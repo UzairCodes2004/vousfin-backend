@@ -51,21 +51,29 @@ module.exports = {
     CREDIT: 'Credit',
   },
 
-  // Default Chart of Accounts (19 accounts)
+  // Default Chart of Accounts (31 accounts)
   // Format: { accountName, accountType, normalBalance, isDefault: true }
   DEFAULT_ACCOUNTS: [
     // Assets
     { accountName: 'Cash', accountType: 'Asset', normalBalance: 'Debit', isDefault: true },
     { accountName: 'Bank', accountType: 'Asset', normalBalance: 'Debit', isDefault: true },
+    { accountName: 'Petty Cash', accountType: 'Asset', normalBalance: 'Debit', isDefault: true },
     { accountName: 'Accounts Receivable', accountType: 'Asset', normalBalance: 'Debit', isDefault: true },
+    { accountName: 'Inventory', accountType: 'Asset', normalBalance: 'Debit', isDefault: true },
     { accountName: 'Prepaid Expenses', accountType: 'Asset', normalBalance: 'Debit', isDefault: true },
     { accountName: 'Fixed Assets', accountType: 'Asset', normalBalance: 'Debit', isDefault: true },
     // Liabilities
     { accountName: 'Accounts Payable', accountType: 'Liability', normalBalance: 'Credit', isDefault: true },
     { accountName: 'Loan Payable', accountType: 'Liability', normalBalance: 'Credit', isDefault: true },
     { accountName: 'Tax Payable', accountType: 'Liability', normalBalance: 'Credit', isDefault: true },
+    { accountName: 'Salaries Payable', accountType: 'Liability', normalBalance: 'Credit', isDefault: true },
+    { accountName: 'Accrued Expenses', accountType: 'Liability', normalBalance: 'Credit', isDefault: true },
+    { accountName: 'Unearned Revenue', accountType: 'Liability', normalBalance: 'Credit', isDefault: true },
+    { accountName: 'Interest Payable', accountType: 'Liability', normalBalance: 'Credit', isDefault: true },
     // Equity
     { accountName: "Owner's Equity", accountType: 'Equity', normalBalance: 'Credit', isDefault: true },
+    { accountName: 'Owner Drawings', accountType: 'Equity', normalBalance: 'Debit', isDefault: true },
+    { accountName: 'Retained Earnings', accountType: 'Equity', normalBalance: 'Credit', isDefault: true },
     // Revenue
     { accountName: 'Sales Revenue', accountType: 'Revenue', normalBalance: 'Credit', isDefault: true },
     { accountName: 'Service Revenue', accountType: 'Revenue', normalBalance: 'Credit', isDefault: true },
@@ -77,6 +85,10 @@ module.exports = {
     { accountName: 'Utilities Expense', accountType: 'Expense', normalBalance: 'Debit', isDefault: true },
     { accountName: 'Salaries Expense', accountType: 'Expense', normalBalance: 'Debit', isDefault: true },
     { accountName: 'Marketing Expense', accountType: 'Expense', normalBalance: 'Debit', isDefault: true },
+    { accountName: 'Interest Expense', accountType: 'Expense', normalBalance: 'Debit', isDefault: true },
+    { accountName: 'Depreciation Expense', accountType: 'Expense', normalBalance: 'Debit', isDefault: true },
+    { accountName: 'Bank Charges', accountType: 'Expense', normalBalance: 'Debit', isDefault: true },
+    { accountName: 'Insurance Expense', accountType: 'Expense', normalBalance: 'Debit', isDefault: true },
     { accountName: 'Miscellaneous Expense', accountType: 'Expense', normalBalance: 'Debit', isDefault: true },
   ],
 

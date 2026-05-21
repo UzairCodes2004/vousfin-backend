@@ -32,9 +32,12 @@ router.get('/:id/settlements', validate(transactionIdParamSchema, 'params'), tra
 router.post('/installment', validate(createInstallmentSchema), transactionController.createInstallmentTransaction);
 router.post('/installment/:planId/pay', transactionController.recordInstallmentPayment);
 
-// Legacy AI/Excel
+// Natural Language
 router.post('/nl', validate(naturalLanguageSchema), transactionController.processNaturalLanguage);
 router.post('/nl/confirm', validate(confirmNaturalLanguageSchema), transactionController.confirmNaturalLanguage);
+
+// Excel Bulk Import  (GET template must come before /:id to avoid route collision)
+router.get('/excel/template', transactionController.downloadExcelTemplate);
 router.post('/excel', upload.single('file'), transactionController.uploadExcelPreview);
 router.post('/excel/confirm', transactionController.confirmExcelImport);
 

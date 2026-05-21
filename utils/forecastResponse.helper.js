@@ -1,63 +1,124 @@
-const { generateInsights } = require('../services/forecasting/forecastingService');
+/**
+ * forecastResponse.helper.js
+ *
+ * Transforms the raw lstmForecastService output into the API response shape
+ * consumed by the frontend. All monetary values stay in raw PKR — the frontend
+ * formatter (formatCurrency / Y-axis tick) handles display scaling.
+ */
 
 const METRIC_API_TO_TARGET = {
-  revenue: 'Revenue',
-  expenses: 'Expenses',
+  revenue:     'Revenue',
+  expenses:    'Expenses',
   netCashFlow: 'Net Cash Flow',
 };
 
-function monthLabelToDate(label, index) {
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const idx = months.indexOf(label);
-  const month = idx >= 0 ? idx : index % 12;
-  const year = new Date().getFullYear();
-  return new Date(year, month, 1).toISOString();
+/* ── Label → ISO date (first day of that calendar month) ── */
+const MONTH_IDX = { Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11 };
+
+function labelToIsoDate(label, fallbackIndex) {
+  const mIdx  = MONTH_IDX[label] ?? (fallbackIndex % 12);
+  // If the label month is earlier than today, put it in next year (it's a forecast label)
+  const now   = new Date();
+  let   year  = now.getFullYear();
+  if (mIdx < now.getMonth() && fallbackIndex >= 6) year += 1;
+  return new Date(year, mIdx, 1).toISOString();
 }
 
-function seriesToChartPoints(values, labels, startIndex = 0) {
+/* ── Convert parallel value/label arrays into chart-point objects ── */
+function seriesToChartPoints(values, labels, startIndex) {
   return values.map((value, i) => {
     const label = labels[startIndex + i] || `M${startIndex + i + 1}`;
     return {
       period: label,
-      date: monthLabelToDate(label, startIndex + i),
-      value,
+      date:   labelToIsoDate(label, startIndex + i),
+      value:  value ?? 0,   // raw PKR — never null/undefined
     };
   });
 }
 
-function insightsToList(insightsRaw) {
-  if (!insightsRaw) return [];
+/* ── Convert the rich interpretation object to a flat list of insight items ── */
+function interpretationToList(interp) {
+  if (!interp) return [];
   return [
-    { type: insightsRaw.trend?.isPositive ? 'info' : 'warning', text: insightsRaw.trend?.text },
-    { type: 'info', text: insightsRaw.growth?.text },
-    { type: insightsRaw.risk?.isHigh ? 'warning' : 'info', text: insightsRaw.risk?.text },
-    { type: 'info', text: insightsRaw.recommendation?.text },
-  ].filter((item) => item.text);
+    interp.trend          && { type: 'trend',          text: interp.trend          },
+    interp.growth         && { type: 'growth',         text: interp.growth         },
+    interp.risk           && { type: 'risk',           text: interp.risk           },
+    interp.recommendation && { type: 'recommendation', text: interp.recommendation },
+    interp.sourceNote     && { type: 'info',           text: interp.sourceNote     },
+  ].filter(Boolean);
 }
 
 /**
- * Transform ML forecast output into API response for React charts (historical + predicted arrays).
+ * Main formatter — called by both ai.controller and forecast.controller.
+ *
+ * @param {string} metric  – API metric key ('revenue'|'expenses'|'netCashFlow')
+ * @param {number} horizon – months
+ * @param {object} result  – raw output from generateLSTMForecast()
  */
-function formatForecastApiResponse(metric, horizon, forecastResult) {
-  const { historical, predicted, labels = [], upper, lower, confidence, target } = forecastResult;
-  const historicalPoints = seriesToChartPoints(historical, labels, 0);
-  const predictedPoints = seriesToChartPoints(predicted, labels, historical.length);
-  const insightsRaw = generateInsights(forecastResult);
+function formatForecastApiResponse(metric, horizon, result) {
+  const {
+    historical  = [],
+    predicted   = [],
+    upper       = [],
+    lower       = [],
+    labels      = [],
+    confidence  = [],
+    target,
+    interpretation,
+    kpiSummary,
+    dataSource,
+    modelType,
+    lookBack,
+    sequencesUsed,
+  } = result;
 
-  const confidenceScore =
-    confidence?.[0] === 'High' ? '92%' : confidence?.[0] === 'Medium' ? '85%' : '78%';
+  const historicalPoints = seriesToChartPoints(historical, labels, 0);
+  const predictedPoints  = seriesToChartPoints(predicted,  labels, historical.length);
+
+  // Confidence score as human-readable string + numeric
+  const confLabel  = confidence[0] ?? 'Medium';
+  const confScore  = confLabel === 'High' ? 92 : confLabel === 'Medium' ? 85 : 74;
+  const confString = `${confScore}%`;
+
+  // Confidence bands as chart-friendly [lo, hi] pairs
+  const confidenceIntervals = predicted.map((_, i) => ({
+    upper: upper[i] ?? predicted[i],
+    lower: lower[i] ?? predicted[i],
+  }));
+
+  // Insight items — prefer the rich interpretation from lstmForecastService,
+  // fall back to the legacy generateInsights() shape when using static service.
+  const insights = interpretationToList(interpretation);
 
   return {
     metric: metric || target,
     target,
     months: horizon,
+
+    // Chart series — raw PKR values in {period, date, value} format
     historical: historicalPoints,
-    predicted: predictedPoints,
-    forecast: predictedPoints,
-    confidenceIntervals: predicted.map((v, i) => [lower[i], upper[i]]),
-    confidenceScore,
-    insights: insightsToList(insightsRaw),
-    raw: forecastResult,
+    predicted:  predictedPoints,
+    forecast:   predictedPoints,   // alias kept for backward compat
+
+    // Confidence bands
+    confidenceIntervals,
+    confidenceScore: confString,
+    confidenceNumeric: confScore,
+    confidenceLabel: confLabel,
+
+    // Business-readable KPI summary (all monetary values raw PKR)
+    kpiSummary: kpiSummary || null,
+
+    // Human-readable text insights (no raw ML values)
+    insights,
+
+    // Model metadata (non-sensitive)
+    modelMeta: {
+      modelType:     modelType     || 'LSTM',
+      lookBack:      lookBack      ?? 6,
+      sequencesUsed: sequencesUsed ?? 0,
+      dataSource:    dataSource    || 'static',
+    },
   };
 }
 

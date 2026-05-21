@@ -16,7 +16,6 @@ const resolveAccountIds = async (businessId, row) => {
   const creditName = row.creditAccountName || row.creditAccount;
   if (!debitAccountId && debitName) {
     const debit = await accountRepository.findByBusinessAndName(businessId, debitName);
-    // findByBusinessAndName now does fuzzy matching — throw only if nothing at all found
     if (!debit) throw new ApiError(400, `Debit account not found: "${debitName}". Please check your Chart of Accounts.`);
     debitAccountId = debit._id;
   }
@@ -26,6 +25,37 @@ const resolveAccountIds = async (businessId, row) => {
     creditAccountId = credit._id;
   }
   return { debitAccountId, creditAccountId };
+};
+
+/**
+ * Build an in-memory account resolver from a pre-loaded accounts array.
+ * Replicates the 3-tier fuzzy matching from accountRepository.findByBusinessAndName
+ * so bulk imports need only ONE database query instead of N×2-3.
+ */
+const buildAccountResolver = (accounts) => (name) => {
+  const clean = (name || '').trim();
+  if (!clean) return null;
+  const lower = clean.toLowerCase();
+  // 1. Exact case-insensitive
+  const exact = accounts.find(a => a.accountName.toLowerCase() === lower);
+  if (exact) return exact;
+  // 2. Partial / contains
+  const partial = accounts.find(
+    a => a.accountName.toLowerCase().includes(lower) || lower.includes(a.accountName.toLowerCase())
+  );
+  if (partial) return partial;
+  // 3. Word-overlap fuzzy
+  const words = lower.split(/\s+/).filter(w => w.length > 2);
+  if (words.length) {
+    let best = null, bestScore = 0;
+    for (const acc of accounts) {
+      const accWords = acc.accountName.toLowerCase().split(/\s+/);
+      const score = words.filter(w => accWords.some(aw => aw.includes(w) || w.includes(aw))).length;
+      if (score > bestScore) { bestScore = score; best = acc; }
+    }
+    if (bestScore > 0) return best;
+  }
+  return null;
 };
 
 /**
@@ -236,37 +266,132 @@ const confirmNaturalLanguage = async (req, res, next) => {
 };
 
 /**
- * Upload Excel file, parse and validate rows, return preview.
+ * GET /api/v1/transactions/excel/template
+ * Download a sample .xlsx import template.
+ */
+const downloadExcelTemplate = async (req, res, next) => {
+  try {
+    const ExcelJS = require('exceljs');
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'vousFin';
+
+    // ── Instructions sheet ──────────────────────────────────────────────────
+    const info = wb.addWorksheet('Instructions');
+    info.getColumn(1).width = 20;
+    info.getColumn(2).width = 60;
+    const addInfo = (label, value) => {
+      const row = info.addRow([label, value]);
+      row.getCell(1).font = { bold: true };
+    };
+    info.addRow(['vousFin Bulk Import Template']);
+    info.getRow(1).font = { bold: true, size: 14 };
+    info.addRow([]);
+    addInfo('Required columns:', 'Date, Description, Amount, Debit Account, Credit Account');
+    addInfo('Optional columns:', 'Type, Customer, Vendor, Reference, Notes');
+    addInfo('Date format:', 'YYYY-MM-DD or DD/MM/YYYY');
+    addInfo('Amount format:', 'Positive numbers only (e.g. 25000 or 25,000.00)');
+    addInfo('Debit Account:', 'Exact account name from your Chart of Accounts');
+    addInfo('Credit Account:', 'Exact account name from your Chart of Accounts');
+    addInfo('Type (optional):', 'Income, Expense, Credit Sale, Credit Purchase, Transfer, Owner Investment, Owner Withdrawal, Loan Disbursement, Loan Repayment, Asset Purchase');
+    addInfo('Customer:', 'Required for Credit Sale / Payment Received rows');
+    addInfo('Vendor:', 'Required for Credit Purchase / Payment Made rows');
+
+    // ── Transactions sheet ───────────────────────────────────────────────────
+    const ws = wb.addWorksheet('Transactions');
+
+    const headers = ['Date', 'Description', 'Amount', 'Debit Account', 'Credit Account', 'Type', 'Customer', 'Vendor', 'Reference', 'Notes'];
+    const widths  = [14,     40,             14,       28,              28,               22,     20,         20,       16,          35];
+    headers.forEach((h, i) => { ws.getColumn(i + 1).width = widths[i]; });
+
+    const headerRow = ws.addRow(headers);
+    headerRow.eachCell(cell => {
+      cell.font = { bold: true, color: { argb: 'FFF8FAFC' } };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E293B' } };
+      cell.alignment = { vertical: 'middle' };
+    });
+    ws.getRow(1).height = 22;
+
+    // Example rows
+    const examples = [
+      ['2024-01-15', 'Monthly office rent',                  25000, 'Rent Expense',         'Cash',              'Expense',    '',         '',         'RENT-001', 'Office rent January'],
+      ['2024-01-16', 'Service revenue from client',          50000, 'Cash',                  'Service Revenue',   'Income',     '',         '',         '',         ''],
+      ['2024-01-17', 'Credit sale to Ahmed Khan',            35000, 'Accounts Receivable',   'Sales Revenue',     'Credit Sale','Ahmed Khan','',         'INV-002',  ''],
+      ['2024-01-18', 'Salary payment',                       60000, 'Salaries Expense',      'Bank',              'Expense',    '',         '',         '',         'Staff salaries'],
+      ['2024-01-19', 'Purchase inventory from supplier',     40000, 'Inventory',             'Accounts Payable',  'Credit Purchase','',    'Ali Traders','PO-005',  ''],
+      ['2024-01-20', 'Loan from bank',                      200000, 'Bank',                  'Loan Payable',      'Loan Disbursement','','',            '',         'MCB Business Loan'],
+      ['2024-01-21', 'Owner puts in capital',               100000, 'Cash',                  "Owner's Equity",    'Owner Investment','','',            '',         ''],
+    ];
+    examples.forEach((row, idx) => {
+      const r = ws.addRow(row);
+      r.eachCell(cell => {
+        cell.fill = {
+          type: 'pattern', pattern: 'solid',
+          fgColor: { argb: idx % 2 === 0 ? 'FFFAFAFA' : 'FFFFFFFF' },
+        };
+      });
+    });
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="vousFin_import_template.xlsx"');
+    res.setHeader('Cache-Control', 'no-cache');
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/v1/transactions/excel
+ * Parse & validate an uploaded Excel file; return a preview without saving.
  */
 const uploadExcelPreview = async (req, res, next) => {
   try {
     if (!req.file) {
-      throw new ApiError(400, 'Excel file is required');
+      throw new ApiError(400, 'Excel file is required. Attach the file as form-data field "file".');
     }
-    const buffer = req.file.buffer;
     const businessId = req.user.businessId;
-    const { validRows, errors } = await parseExcelTransactions(buffer, businessId);
+    logger.info(`Excel upload: "${req.file.originalname}" (${req.file.size} bytes) by business ${businessId}`);
+
+    const { validRows, errors } = await parseExcelTransactions(req.file.buffer, businessId);
+
+    // Pre-load all business accounts ONCE — avoids N×2-3 DB queries per row
+    const allAccounts = await accountRepository.findByBusiness(businessId);
+    const resolve = buildAccountResolver(allAccounts);
+
     const resolvedRows = [];
     for (const row of validRows) {
-      try {
-        const { debitAccountId, creditAccountId } = await resolveAccountIds(businessId, row);
-        resolvedRows.push({
-          ...row,
-          debitAccountId,
-          creditAccountId,
-        });
-      } catch (resolveErr) {
-        errors.push({
-          row: row.originalRow,
-          field: 'account',
-          message: resolveErr.message,
-        });
+      const debit  = resolve(row.debitAccountName);
+      const credit = resolve(row.creditAccountName);
+
+      if (!debit) {
+        errors.push({ row: row.originalRow, field: 'debitAccount',
+          message: `Debit account not found: "${row.debitAccountName}". Check your Chart of Accounts.` });
+        continue;
       }
+      if (!credit) {
+        errors.push({ row: row.originalRow, field: 'creditAccount',
+          message: `Credit account not found: "${row.creditAccountName}". Check your Chart of Accounts.` });
+        continue;
+      }
+      if (debit._id.toString() === credit._id.toString()) {
+        errors.push({ row: row.originalRow, field: 'general',
+          message: `Debit and credit resolved to the same account: "${debit.accountName}"` });
+        continue;
+      }
+
+      resolvedRows.push({
+        ...row,
+        debitAccountId:  debit._id,
+        creditAccountId: credit._id,
+      });
     }
+
+    logger.info(`Excel preview: ${resolvedRows.length} resolved, ${errors.length} total errors`);
     ApiResponse.success(res, {
-      validCount: resolvedRows.length,
+      validCount:   resolvedRows.length,
       invalidCount: errors.length,
-      validRows: resolvedRows,
+      validRows:    resolvedRows,
       errors,
     }, 'Excel preview generated');
   } catch (error) {
@@ -275,33 +400,80 @@ const uploadExcelPreview = async (req, res, next) => {
 };
 
 /**
- * Confirm Excel import and bulk save transactions.
+ * POST /api/v1/transactions/excel/confirm
+ * Bulk-save the validated rows that were returned by the preview step.
  */
 const confirmExcelImport = async (req, res, next) => {
   try {
-    const { rows } = req.body; // rows should be the valid rows from preview, possibly with resolved account IDs
+    const { rows } = req.body;
     if (!rows || !Array.isArray(rows) || rows.length === 0) {
       throw new ApiError(400, 'No valid rows to import');
     }
+
+    const businessId = req.user.businessId;
+    logger.info(`Excel confirm: importing ${rows.length} rows for business ${businessId}`);
+
+    // Pre-load all accounts once for re-validation (accounts may have changed since preview)
+    const allAccounts = await accountRepository.findByBusiness(businessId);
+    const resolve = buildAccountResolver(allAccounts);
+
     const transactionsToCreate = [];
+    const accountErrors = [];
+
     for (const row of rows) {
-      const { debitAccountId, creditAccountId } = await resolveAccountIds(req.user.businessId, row);
+      // Re-resolve by name (authoritative); fall back to the ID from preview if name is missing
+      let debitAccountId  = row.debitAccountId;
+      let creditAccountId = row.creditAccountId;
+
+      if (row.debitAccountName) {
+        const acc = resolve(row.debitAccountName);
+        if (!acc) {
+          accountErrors.push({ row: row.originalRow, error: `Debit account not found: "${row.debitAccountName}"` });
+          continue;
+        }
+        debitAccountId = acc._id;
+      }
+      if (row.creditAccountName) {
+        const acc = resolve(row.creditAccountName);
+        if (!acc) {
+          accountErrors.push({ row: row.originalRow, error: `Credit account not found: "${row.creditAccountName}"` });
+          continue;
+        }
+        creditAccountId = acc._id;
+      }
+
+      if (!debitAccountId || !creditAccountId) {
+        accountErrors.push({ row: row.originalRow, error: 'Could not resolve account IDs' });
+        continue;
+      }
+
       transactionsToCreate.push({
-        transactionDate: row.transactionDate,
-        description: row.description,
-        transactionType: row.transactionType,
-        amount: row.amount,
+        transactionDate:      row.transactionDate,
+        description:          row.description,
+        transactionType:      row.transactionType   || undefined,
+        amount:               row.amount,
         debitAccountId,
         creditAccountId,
-        businessId: req.user.businessId,
-        inputMethod: 'excel',
+        customerName:         row.customerName       || undefined,
+        vendorName:           row.vendorName         || undefined,
+        transactionReference: row.transactionReference || undefined,
+        notes:                row.notes              || undefined,
+        businessId,
+        inputMethod:          'excel',
+        originalRow:          row.originalRow,
       });
     }
+
     const results = await transactionService.createBulkTransactions(
       transactionsToCreate,
       req.user.id,
       req.ip
     );
+
+    // Merge account-resolution failures with service-level failures
+    results.failed = [...(results.failed || []), ...accountErrors];
+
+    logger.info(`Excel import complete: ${results.successful} saved, ${results.failed.length} failed`);
     ApiResponse.success(res, results, `${results.successful} transactions imported successfully`);
   } catch (error) {
     next(error);
@@ -404,6 +576,7 @@ module.exports = {
   recordInstallmentPayment,
   processNaturalLanguage,
   confirmNaturalLanguage,
+  downloadExcelTemplate,
   uploadExcelPreview,
   confirmExcelImport,
   getTransactions,

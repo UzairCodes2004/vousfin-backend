@@ -4,6 +4,7 @@ const aiPlaceholderService = require('../services/aiPlaceholder.service');
 const anomalyDetectionService = require('../services/anomalyDetection.service');
 const parserService = require('../services/nlParser/services/parserService');
 const forecastingService = require('../services/forecasting/forecastingService');
+const { generateLSTMForecast } = require('../services/forecasting/lstmForecastService');
 const { METRIC_API_TO_TARGET, formatForecastApiResponse } = require('../utils/forecastResponse.helper');
 const ApiResponse = require('../utils/ApiResponse');
 const { ApiError } = require('../utils/ApiError');
@@ -66,7 +67,16 @@ const forecast = async (req, res, next) => {
       throw new ApiError(400, 'Both metric and horizon are required');
     }
     const target = METRIC_API_TO_TARGET[metric] || 'Revenue';
-    const forecastResult = forecastingService.generateForecast(target, horizon);
+
+    // Prefer LSTM live forecast using business's actual accounting data
+    let forecastResult;
+    try {
+      forecastResult = await generateLSTMForecast(req.user.businessId, target, horizon);
+    } catch {
+      // Fall back to static model output if live data fetch fails
+      forecastResult = forecastingService.generateForecast(target, horizon);
+    }
+
     const payload = formatForecastApiResponse(metric, horizon, forecastResult);
     ApiResponse.success(res, payload, 'Forecast generated');
   } catch (error) {

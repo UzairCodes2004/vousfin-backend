@@ -19,6 +19,8 @@ const CA = ACCOUNT_TYPES.CONTRA_ASSET;
 const CHART_OF_ACCOUNTS = Object.freeze([
   // ── Assets ──
   acct('Cash', A, 'debit', ['cash', 'cash in hand', 'petty cash']),
+  acct('Petty Cash', A, 'debit', ['petty cash fund']),
+  acct('Bank', A, 'debit', ['bank', 'bank account']),
   acct('HBL Bank', A, 'debit', ['hbl', 'hbl bank', 'habib bank']),
   acct('Meezan Bank', A, 'debit', ['meezan', 'meezan bank']),
   acct('UBL', A, 'debit', ['ubl', 'ubl bank', 'united bank']),
@@ -35,17 +37,20 @@ const CHART_OF_ACCOUNTS = Object.freeze([
   acct('Equipment', A, 'debit', ['equipment', 'office equipment', 'tools']),
   acct('Machinery', A, 'debit', ['machinery', 'machine', 'plant']),
   acct('Prepaid Expenses', A, 'debit', ['prepaid', 'advance payment']),
+  acct('Fixed Assets', A, 'debit', ['fixed assets', 'property plant equipment', 'ppe']),
 
   // ── Liabilities ──
   acct('Credit Card', L, 'credit', ['credit card', 'cc', 'visa', 'mastercard']),
   acct('Accounts Payable', L, 'credit', ['accounts payable', 'payables', 'creditors']),
   acct('Loan Payable', L, 'credit', ['loan', 'loan payable', 'bank loan']),
   acct('Tax Payable', L, 'credit', ['tax payable', 'taxes payable']),
-  acct('Salary Payable', L, 'credit', ['salary payable', 'wages payable']),
-  acct('Accrued Liabilities', L, 'credit', ['accrued liabilities', 'accrued expenses']),
+  acct('Salaries Payable', L, 'credit', ['salaries payable', 'salary payable', 'wages payable']),
+  acct('Accrued Expenses', L, 'credit', ['accrued expenses', 'accrued liabilities', 'accrued costs']),
+  acct('Unearned Revenue', L, 'credit', ['unearned revenue', 'deferred revenue', 'advance payment received']),
+  acct('Interest Payable', L, 'credit', ['interest payable', 'accrued interest']),
 
   // ── Equity ──
-  acct('Owner Capital', E, 'credit', ['owner capital', 'capital', 'equity', 'invested capital']),
+  acct("Owner's Equity", E, 'credit', ["owner's equity", 'owner capital', 'capital', 'equity', 'invested capital']),
   acct('Owner Drawings', E, 'debit', ['drawings', 'owner drawings', 'withdrawal']),
   acct('Retained Earnings', E, 'credit', ['retained earnings']),
 
@@ -63,7 +68,7 @@ const CHART_OF_ACCOUNTS = Object.freeze([
   acct('Water Expense', X, 'debit', ['water', 'water bill']),
   acct('Mobile Bill Expense', X, 'debit', ['mobile bill', 'phone bill']),
   acct('Rent Expense', X, 'debit', ['rent', 'office rent', 'shop rent']),
-  acct('Salary Expense', X, 'debit', ['salary', 'salary expense', 'wages', 'payroll']),
+  acct('Salaries Expense', X, 'debit', ['salary', 'salary expense', 'salaries expense', 'wages', 'payroll']),
   acct('Fuel Expense', X, 'debit', ['fuel', 'petrol', 'diesel']),
   acct('Transport Expense', X, 'debit', ['transport', 'travel', 'uber', 'careem']),
   acct('Maintenance Expense', X, 'debit', ['maintenance']),
@@ -79,6 +84,8 @@ const CHART_OF_ACCOUNTS = Object.freeze([
   acct('Printing Expense', X, 'debit', ['printing']),
   acct('Insurance Expense', X, 'debit', ['insurance', 'insurance premium']),
   acct('Bank Charges', X, 'debit', ['bank fee', 'bank charges', 'service charges']),
+  acct('Interest Expense', X, 'debit', ['interest expense', 'interest paid', 'loan interest']),
+  acct('Utilities Expense', X, 'debit', ['utilities expense', 'utility expense', 'utilities']),
   acct('Tax Expense', X, 'debit', ['tax', 'tax expense', 'income tax']),
   acct('Cost of Goods Sold', X, 'debit', ['cogs', 'cost of goods sold', 'cost of sales']),
   acct('Depreciation Expense', X, 'debit', ['depreciation', 'depreciation expense']),
