@@ -204,11 +204,33 @@ module.exports = {
   // ===============================
   // Anomaly Alert Constants
   // ===============================
+  // Lifecycle:
+  //   pending          → initial state when first flagged by ML scan
+  //   pending_review   → alias for pending (kept for clarity)
+  //   marked_legit     → user reviewed and confirmed it is legitimate (suppresses future re-flag)
+  //   confirmed_fraud  → user reviewed and confirmed it is fraudulent (kept tracked)
+  //   ignored          → user dismissed without verdict (do not re-flag within X days)
+  //   rescanned        → previously reviewed but transaction has changed materially → re-eligible
+  //
+  // Legacy (kept for backward-compat with already-saved documents):
+  //   valid            → DEPRECATED alias for marked_legit
+  //   confirmed_issue  → DEPRECATED alias for confirmed_fraud
   ANOMALY_STATUS: {
-    PENDING: 'pending',
-    VALID: 'valid',
-    CONFIRMED_ISSUE: 'confirmed_issue',
+    PENDING:          'pending',
+    PENDING_REVIEW:   'pending_review',
+    MARKED_LEGIT:     'marked_legit',
+    CONFIRMED_FRAUD:  'confirmed_fraud',
+    IGNORED:          'ignored',
+    RESCANNED:        'rescanned',
+    // Legacy
+    VALID:            'valid',
+    CONFIRMED_ISSUE:  'confirmed_issue',
   },
+
+  // Statuses that should SUPPRESS the same transaction from being re-flagged in future scans
+  ANOMALY_SUPPRESS_STATUSES: ['marked_legit', 'valid', 'ignored'],
+  // Statuses that count as "user reviewed" (any verdict given)
+  ANOMALY_REVIEWED_STATUSES: ['marked_legit', 'confirmed_fraud', 'valid', 'confirmed_issue', 'ignored'],
 
   // ===============================
   // API & Pagination Constants

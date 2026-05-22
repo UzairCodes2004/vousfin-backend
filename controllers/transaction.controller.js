@@ -107,11 +107,18 @@ const recordPayment = async (req, res, next) => {
  */
 const getOutstandingBalances = async (req, res, next) => {
   try {
-    const { type } = req.query; // 'receivable' or 'payable'
+    const { type, withAging } = req.query; // 'receivable' or 'payable'
     if (!type) throw new ApiError(400, 'type query parameter is required (receivable or payable)');
 
-    const outstanding = await transactionService.getOutstandingBalances(req.user.businessId, type);
-    ApiResponse.success(res, outstanding, 'Outstanding balances retrieved');
+    const rows = await transactionService.getOutstandingBalances(req.user.businessId, type);
+
+    /* Backward-compat: without withAging the response stays a plain array.
+       With ?withAging=true we wrap it as { rows, aging, totals }. */
+    if (withAging === 'true' || withAging === '1') {
+      const aging = transactionService.computeAgingBuckets(rows);
+      return ApiResponse.success(res, { rows, aging }, 'Outstanding balances retrieved');
+    }
+    ApiResponse.success(res, rows, 'Outstanding balances retrieved');
   } catch (error) {
     next(error);
   }
@@ -341,6 +348,17 @@ const downloadExcelTemplate = async (req, res, next) => {
   }
 };
 
+// ── Allowed MIME types and extensions for Excel/CSV uploads ─────────────────
+const ALLOWED_EXCEL_MIMETYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // .xlsx
+  'application/vnd.ms-excel',                                           // .xls
+  'text/csv',
+  'application/csv',
+  'text/plain',   // some browsers send .csv as text/plain
+  'application/octet-stream', // generic binary — rely on extension
+]);
+const ALLOWED_EXCEL_EXTENSIONS = new Set(['xlsx', 'xls', 'csv']);
+
 /**
  * POST /api/v1/transactions/excel
  * Parse & validate an uploaded Excel file; return a preview without saving.
@@ -350,12 +368,29 @@ const uploadExcelPreview = async (req, res, next) => {
     if (!req.file) {
       throw new ApiError(400, 'Excel file is required. Attach the file as form-data field "file".');
     }
+
+    // ── Security: validate file type ──────────────────────────────────────
+    const ext = (req.file.originalname || '').split('.').pop().toLowerCase();
+    if (!ALLOWED_EXCEL_EXTENSIONS.has(ext)) {
+      throw new ApiError(400, `Unsupported file extension ".${ext}". Please upload .xlsx, .xls, or .csv.`);
+    }
+    if (req.file.mimetype && !ALLOWED_EXCEL_MIMETYPES.has(req.file.mimetype)) {
+      logger.warn(`Excel upload: unexpected MIME type "${req.file.mimetype}" for ${req.file.originalname} — proceeding`);
+    }
+
     const businessId = req.user.businessId;
-    logger.info(`Excel upload: "${req.file.originalname}" (${req.file.size} bytes) by business ${businessId}`);
+    logger.info(`Excel upload: "${req.file.originalname}" (${req.file.size} B) by business ${businessId}`);
 
-    const { validRows, errors } = await parseExcelTransactions(req.file.buffer, businessId);
+    // ── Parse file (multi-format: xlsx / xls / csv) ───────────────────────
+    const {
+      validRows,
+      errors,
+      duplicatesFound,
+      fileInfo,
+      confidenceStats,
+    } = await parseExcelTransactions(req.file.buffer, businessId, req.file.originalname);
 
-    // Pre-load all business accounts ONCE — avoids N×2-3 DB queries per row
+    // ── Resolve account names → IDs (single DB query) ─────────────────────
     const allAccounts = await accountRepository.findByBusiness(businessId);
     const resolve = buildAccountResolver(allAccounts);
 
@@ -365,35 +400,79 @@ const uploadExcelPreview = async (req, res, next) => {
       const credit = resolve(row.creditAccountName);
 
       if (!debit) {
-        errors.push({ row: row.originalRow, field: 'debitAccount',
-          message: `Debit account not found: "${row.debitAccountName}". Check your Chart of Accounts.` });
+        errors.push({
+          row:     row.originalRow,
+          field:   'debitAccount',
+          message: `Debit account not found: "${row.debitAccountName}". Check your Chart of Accounts.`,
+        });
         continue;
       }
       if (!credit) {
-        errors.push({ row: row.originalRow, field: 'creditAccount',
-          message: `Credit account not found: "${row.creditAccountName}". Check your Chart of Accounts.` });
+        errors.push({
+          row:     row.originalRow,
+          field:   'creditAccount',
+          message: `Credit account not found: "${row.creditAccountName}". Check your Chart of Accounts.`,
+        });
         continue;
       }
       if (debit._id.toString() === credit._id.toString()) {
-        errors.push({ row: row.originalRow, field: 'general',
-          message: `Debit and credit resolved to the same account: "${debit.accountName}"` });
+        errors.push({
+          row:     row.originalRow,
+          field:   'general',
+          message: `Debit and credit resolved to the same account: "${debit.accountName}"`,
+        });
         continue;
       }
 
+      // Downgrade confidence if account was fuzzy-matched
+      let rowConf = row.confidenceScore;
+      const rowFlags = [...(row.confidenceFlags || [])];
+      if (debit.accountName.toLowerCase()  !== row.debitAccountName.toLowerCase())  {
+        rowConf  -= 15; rowFlags.push('debit_fuzzy');
+      }
+      if (credit.accountName.toLowerCase() !== row.creditAccountName.toLowerCase()) {
+        rowConf  -= 15; rowFlags.push('credit_fuzzy');
+      }
+      rowConf = Math.max(0, rowConf);
+      const rowConfLabel = rowConf >= 80 ? 'High' : rowConf >= 50 ? 'Medium' : 'Low';
+
       resolvedRows.push({
         ...row,
-        debitAccountId:  debit._id,
-        creditAccountId: credit._id,
+        debitAccountId:    debit._id,
+        creditAccountId:   credit._id,
+        debitAccountName:  debit.accountName,   // normalise to canonical name
+        creditAccountName: credit.accountName,
+        confidenceScore:   rowConf,
+        confidenceLabel:   rowConfLabel,
+        confidenceFlags:   rowFlags,
       });
     }
 
-    logger.info(`Excel preview: ${resolvedRows.length} resolved, ${errors.length} total errors`);
+    // ── Re-compute confidence stats after account resolution ─────────────
+    const resolvedStats = resolvedRows.reduce(
+      (acc, r) => {
+        if      (r.confidenceScore >= 80) acc.high++;
+        else if (r.confidenceScore >= 50) acc.medium++;
+        else                              acc.low++;
+        return acc;
+      },
+      { high: 0, medium: 0, low: 0 }
+    );
+
+    logger.info(`Excel preview: ${resolvedRows.length} resolved, ${errors.length} error(s)`);
+
     ApiResponse.success(res, {
+      // Backward-compat fields
       validCount:   resolvedRows.length,
       invalidCount: errors.length,
       validRows:    resolvedRows,
       errors,
+      // New fields
+      duplicatesFound,
+      fileInfo,
+      confidenceStats: resolvedStats,
     }, 'Excel preview generated');
+
   } catch (error) {
     next(error);
   }
@@ -450,14 +529,15 @@ const confirmExcelImport = async (req, res, next) => {
       transactionsToCreate.push({
         transactionDate:      row.transactionDate,
         description:          row.description,
-        transactionType:      row.transactionType   || undefined,
+        transactionType:      row.transactionType      || undefined,
+        transactionMode:      row.transactionMode      || undefined,
         amount:               row.amount,
         debitAccountId,
         creditAccountId,
-        customerName:         row.customerName       || undefined,
-        vendorName:           row.vendorName         || undefined,
+        customerName:         row.customerName         || undefined,
+        vendorName:           row.vendorName           || undefined,
         transactionReference: row.transactionReference || undefined,
-        notes:                row.notes              || undefined,
+        notes:                row.notes                || undefined,
         businessId,
         inputMethod:          'excel',
         originalRow:          row.originalRow,

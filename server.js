@@ -5,6 +5,7 @@ const config = require('./config');
 const logger = require('./config/logger');
 const { scheduleAnomalyScan } = require('./jobs/anomalyScan.job');
 const { initialize: initForecastingData } = require('./services/forecasting/dataLoader');
+const { ensureLSTMRunning, stopLSTM } = require('./utils/lstmService');
 
 // Global unhandled rejection/exception handlers (must be set early)
 process.on('unhandledRejection', (reason, promise) => {
@@ -41,7 +42,12 @@ const startServer = async () => {
     } catch (err) {
       logger.warn(`⚠️ Failed to load ML forecasting data. Forecasts may fail: ${err.message}`);
     }
-    
+
+    // Step 3b: Auto-start Python LSTM microservice (non-blocking — errors are warnings only)
+    ensureLSTMRunning().catch(err => {
+      logger.warn(`⚠️ LSTM auto-start error (non-fatal): ${err.message}`);
+    });
+
     // Step 4: Start Express server
     const server = app.listen(config.PORT, () => {
       logger.info(`🚀 Server listening on port ${config.PORT}`);
@@ -52,6 +58,7 @@ const startServer = async () => {
     // Graceful shutdown
     const shutdown = async (signal) => {
       logger.warn(`⚠️ ${signal} received. Shutting down gracefully...`);
+      stopLSTM();   // terminate Python LSTM microservice if we spawned it
       server.close(async () => {
         logger.info('HTTP server closed');
         await mongoose.connection.close();

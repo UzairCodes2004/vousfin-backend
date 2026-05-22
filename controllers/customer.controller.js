@@ -86,3 +86,12 @@ exports.toggleActive = async (req, res, next) => {
     next(error);
   }
 };
+
+exports.getCustomerStats = async (req, res, next) => {
+  try {
+    const stats = await customerService.getCustomerStats(req.params.id, req.user.businessId);
+    ApiResponse.success(res, stats, 'Customer stats retrieved');
+  } catch (error) {
+    next(error);
+  }
+};

@@ -1,10 +1,35 @@
 // services/isolationForest.service.js
-// Pure JavaScript Isolation Forest implementation.
-// Reference: Liu, Fei Tony, Ting, Kai Ming, and Zhou, Zhi-Hua. "Isolation forest." (2008).
+// Pure JavaScript Isolation Forest with DETERMINISTIC (seeded) RNG.
+//
+// Reference:  Liu, Fei Tony, Ting, Kai Ming, and Zhou, Zhi-Hua. "Isolation forest." (2008).
+//
+// v2 changes:
+//   ✓ Seeded mulberry32 RNG → identical scores across rescans for unchanged data
+//   ✓ Pluggable seed (default derived from businessId for stability per-business)
 
-/**
- * Single node in an isolation tree.
- */
+// ── Seeded RNG (mulberry32) ──────────────────────────────────────────────────
+//   Tiny, fast, deterministic 32-bit PRNG.  Produces same sequence for same seed.
+function makeRng(seed) {
+  let s = (seed >>> 0) || 1;
+  return function rng() {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Hash an arbitrary string into a 32-bit seed (FNV-1a). */
+function seedFromString(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h || 1;
+}
+
 class IsolationNode {
   constructor({ isLeaf, size = 0, featureIdx = -1, splitVal = 0, left = null, right = null } = {}) {
     this.isLeaf = isLeaf;
@@ -16,13 +41,11 @@ class IsolationNode {
   }
 }
 
-/**
- * A single isolation tree built from a subsample.
- */
 class IsolationTree {
-  constructor(maxDepth) {
+  constructor(maxDepth, rng) {
     this.maxDepth = maxDepth;
-    this.root = null;
+    this.rng      = rng || Math.random;
+    this.root     = null;
   }
 
   fit(data) {
@@ -34,115 +57,90 @@ class IsolationTree {
     if (depth >= this.maxDepth || data.length <= 1) {
       return new IsolationNode({ isLeaf: true, size: data.length });
     }
-
     const numFeatures = data[0].length;
-    const featureIdx = Math.floor(Math.random() * numFeatures);
+    const featureIdx = Math.floor(this.rng() * numFeatures);
 
-    let min = Infinity;
-    let max = -Infinity;
+    let min = Infinity, max = -Infinity;
     for (const point of data) {
       const v = point[featureIdx];
       if (v < min) min = v;
       if (v > max) max = v;
     }
-
-    // All values identical on this feature — can't split
     if (min >= max) {
       return new IsolationNode({ isLeaf: true, size: data.length });
     }
-
-    const splitVal = min + Math.random() * (max - min);
-    const left = [];
-    const right = [];
+    const splitVal = min + this.rng() * (max - min);
+    const left = [], right = [];
     for (const point of data) {
       (point[featureIdx] < splitVal ? left : right).push(point);
     }
-
     return new IsolationNode({
       isLeaf: false,
       featureIdx,
       splitVal,
-      left: this._build(left, depth + 1),
+      left:  this._build(left,  depth + 1),
       right: this._build(right, depth + 1),
     });
   }
 
-  /**
-   * Compute path length for a single point.
-   * Shorter path = more isolated = more anomalous.
-   */
-  pathLength(point) {
-    return this._traverse(point, this.root, 0);
-  }
+  pathLength(point) { return this._traverse(point, this.root, 0); }
 
   _traverse(point, node, depth) {
     if (node === null) return depth;
-    if (node.isLeaf) {
-      // Add expected additional path length for the remaining subspace
-      return depth + _avgPathLength(node.size);
-    }
+    if (node.isLeaf)   return depth + _avgPathLength(node.size);
     if (point[node.featureIdx] < node.splitVal) {
-      return this._traverse(point, node.left, depth + 1);
+      return this._traverse(point, node.left,  depth + 1);
     }
     return this._traverse(point, node.right, depth + 1);
   }
 }
 
-/**
- * Expected path length of unsuccessful BST search (harmonic approximation).
- * c(n) from the original paper.
- * @param {number} n - number of samples
- */
 function _avgPathLength(n) {
   if (n <= 1) return 0;
   if (n === 2) return 1;
-  // Euler-Mascheroni constant ≈ 0.5772156649
   return 2.0 * (Math.log(n - 1) + 0.5772156649) - (2.0 * (n - 1) / n);
 }
 
 /**
- * Isolation Forest anomaly detector.
+ * IsolationForest with deterministic seeding.
  *
  * Usage:
- *   const forest = new IsolationForest({ numTrees: 100, sampleSize: 256 });
- *   forest.fit(featureMatrix);       // Array<Array<number>>
- *   const scores = forest.predict(featureMatrix); // Array<number> in [0,1]
- *   // score > 0.5 → anomalous; closer to 1.0 → more anomalous
+ *   const forest = new IsolationForest({ numTrees: 100, sampleSize: 256, seed: 'my-biz-id' });
+ *   forest.fit(featureMatrix);
+ *   const scores = forest.predict(featureMatrix);
+ *
+ * `seed` can be a string (hashed via FNV-1a), a number, or omitted (then a
+ * fixed default seed is used so repeated calls on identical data give
+ * identical scores).
  */
 class IsolationForest {
-  constructor({ numTrees = 100, sampleSize = 256 } = {}) {
-    this.numTrees = numTrees;
+  constructor({ numTrees = 100, sampleSize = 256, seed = 'vousfin-default' } = {}) {
+    this.numTrees   = numTrees;
     this.sampleSize = sampleSize;
-    this.trees = [];
-    this._n = 0;
+    this.seed       = typeof seed === 'number' ? seed : seedFromString(String(seed));
+    this.rng        = makeRng(this.seed);
+    this.trees      = [];
+    this._n         = 0;
   }
 
-  /**
-   * Train the forest on a feature matrix.
-   * @param {Array<Array<number>>} data - each row is a feature vector
-   */
   fit(data) {
     if (!data || data.length === 0) throw new Error('IsolationForest.fit: empty dataset');
-
     this._n = data.length;
     const effectiveSampleSize = Math.min(this.sampleSize, data.length);
     const maxDepth = Math.ceil(Math.log2(effectiveSampleSize));
-
     this.trees = [];
     for (let i = 0; i < this.numTrees; i++) {
       const sample = this._subsample(data, effectiveSampleSize);
-      const tree = new IsolationTree(maxDepth);
+      // Each tree gets its own seeded RNG, derived from forest seed + tree index
+      // so different trees see different random splits but the SEQUENCE is reproducible.
+      const treeRng = makeRng(this.seed + i + 1);
+      const tree = new IsolationTree(maxDepth, treeRng);
       tree.fit(sample);
       this.trees.push(tree);
     }
     return this;
   }
 
-  /**
-   * Compute anomaly score for a single point.
-   * @param {Array<number>} point - feature vector
-   * @returns {number} score in [0, 1]; higher = more anomalous
-   */
   scorePoint(point) {
     const avgPathLen =
       this.trees.reduce((sum, tree) => sum + tree.pathLength(point), 0) / this.trees.length;
@@ -151,22 +149,14 @@ class IsolationForest {
     return Math.pow(2, -avgPathLen / c);
   }
 
-  /**
-   * Compute anomaly scores for all points.
-   * @param {Array<Array<number>>} data
-   * @returns {Array<number>}
-   */
-  predict(data) {
-    return data.map((point) => this.scorePoint(point));
-  }
+  predict(data) { return data.map(point => this.scorePoint(point)); }
 
   _subsample(data, size) {
     if (size >= data.length) return [...data];
-    const result = new Array(size);
-    // Fisher-Yates partial shuffle
+    const result  = new Array(size);
     const indices = Array.from({ length: data.length }, (_, i) => i);
     for (let i = 0; i < size; i++) {
-      const j = i + Math.floor(Math.random() * (data.length - i));
+      const j = i + Math.floor(this.rng() * (data.length - i));
       [indices[i], indices[j]] = [indices[j], indices[i]];
       result[i] = data[indices[i]];
     }
@@ -174,4 +164,4 @@ class IsolationForest {
   }
 }
 
-module.exports = { IsolationForest };
+module.exports = { IsolationForest, makeRng, seedFromString };

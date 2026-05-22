@@ -1,7 +1,11 @@
 // repositories/anomaly.repository.js
 const BaseRepository = require('./base.repository');
 const AnomalyAlert = require('../models/AnomalyAlert.model');
-const { ANOMALY_STATUS } = require('../config/constants');
+const {
+  ANOMALY_STATUS,
+  ANOMALY_SUPPRESS_STATUSES,
+  ANOMALY_REVIEWED_STATUSES,
+} = require('../config/constants');
 const { sanitizeAndValidateId } = require('../utils/sanitize.helper');
 const logger = require('../config/logger');
 
@@ -11,40 +15,160 @@ class AnomalyRepository extends BaseRepository {
   }
 
   /**
-   * Create a single anomaly alert.
-   * @param {Object} data - { businessId, journalEntryId, anomalyScore, reason, featureVector, scanId }
-   * @returns {Promise<Object>}
+   * Upsert an alert keyed on (businessId, journalEntryId).
+   *
+   * If the alert already exists:
+   *   - User REVIEWED it → DO NOT downgrade their decision.  Only refresh the
+   *     score, fingerprint, lastScannedAt fields.  If fingerprint differs from
+   *     the stored one AND status is suppress-eligible, mark status='rescanned'
+   *     to re-surface in the UI.
+   *   - Still pending → update score, reason, breakdown.  Increment scanCount.
+   *
+   * If new:
+   *   - Insert fresh with status=pending.
+   *
+   * @param {Object} alertData - must include businessId, journalEntryId, anomalyScore, reason, scanId
+   * @returns {Promise<{ alert: Object, action: 'created'|'updated'|'suppressed'|'rescanned' }>}
    */
-  async createAlert(data) {
-    if (!data.businessId || !data.journalEntryId || !data.anomalyScore || !data.scanId) {
-      throw new Error('Missing required fields for anomaly alert');
+  async upsertAlert(alertData) {
+    if (!alertData.businessId || !alertData.journalEntryId ||
+        alertData.anomalyScore == null || !alertData.scanId) {
+      throw new Error('upsertAlert: missing required fields');
     }
-    return this.create(data);
+
+    const existing = await this.model.findOne({
+      businessId:     alertData.businessId,
+      journalEntryId: alertData.journalEntryId,
+    });
+
+    if (!existing) {
+      const created = await this.model.create({
+        ...alertData,
+        status:     ANOMALY_STATUS.PENDING,
+        scanCount:  1,
+      });
+      return { alert: created.toObject(), action: 'created' };
+    }
+
+    const wasReviewed = ANOMALY_REVIEWED_STATUSES.includes(existing.status);
+    const isSuppressed = ANOMALY_SUPPRESS_STATUSES.includes(existing.status);
+    const fingerprintChanged = alertData.transactionFingerprint &&
+      existing.transactionFingerprint &&
+      alertData.transactionFingerprint !== existing.transactionFingerprint;
+
+    // Build update payload — never overwrite reviewer's verdict unless txn changed
+    const update = {
+      anomalyScore:           alertData.anomalyScore,
+      reason:                 alertData.reason,
+      triggeredRules:         alertData.triggeredRules || [],
+      explanation:            alertData.explanation     || '',
+      featureVector:          alertData.featureVector   || null,
+      scoreBreakdown:         alertData.scoreBreakdown  || existing.scoreBreakdown,
+      confidence:             alertData.confidence      || existing.confidence,
+      lastScannedAt:          new Date(),
+      scanId:                 alertData.scanId,
+      scanCount:              (existing.scanCount || 1) + 1,
+      transactionFingerprint: alertData.transactionFingerprint || existing.transactionFingerprint,
+    };
+
+    let action = 'updated';
+
+    if (wasReviewed && fingerprintChanged) {
+      // Transaction changed materially → re-surface as 'rescanned' for review
+      update.status      = ANOMALY_STATUS.RESCANNED;
+      update.reviewedBy  = null;
+      update.reviewedAt  = null;
+      update.reviewNotes = '';
+      action = 'rescanned';
+    } else if (isSuppressed) {
+      // User already cleared this → keep status, just refresh metadata
+      action = 'suppressed';
+    }
+    // else: pending or confirmed_fraud → just update fields, keep status
+
+    const updated = await this.model.findOneAndUpdate(
+      { _id: existing._id },
+      { $set: update },
+      { new: true }
+    );
+
+    return { alert: updated.toObject(), action };
   }
 
   /**
-   * Bulk create alerts (for multiple flagged transactions in one scan).
-   * @param {Array} alertsArray - Array of alert objects
-   * @returns {Promise<Array>}
+   * Bulk version of upsertAlert.  Returns counts by action type.
+   */
+  async bulkUpsertAlerts(alertsArray) {
+    if (!alertsArray || !alertsArray.length) {
+      return { created: 0, updated: 0, suppressed: 0, rescanned: 0, alerts: [] };
+    }
+    const counts = { created: 0, updated: 0, suppressed: 0, rescanned: 0 };
+    const alerts = [];
+    for (const data of alertsArray) {
+      try {
+        const { alert, action } = await this.upsertAlert(data);
+        counts[action]++;
+        alerts.push(alert);
+      } catch (e) {
+        logger.warn(`bulkUpsertAlerts: skipping one (${e.message})`);
+      }
+    }
+    return { ...counts, alerts };
+  }
+
+  /**
+   * Look up existing decisions (any non-pending status) for the given
+   * journalEntryIds.  Used by the scanner to filter out suppressed transactions
+   * before running the model.
+   *
+   * @returns {Map<journalEntryId(string), { status, transactionFingerprint, reviewedAt }>}
+   */
+  async getDecisionsForJournalEntries(businessId, journalEntryIds) {
+    const validBizId = sanitizeAndValidateId(businessId);
+    if (!journalEntryIds || !journalEntryIds.length) return new Map();
+    const docs = await this.model.find({
+      businessId:     validBizId,
+      journalEntryId: { $in: journalEntryIds },
+      status:         { $in: ANOMALY_REVIEWED_STATUSES },
+    }).select('journalEntryId status transactionFingerprint reviewedAt').lean();
+
+    const map = new Map();
+    for (const d of docs) {
+      map.set(String(d.journalEntryId), {
+        status:                 d.status,
+        transactionFingerprint: d.transactionFingerprint,
+        reviewedAt:             d.reviewedAt,
+      });
+    }
+    return map;
+  }
+
+  /**
+   * Legacy: keep this method name for backward-compatibility with any callers
+   * that haven't been migrated to upsertAlert yet.
+   * Delegates to bulkUpsertAlerts.
    */
   async bulkCreateAlerts(alertsArray) {
-    if (!alertsArray || alertsArray.length === 0) return [];
-    return this.model.insertMany(alertsArray, { ordered: false });
+    const r = await this.bulkUpsertAlerts(alertsArray);
+    return r.alerts;
   }
 
-  /**
-   * Get pending (unreviewed) alerts for a business, with populated journal entry.
-   * @param {string} businessId
-   * @param {Object} pagination - { page, limit }
-   * @returns {Promise<{data: Array, total: number, page: number, limit: number}>}
-   */
+  async createAlert(data) {
+    const { alert } = await this.upsertAlert(data);
+    return alert;
+  }
+
   async getPendingAlerts(businessId, pagination = {}) {
     const validBusinessId = sanitizeAndValidateId(businessId);
     const { page = 1, limit = 25 } = pagination;
     const skip = (page - 1) * limit;
     const query = {
       businessId: validBusinessId,
-      status: ANOMALY_STATUS.PENDING,
+      status: { $in: [
+        ANOMALY_STATUS.PENDING,
+        ANOMALY_STATUS.PENDING_REVIEW,
+        ANOMALY_STATUS.RESCANNED,
+      ] },
     };
     const [data, total] = await Promise.all([
       this.model.find(query)
@@ -58,20 +182,34 @@ class AnomalyRepository extends BaseRepository {
     return { data, total, page, limit };
   }
 
-  /**
-   * Get alerts for a business with optional status filter.
-   * @param {string} businessId
-   * @param {string} status - 'pending', 'valid', 'confirmed_issue' (optional)
-   * @param {Object} pagination - { page, limit }
-   * @returns {Promise<{data: Array, total: number, page: number, limit: number}>}
-   */
   async getByBusiness(businessId, status = null, pagination = {}) {
     const validBusinessId = sanitizeAndValidateId(businessId);
     const { page = 1, limit = 25 } = pagination;
     const skip = (page - 1) * limit;
     const query = { businessId: validBusinessId };
-    if (status && Object.values(ANOMALY_STATUS).includes(status)) {
-      query.status = status;
+    if (status) {
+      // Translate legacy aliases on the way in
+      const aliasMap = {
+        legit:           ANOMALY_STATUS.MARKED_LEGIT,
+        fraud:           ANOMALY_STATUS.CONFIRMED_FRAUD,
+      };
+      const normalised = aliasMap[status] || status;
+      if (Object.values(ANOMALY_STATUS).includes(normalised)) {
+        // For "pending" filter, include the rescanned variants as well
+        if (normalised === ANOMALY_STATUS.PENDING) {
+          query.status = { $in: [
+            ANOMALY_STATUS.PENDING,
+            ANOMALY_STATUS.PENDING_REVIEW,
+            ANOMALY_STATUS.RESCANNED,
+          ] };
+        } else if (normalised === ANOMALY_STATUS.MARKED_LEGIT) {
+          query.status = { $in: [ANOMALY_STATUS.MARKED_LEGIT, ANOMALY_STATUS.VALID] };
+        } else if (normalised === ANOMALY_STATUS.CONFIRMED_FRAUD) {
+          query.status = { $in: [ANOMALY_STATUS.CONFIRMED_FRAUD, ANOMALY_STATUS.CONFIRMED_ISSUE] };
+        } else {
+          query.status = normalised;
+        }
+      }
     }
     const [data, total] = await Promise.all([
       this.model.find(query)
@@ -87,34 +225,27 @@ class AnomalyRepository extends BaseRepository {
   }
 
   /**
-   * Update the status of an anomaly alert (e.g., after user review).
-   * @param {string} alertId
-   * @param {string} status - 'valid' or 'confirmed_issue'
-   * @param {string} reviewedBy - User ID of reviewer
-   * @returns {Promise<Object|null>}
+   * Update an alert's status (called from user-review UI).
+   * Idempotent — calling twice with same status produces same result.
    */
-  async updateAlertStatus(alertId, status, reviewedBy) {
+  async updateAlertStatus(alertId, status, reviewedBy, notes = '') {
     const validAlertId = sanitizeAndValidateId(alertId);
     if (!Object.values(ANOMALY_STATUS).includes(status)) {
       throw new Error(`Invalid status: ${status}`);
     }
-    if (status === ANOMALY_STATUS.PENDING) {
+    if (status === ANOMALY_STATUS.PENDING || status === ANOMALY_STATUS.PENDING_REVIEW) {
       throw new Error('Cannot set status back to pending');
     }
     const validReviewer = sanitizeAndValidateId(reviewedBy);
-    return this.update(validAlertId, {
+    const update = {
       status,
       reviewedBy: validReviewer,
       reviewedAt: new Date(),
-    });
+    };
+    if (notes) update.reviewNotes = String(notes).substring(0, 1000);
+    return this.update(validAlertId, update);
   }
 
-  /**
-   * Get all alerts from a specific scan batch (for debugging or batch reprocessing).
-   * @param {string} scanId - Unique identifier of the scan run
-   * @param {string} businessId
-   * @returns {Promise<Array>}
-   */
   async getByScanId(scanId, businessId) {
     const validBusinessId = sanitizeAndValidateId(businessId);
     return this.model.find({
@@ -122,24 +253,20 @@ class AnomalyRepository extends BaseRepository {
       businessId: validBusinessId,
     })
       .populate('journalEntryId')
-      .sort({ anomalyScore: 1 }) // most anomalous first (more negative)
+      .sort({ anomalyScore: -1 })  // highest score first
       .lean();
   }
 
-  /**
-   * Get alerts that have been pending for longer than specified hours.
-   * Used for reminder jobs.
-   * @param {string} businessId
-   * @param {number} hoursOld - Minimum age in hours
-   * @returns {Promise<Array>}
-   */
   async getStalePendingAlerts(businessId, hoursOld = 24) {
     const validBusinessId = sanitizeAndValidateId(businessId);
     const cutoff = new Date();
     cutoff.setHours(cutoff.getHours() - hoursOld);
     return this.model.find({
       businessId: validBusinessId,
-      status: ANOMALY_STATUS.PENDING,
+      status: { $in: [
+        ANOMALY_STATUS.PENDING,
+        ANOMALY_STATUS.PENDING_REVIEW,
+      ] },
       detectedAt: { $lte: cutoff },
     })
       .populate('journalEntryId')
@@ -148,32 +275,35 @@ class AnomalyRepository extends BaseRepository {
   }
 
   /**
-   * Get counts of alerts by status for a business (for notification badge).
-   * @param {string} businessId
-   * @returns {Promise<Object>} { pending: number, valid: number, confirmed_issue: number }
+   * Counts by status — merges legacy aliases with new statuses.
    */
   async countByBusinessAndStatus(businessId) {
     const validBusinessId = sanitizeAndValidateId(businessId);
     const result = await this.model.aggregate([
       { $match: { businessId: validBusinessId } },
-      { $group: { _id: '$status', count: { $sum: 1 } } },
+      { $group:  { _id: '$status', count: { $sum: 1 } } },
     ]);
     const counts = {
-      [ANOMALY_STATUS.PENDING]: 0,
-      [ANOMALY_STATUS.VALID]: 0,
-      [ANOMALY_STATUS.CONFIRMED_ISSUE]: 0,
+      pending:          0,
+      pending_review:   0,
+      marked_legit:     0,
+      confirmed_fraud:  0,
+      ignored:          0,
+      rescanned:        0,
+      // Legacy aliases (kept for backward compat with frontend)
+      valid:            0,
+      confirmed_issue:  0,
     };
     result.forEach(item => {
-      counts[item._id] = item.count;
+      if (item._id in counts) counts[item._id] = item.count;
     });
+    // Surface a "total reviewed" convenience field
+    counts.totalReviewed = counts.marked_legit + counts.confirmed_fraud +
+                           counts.ignored + counts.valid + counts.confirmed_issue;
+    counts.totalPending  = counts.pending + counts.pending_review + counts.rescanned;
     return counts;
   }
 
-  /**
-   * Delete alerts older than a certain date (maintenance, if needed).
-   * @param {Date} olderThan
-   * @returns {Promise<number>}
-   */
   async deleteOlderThan(olderThan) {
     const result = await this.model.deleteMany({ detectedAt: { $lt: olderThan } });
     logger.warn(`Deleted ${result.deletedCount} anomaly alerts older than ${olderThan}`);

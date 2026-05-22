@@ -27,7 +27,7 @@ const parseNaturalLanguage = async (req, res, next) => {
 };
 
 /**
- * AI assistant chat — powered by Gemini Flash with live financial context.
+ * AI assistant chat — powered by Groq (LLaMA) with live financial context.
  * POST /api/v1/ai/rag-query
  */
 const ragQuery = async (req, res, next) => {
@@ -85,13 +85,16 @@ const forecast = async (req, res, next) => {
 };
 
 /**
- * Run Isolation Forest anomaly scan on recent transactions.
- * POST /api/v1/ai/anomaly-scan
- * Returns scan summary + formatted anomaly list for immediate display.
+ * Run anomaly scan on recent transactions.
+ * POST /api/v1/ai/anomaly-scan   body: { force?: boolean }
+ *
+ * When `force=true`, previously cleared (legit / ignored) transactions are
+ * re-scored — used by admins for a full audit run.  Default: respect decisions.
  */
 const anomalyScan = async (req, res, next) => {
   try {
-    const result = await anomalyDetectionService.runScan(req.user.businessId);
+    const force = Boolean(req.body?.force);
+    const result = await anomalyDetectionService.runScan(req.user.businessId, { force });
     ApiResponse.success(res, result, 'Anomaly scan completed');
   } catch (error) {
     next(error);
@@ -119,17 +122,19 @@ const getAnomalyAlerts = async (req, res, next) => {
 /**
  * Review / classify an anomaly alert.
  * PUT /api/v1/ai/anomaly-alerts/:id/review
- * Body: { action: "legitimate" | "fraud" }
+ * Body: { action: "legitimate" | "fraud" | "ignore", notes?: string }
  */
 const reviewAnomalyAlert = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { action } = req.body;
-    if (!action || !['legitimate', 'fraud'].includes(action)) {
-      throw new ApiError(400, 'action must be "legitimate" or "fraud"');
+    const { action, notes = '' } = req.body || {};
+    const allowed = ['legitimate', 'fraud', 'ignore', 'legit', 'mark_legit',
+                     'confirm_fraud', 'ignored', 'dismiss'];
+    if (!action || !allowed.includes(action)) {
+      throw new ApiError(400, 'action must be one of: legitimate | fraud | ignore');
     }
     const userId = req.user._id || req.user.id;
-    const updated = await anomalyDetectionService.reviewAlert(id, action, userId);
+    const updated = await anomalyDetectionService.reviewAlert(id, action, userId, notes);
     ApiResponse.success(res, updated, 'Alert reviewed successfully');
   } catch (error) {
     next(error);

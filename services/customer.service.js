@@ -1,7 +1,10 @@
 const customerRepository = require('../repositories/customer.repository');
 const transactionRepository = require('../repositories/transaction.repository');
+const JournalEntry = require('../models/JournalEntry.model');
 const { ApiError } = require('../utils/ApiError');
+const { TRANSACTION_TYPES, PAYMENT_STATUS } = require('../config/constants');
 const logger = require('../config/logger');
+const mongoose = require('mongoose');
 
 class CustomerService {
   /**
@@ -95,6 +98,132 @@ class CustomerService {
       throw new ApiError(404, 'Customer not found');
     }
     return transactionRepository.findByCustomer(businessId, customerId, filters, pagination);
+  }
+
+  /**
+   * Aggregate ERP-style customer activity statistics.
+   *
+   * Returns:
+   *   - currentReceivable       : Outstanding AR (denormalized field)
+   *   - lifetimeRevenue         : Sum of all Credit Sale + Income amounts
+   *   - lifetimePaymentsReceived: Sum of Payment Received amounts
+   *   - invoiceCount            : Count of Credit Sale entries
+   *   - paymentCount            : Count of Payment Received entries
+   *   - avgInvoiceValue         : Average Credit Sale amount
+   *   - overdueCount            : Number of overdue invoices (paymentStatus = OVERDUE)
+   *   - lastInvoiceDate         : Most recent Credit Sale date
+   *   - lastPaymentDate         : Most recent Payment Received date
+   *   - lastActivityDate        : Most recent activity of ANY type
+   *
+   * @param {string} customerId
+   * @param {string} businessId
+   * @returns {Promise<Object>}
+   */
+  async getCustomerStats(customerId, businessId) {
+    const customer = await customerRepository.findByBusinessAndId(businessId, customerId);
+    if (!customer) throw new ApiError(404, 'Customer not found');
+
+    const customerObjId = new mongoose.Types.ObjectId(String(customerId));
+    const businessObjId = new mongoose.Types.ObjectId(String(businessId));
+
+    const [stats] = await JournalEntry.aggregate([
+      {
+        $match: {
+          businessId: businessObjId,
+          customerId: customerObjId,
+          isArchived: { $ne: true },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          lifetimeRevenue: {
+            $sum: {
+              $cond: [
+                { $in: ['$transactionType', [TRANSACTION_TYPES.CREDIT_SALE, TRANSACTION_TYPES.INCOME]] },
+                '$amount',
+                0,
+              ],
+            },
+          },
+          lifetimePaymentsReceived: {
+            $sum: {
+              $cond: [
+                { $eq: ['$transactionType', TRANSACTION_TYPES.PAYMENT_RECEIVED] },
+                '$amount',
+                0,
+              ],
+            },
+          },
+          invoiceCount: {
+            $sum: {
+              $cond: [{ $eq: ['$transactionType', TRANSACTION_TYPES.CREDIT_SALE] }, 1, 0],
+            },
+          },
+          paymentCount: {
+            $sum: {
+              $cond: [{ $eq: ['$transactionType', TRANSACTION_TYPES.PAYMENT_RECEIVED] }, 1, 0],
+            },
+          },
+          overdueCount: {
+            $sum: {
+              $cond: [{ $eq: ['$paymentStatus', PAYMENT_STATUS.OVERDUE] }, 1, 0],
+            },
+          },
+          invoiceAmountSum: {
+            $sum: {
+              $cond: [{ $eq: ['$transactionType', TRANSACTION_TYPES.CREDIT_SALE] }, '$amount', 0],
+            },
+          },
+          lastInvoiceDate: {
+            $max: {
+              $cond: [
+                { $eq: ['$transactionType', TRANSACTION_TYPES.CREDIT_SALE] },
+                '$transactionDate',
+                null,
+              ],
+            },
+          },
+          lastPaymentDate: {
+            $max: {
+              $cond: [
+                { $eq: ['$transactionType', TRANSACTION_TYPES.PAYMENT_RECEIVED] },
+                '$transactionDate',
+                null,
+              ],
+            },
+          },
+          lastActivityDate: { $max: '$transactionDate' },
+        },
+      },
+    ]);
+
+    const safe = stats || {
+      lifetimeRevenue: 0,
+      lifetimePaymentsReceived: 0,
+      invoiceCount: 0,
+      paymentCount: 0,
+      overdueCount: 0,
+      invoiceAmountSum: 0,
+      lastInvoiceDate: null,
+      lastPaymentDate: null,
+      lastActivityDate: null,
+    };
+
+    return {
+      currentReceivable: customer.currentReceivableBalance || 0,
+      lifetimeRevenue: safe.lifetimeRevenue,
+      lifetimePaymentsReceived: safe.lifetimePaymentsReceived,
+      invoiceCount: safe.invoiceCount,
+      paymentCount: safe.paymentCount,
+      overdueCount: safe.overdueCount,
+      avgInvoiceValue: safe.invoiceCount > 0
+        ? Math.round((safe.invoiceAmountSum / safe.invoiceCount) * 100) / 100
+        : 0,
+      lastInvoiceDate: safe.lastInvoiceDate,
+      lastPaymentDate: safe.lastPaymentDate,
+      lastActivityDate: safe.lastActivityDate,
+    };
   }
 
   /**

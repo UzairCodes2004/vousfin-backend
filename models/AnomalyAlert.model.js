@@ -3,9 +3,19 @@ const mongoose = require('mongoose');
 const { ANOMALY_STATUS } = require('../config/constants');
 
 /**
- * AnomalyAlert Schema
- * Stores flagged transactions from Isolation Forest anomaly detection.
- * Users can review and classify each alert.
+ * AnomalyAlert Schema (v2)
+ *
+ * Persistent record of a flagged transaction.  Tied 1:1 to a `journalEntryId`
+ * via a compound unique index so the SAME transaction is never duplicated
+ * across rescans.  Instead, rescans UPDATE the existing alert (or skip it if
+ * the user has already given a verdict).
+ *
+ * Lifecycle (see config/constants.js → ANOMALY_STATUS):
+ *   pending          - newly flagged
+ *   marked_legit     - user OK'd it — suppress in future scans
+ *   confirmed_fraud  - user flagged as fraud — keep tracked
+ *   ignored          - dismissed — suppress for N days
+ *   rescanned        - reviewed but txn changed → eligible to re-flag
  */
 const anomalyAlertSchema = new mongoose.Schema(
   {
@@ -24,18 +34,34 @@ const anomalyAlertSchema = new mongoose.Schema(
     anomalyScore: {
       type: Number,
       required: true,
-      // Negative scores indicate more anomalous (Isolation Forest convention)
+      // 0-1 range. 1.0 = highly anomalous, 0.5 = neutral, 0.0 = definitely normal
     },
     reason: {
       type: String,
       required: true,
       trim: true,
     },
+    // Detailed explainability fields (Step 7)
+    triggeredRules: {
+      type: [String],
+      default: [],
+      // e.g. ['amount_zscore_3.5', 'weekend_transaction', 'rare_account_pair']
+    },
+    explanation: {
+      type: String,
+      default: '',
+      // Long-form human-readable explanation: "Amount PKR 250,000 is 4.8× the normal vendor average..."
+    },
     featureVector: {
       type: mongoose.Schema.Types.Mixed,
       default: null,
-      // Stores the feature values used for detection: 
-      // { amount, dayOfWeek, transactionType, accountPairFreq, interval }
+    },
+    // Used to detect whether the transaction has materially changed since
+    // the alert was created. If unchanged & user has reviewed it → suppress.
+    transactionFingerprint: {
+      type: String,
+      default: null,
+      index: true,
     },
     status: {
       type: String,
@@ -53,11 +79,40 @@ const anomalyAlertSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    reviewNotes: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    // Multi-component score breakdown (Step 3)
+    scoreBreakdown: {
+      isolationForest:   { type: Number, default: 0 }, // [0,1]
+      zScore:            { type: Number, default: 0 }, // [0,1]
+      heuristic:         { type: Number, default: 0 }, // [0,1]
+      behavioral:        { type: Number, default: 0 }, // [0,1]
+      frequency:         { type: Number, default: 0 }, // [0,1]
+      velocity:          { type: Number, default: 0 }, // [0,1]
+    },
+    confidence: {
+      type: Number,
+      default: 0,
+      // 0-100% how confident the ensemble is in this anomaly classification
+    },
     detectedAt: {
       type: Date,
       default: Date.now,
       required: true,
       index: true,
+    },
+    lastScannedAt: {
+      type: Date,
+      default: Date.now,
+      // Updated on each rescan (even if no change). Useful for "stale alerts".
+    },
+    scanCount: {
+      type: Number,
+      default: 1,
+      // How many times this transaction has been flagged across rescans
     },
     scanId: {
       type: String,
@@ -66,7 +121,7 @@ const anomalyAlertSchema = new mongoose.Schema(
     },
   },
   {
-    timestamps: false, // using custom detectedAt
+    timestamps: false,
     toJSON: {
       transform: (doc, ret) => {
         delete ret.__v;
@@ -76,63 +131,50 @@ const anomalyAlertSchema = new mongoose.Schema(
   }
 );
 
-// ===============================
-// Indexes
-// ===============================
-// For listing pending alerts for a business
+// ── Indexes ───────────────────────────────────────────────────────────────────
+// One alert per (business, journal-entry) — prevents duplicates on rescan.
+// PartialFilter ensures already-soft-deleted records don't block re-creation.
+anomalyAlertSchema.index(
+  { businessId: 1, journalEntryId: 1 },
+  { unique: true, name: 'uniq_biz_journal' }
+);
+// Listing pending alerts
 anomalyAlertSchema.index({ businessId: 1, status: 1, detectedAt: -1 });
-// For finding alerts by scan batch
+// Scan batch lookups
 anomalyAlertSchema.index({ scanId: 1 });
-// For counting alerts per business (admin dashboard)
+// Dashboard counts
 anomalyAlertSchema.index({ businessId: 1, detectedAt: -1 });
 
-// ===============================
-// Instance Methods
-// ===============================
-
-/**
- * Mark alert as reviewed with classification.
- * @param {string} userId - ID of the reviewing user
- * @param {string} classification - 'valid' or 'confirmed_issue'
- * @returns {Promise<AnomalyAlert>}
- */
-anomalyAlertSchema.methods.review = async function (userId, classification) {
+// ── Instance methods ─────────────────────────────────────────────────────────
+anomalyAlertSchema.methods.review = async function (userId, classification, notes = '') {
   if (!Object.values(ANOMALY_STATUS).includes(classification)) {
-    throw new Error('Invalid classification');
+    throw new Error(`Invalid classification: ${classification}`);
   }
-  this.status = classification;
-  this.reviewedBy = userId;
-  this.reviewedAt = new Date();
+  if (classification === ANOMALY_STATUS.PENDING ||
+      classification === ANOMALY_STATUS.PENDING_REVIEW) {
+    throw new Error('Cannot set status back to pending via review()');
+  }
+  this.status      = classification;
+  this.reviewedBy  = userId;
+  this.reviewedAt  = new Date();
+  if (notes) this.reviewNotes = String(notes).substring(0, 1000);
   return this.save();
 };
 
-// ===============================
-// Statics
-// ===============================
-
-/**
- * Get all pending (unreviewed) alerts for a business.
- * @param {string} businessId
- * @param {Object} options - pagination
- * @returns {Promise<Array>}
- */
+// ── Statics ──────────────────────────────────────────────────────────────────
 anomalyAlertSchema.statics.getPendingAlerts = async function (businessId, options = {}) {
   const { page = 1, limit = 25 } = options;
   const skip = (page - 1) * limit;
-  return this.find({ businessId, status: ANOMALY_STATUS.PENDING })
+  return this.find({
+    businessId,
+    status: { $in: [ANOMALY_STATUS.PENDING, ANOMALY_STATUS.PENDING_REVIEW, ANOMALY_STATUS.RESCANNED] },
+  })
     .sort({ detectedAt: -1 })
     .skip(skip)
     .limit(limit)
     .populate('journalEntryId');
 };
 
-/**
- * Get all alerts for a business (paginated) with optional status filter.
- * @param {string} businessId
- * @param {string} status - pending, valid, confirmed_issue
- * @param {Object} pagination
- * @returns {Promise<{data: Array, total: number}>}
- */
 anomalyAlertSchema.statics.getByBusiness = async function (businessId, status = null, pagination = {}) {
   const { page = 1, limit = 25 } = pagination;
   const skip = (page - 1) * limit;
@@ -147,32 +189,22 @@ anomalyAlertSchema.statics.getByBusiness = async function (businessId, status = 
   return { data, total, page, limit };
 };
 
-/**
- * Get anomaly alerts that are still pending and older than a certain time (for reminders).
- * @param {string} businessId
- * @param {number} hoursAgo
- * @returns {Promise<Array>}
- */
 anomalyAlertSchema.statics.getStalePendingAlerts = function (businessId, hoursAgo = 24) {
   const cutoff = new Date();
   cutoff.setHours(cutoff.getHours() - hoursAgo);
   return this.find({
     businessId,
-    status: ANOMALY_STATUS.PENDING,
+    status: { $in: [ANOMALY_STATUS.PENDING, ANOMALY_STATUS.PENDING_REVIEW] },
     detectedAt: { $lte: cutoff },
   }).sort({ detectedAt: 1 });
 };
 
-// ===============================
-// Pre-save Middleware
-// ===============================
+// ── Pre-save ─────────────────────────────────────────────────────────────────
 anomalyAlertSchema.pre('save', function () {
   if (!this.detectedAt) this.detectedAt = new Date();
+  this.lastScannedAt = new Date();
 });
 
-// ===============================
-// Model Export
-// ===============================
 const AnomalyAlert = mongoose.model('AnomalyAlert', anomalyAlertSchema);
 
 module.exports = AnomalyAlert;

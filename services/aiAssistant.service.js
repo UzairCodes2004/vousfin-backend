@@ -1,19 +1,20 @@
 /**
  * @module aiAssistant.service
- * @description Real AI financial assistant using Gemini Flash.
+ * @description Real AI financial assistant using Groq (LLaMA).
  * Collects live accounting data, builds a compact context summary,
- * and sends it to Gemini Flash to answer financial questions.
+ * and sends it to Groq to answer financial questions.
  *
- * Reuses the same GEMINI_API_KEY and model as the NL Parser.
- * Does NOT touch the forecasting service or any unrelated modules.
+ * Uses GROQ_API_KEY from .env. Does NOT touch the NL Parser,
+ * forecasting service, or any unrelated modules.
  */
 
 const reportService = require('./report.service');
 const { extractJSON } = require('./nlParser/services/geminiService');
 const logger = require('../config/logger');
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
-const TIMEOUT_MS = 30000;
+const GROQ_MODEL   = process.env.GROQ_MODEL   || 'llama-3.3-70b-versatile';
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const TIMEOUT_MS   = 30000;
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 
@@ -211,35 +212,50 @@ function formatContext(ctx) {
   return lines.join('\n');
 }
 
-// ── Gemini API call helper ────────────────────────────────────────────────────
+// ── Groq API call helper ──────────────────────────────────────────────────────
 
-async function callGemini(requestBody, retries = 2) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY environment variable is not set');
+/**
+ * Send a messages array to Groq and return the assistant's text response.
+ * @param {Array<{role:string,content:string}>} messages - OpenAI-format messages
+ * @param {object} opts - Optional overrides: temperature, max_tokens
+ * @param {number} retries
+ */
+async function callGroq(messages, opts = {}, retries = 2) {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error('GROQ_API_KEY environment variable is not set');
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+  const body = {
+    model:       GROQ_MODEL,
+    messages,
+    temperature: opts.temperature  ?? 0.5,
+    max_tokens:  opts.max_tokens   ?? 800,
+    stream:      false,
+  };
 
   let lastError;
   for (let attempt = 1; attempt <= retries; attempt++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody),
+      const res = await fetch(GROQ_API_URL, {
+        method:  'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body:   JSON.stringify(body),
         signal: controller.signal,
       });
       clearTimeout(timer);
 
       if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`Gemini API error (${res.status}): ${body.slice(0, 200)}`);
+        const errBody = await res.text().catch(() => '');
+        throw new Error(`Groq API error (${res.status}): ${errBody.slice(0, 300)}`);
       }
 
       const data = await res.json();
-      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!text) throw new Error('Gemini returned an empty response');
+      const text = data?.choices?.[0]?.message?.content;
+      if (!text) throw new Error('Groq returned an empty response');
       return text.trim();
     } catch (err) {
       clearTimeout(timer);
@@ -253,7 +269,7 @@ async function callGemini(requestBody, retries = 2) {
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 /**
- * Answer a financial question using live data + Gemini Flash.
+ * Answer a financial question using live data + Groq (LLaMA).
  *
  * @param {string} question - User's question
  * @param {string} businessId - Authenticated business ID
@@ -265,37 +281,28 @@ async function chat(question, businessId, chatHistory = []) {
   const ctx = await buildFinancialContext(businessId);
   const contextBlock = formatContext(ctx);
 
-  // Convert prior messages to Gemini format (last 8 to limit tokens)
-  const priorMessages = chatHistory
+  // System message
+  const messages = [{ role: 'system', content: SYSTEM_PROMPT }];
+
+  // Prior conversation history — last 8 turns, OpenAI format
+  chatHistory
     .slice(-8)
     .filter((m) => m.role === 'user' || m.role === 'assistant')
-    .map((m) => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }],
-    }));
+    .forEach((m) => messages.push({ role: m.role, content: m.content }));
 
-  // Current user turn: inject financial context into the message
-  const currentTurn = {
-    role: 'user',
-    parts: [{ text: `${contextBlock}\n\nQuestion: ${question}` }],
-  };
+  // Current user turn: inject live financial context before the question
+  messages.push({
+    role:    'user',
+    content: `${contextBlock}\n\nQuestion: ${question}`,
+  });
 
-  const requestBody = {
-    system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
-    contents: [...priorMessages, currentTurn],
-    generationConfig: {
-      temperature: 0.5,
-      maxOutputTokens: 800,
-    },
-  };
-
-  const answer = await callGemini(requestBody);
+  const answer = await callGroq(messages, { temperature: 0.5, max_tokens: 800 });
   return { answer };
 }
 
 /**
  * Generate 3-4 AI-powered actionable financial recommendations
- * based on live accounting data. Falls back to rule-based tips if Gemini fails.
+ * based on live accounting data. Falls back to rule-based tips if Groq fails.
  *
  * @param {string} businessId
  * @returns {Promise<Array<{ type: string, text: string }>>}
@@ -316,33 +323,26 @@ async function generateRecommendations(businessId) {
   const prompt = `${contextBlock}
 
 Generate exactly 3 to 4 specific, actionable financial recommendations for this business based on the data above.
-Return a JSON array only — no extra text:
+Return a JSON array ONLY — no extra text, no markdown, no explanation:
 [
   { "type": "warning|positive|info", "text": "recommendation text (1-2 sentences, specific to the numbers)" }
 ]
 Use "warning" for risks/problems, "positive" for strengths/opportunities, "info" for neutral tips.`;
 
   try {
-    const requestBody = {
-      system_instruction: {
-        parts: [{ text: 'You are a financial advisor. Output only a valid JSON array of recommendations.' }],
-      },
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.3,
-        maxOutputTokens: 500,
-        responseMimeType: 'application/json',
-      },
-    };
+    const messages = [
+      { role: 'system', content: 'You are a financial advisor. Output ONLY a valid JSON array of recommendations. No markdown, no explanation.' },
+      { role: 'user',   content: prompt },
+    ];
 
-    const raw = await callGemini(requestBody, 2);
+    const raw    = await callGroq(messages, { temperature: 0.3, max_tokens: 500 });
     const parsed = extractJSON(raw);
 
     if (Array.isArray(parsed) && parsed.length > 0) return parsed;
     if (Array.isArray(parsed?.recommendations)) return parsed.recommendations;
     throw new Error('Unexpected JSON shape');
   } catch (err) {
-    logger.warn('[aiAssistant] Recommendations Gemini call failed, using rule-based fallback:', err.message);
+    logger.warn('[aiAssistant] Recommendations Groq call failed, using rule-based fallback:', err.message);
     return buildRuleBasedRecommendations(ctx);
   }
 }

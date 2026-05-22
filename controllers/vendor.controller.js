@@ -86,3 +86,12 @@ exports.toggleActive = async (req, res, next) => {
     next(error);
   }
 };
+
+exports.getVendorStats = async (req, res, next) => {
+  try {
+    const stats = await vendorService.getVendorStats(req.params.id, req.user.businessId);
+    ApiResponse.success(res, stats, 'Vendor stats retrieved');
+  } catch (error) {
+    next(error);
+  }
+};

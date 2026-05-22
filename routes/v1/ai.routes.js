@@ -27,7 +27,11 @@ const semanticSearchSchema = Joi.object({
 });
 
 const reviewAlertSchema = Joi.object({
-  action: Joi.string().valid('legitimate', 'fraud').required(),
+  action: Joi.string()
+    .valid('legitimate', 'fraud', 'ignore', 'legit', 'mark_legit',
+           'confirm_fraud', 'ignored', 'dismiss')
+    .required(),
+  notes: Joi.string().max(1000).optional().allow(''),
 });
 
 // ─── All AI routes require auth + business context ─────────────────────────────

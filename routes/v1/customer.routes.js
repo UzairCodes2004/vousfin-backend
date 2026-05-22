@@ -49,4 +49,10 @@ router.patch(
   customerController.toggleActive
 );
 
+router.get(
+  '/:id/stats',
+  validate(customerIdParamSchema, 'params'),
+  customerController.getCustomerStats
+);
+
 module.exports = router;

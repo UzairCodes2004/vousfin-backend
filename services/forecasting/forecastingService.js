@@ -222,8 +222,14 @@ function generateForecast(target = 'Revenue', months = 6, localTransactions = []
     ? growthFactors.reduce((a, b) => a + b, 0) / growthFactors.length
     : 1;
 
+  // Deterministic trend: use average MoM rate from the dataset instead of Math.random()
+  const allValues = monthlySeries.map(m => m[metricKey]).filter(v => v > 0);
+  const avgMoM = allValues.length > 1
+    ? (allValues[allValues.length - 1] - allValues[0]) / allValues[0] / (allValues.length - 1)
+    : 0.025; // 2.5% default if only one data point
+
   for (let i = 0; i < months; i++) {
-    const trend = 1 + (0.01 + Math.random() * 0.04); // 1-5% monthly growth
+    const trend = 1 + Math.max(-0.08, Math.min(0.12, avgMoM));
     const seasonalFactor = 1 + Math.sin((historicalMonths + i) * Math.PI / 6) * 0.05;
     const base = (i === 0 ? lastHistorical : predicted[i - 1]) * trend * seasonalFactor;
 

@@ -49,4 +49,10 @@ router.patch(
   vendorController.toggleActive
 );
 
+router.get(
+  '/:id/stats',
+  validate(vendorIdParamSchema, 'params'),
+  vendorController.getVendorStats
+);
+
 module.exports = router;

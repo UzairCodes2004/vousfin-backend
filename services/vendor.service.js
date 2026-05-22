@@ -1,7 +1,10 @@
 const vendorRepository = require('../repositories/vendor.repository');
 const transactionRepository = require('../repositories/transaction.repository');
+const JournalEntry = require('../models/JournalEntry.model');
 const { ApiError } = require('../utils/ApiError');
+const { TRANSACTION_TYPES, PAYMENT_STATUS } = require('../config/constants');
 const logger = require('../config/logger');
+const mongoose = require('mongoose');
 
 class VendorService {
   /**
@@ -95,6 +98,121 @@ class VendorService {
       throw new ApiError(404, 'Vendor not found');
     }
     return transactionRepository.findByVendor(businessId, vendorId, filters, pagination);
+  }
+
+  /**
+   * Aggregate ERP-style vendor activity statistics.
+   * Mirror of customer stats but tracks purchases instead of revenue.
+   *
+   * @param {string} vendorId
+   * @param {string} businessId
+   * @returns {Promise<Object>}
+   */
+  async getVendorStats(vendorId, businessId) {
+    const vendor = await vendorRepository.findByBusinessAndId(businessId, vendorId);
+    if (!vendor) throw new ApiError(404, 'Vendor not found');
+
+    const vendorObjId   = new mongoose.Types.ObjectId(String(vendorId));
+    const businessObjId = new mongoose.Types.ObjectId(String(businessId));
+
+    const [stats] = await JournalEntry.aggregate([
+      {
+        $match: {
+          businessId: businessObjId,
+          vendorId: vendorObjId,
+          isArchived: { $ne: true },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          lifetimePurchases: {
+            $sum: {
+              $cond: [
+                { $in: ['$transactionType', [TRANSACTION_TYPES.CREDIT_PURCHASE, TRANSACTION_TYPES.EXPENSE]] },
+                '$amount',
+                0,
+              ],
+            },
+          },
+          lifetimePaymentsMade: {
+            $sum: {
+              $cond: [
+                { $eq: ['$transactionType', TRANSACTION_TYPES.PAYMENT_MADE] },
+                '$amount',
+                0,
+              ],
+            },
+          },
+          billCount: {
+            $sum: {
+              $cond: [{ $eq: ['$transactionType', TRANSACTION_TYPES.CREDIT_PURCHASE] }, 1, 0],
+            },
+          },
+          paymentCount: {
+            $sum: {
+              $cond: [{ $eq: ['$transactionType', TRANSACTION_TYPES.PAYMENT_MADE] }, 1, 0],
+            },
+          },
+          overdueCount: {
+            $sum: {
+              $cond: [{ $eq: ['$paymentStatus', PAYMENT_STATUS.OVERDUE] }, 1, 0],
+            },
+          },
+          billAmountSum: {
+            $sum: {
+              $cond: [{ $eq: ['$transactionType', TRANSACTION_TYPES.CREDIT_PURCHASE] }, '$amount', 0],
+            },
+          },
+          lastBillDate: {
+            $max: {
+              $cond: [
+                { $eq: ['$transactionType', TRANSACTION_TYPES.CREDIT_PURCHASE] },
+                '$transactionDate',
+                null,
+              ],
+            },
+          },
+          lastPaymentDate: {
+            $max: {
+              $cond: [
+                { $eq: ['$transactionType', TRANSACTION_TYPES.PAYMENT_MADE] },
+                '$transactionDate',
+                null,
+              ],
+            },
+          },
+          lastActivityDate: { $max: '$transactionDate' },
+        },
+      },
+    ]);
+
+    const safe = stats || {
+      lifetimePurchases: 0,
+      lifetimePaymentsMade: 0,
+      billCount: 0,
+      paymentCount: 0,
+      overdueCount: 0,
+      billAmountSum: 0,
+      lastBillDate: null,
+      lastPaymentDate: null,
+      lastActivityDate: null,
+    };
+
+    return {
+      currentPayable: vendor.currentPayableBalance || 0,
+      lifetimePurchases: safe.lifetimePurchases,
+      lifetimePaymentsMade: safe.lifetimePaymentsMade,
+      billCount: safe.billCount,
+      paymentCount: safe.paymentCount,
+      overdueCount: safe.overdueCount,
+      avgBillValue: safe.billCount > 0
+        ? Math.round((safe.billAmountSum / safe.billCount) * 100) / 100
+        : 0,
+      lastBillDate: safe.lastBillDate,
+      lastPaymentDate: safe.lastPaymentDate,
+      lastActivityDate: safe.lastActivityDate,
+    };
   }
 
   /**

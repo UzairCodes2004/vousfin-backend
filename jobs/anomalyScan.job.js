@@ -1,19 +1,20 @@
 // jobs/anomalyScan.job.js
 const cron = require('node-cron');
-const aiPlaceholderService = require('../services/aiPlaceholder.service');
+const anomalyDetectionService = require('../services/anomalyDetection.service');
 const userRepository = require('../repositories/user.repository');
 const logger = require('../config/logger');
 const config = require('../config');
 
 /**
  * Run anomaly detection for a single business.
+ * Background scans always respect existing user decisions (force=false).
  * @param {string} businessId
  * @returns {Promise<Object>}
  */
 const runScanForBusiness = async (businessId) => {
   try {
-    const result = await aiPlaceholderService.anomalyScan(businessId);
-    logger.info(`Anomaly scan for business ${businessId}: ${result.anomaliesFound} anomalies, ${result.alertsCreated} alerts created`);
+    const result = await anomalyDetectionService.runScan(businessId, { force: false });
+    logger.info(`Anomaly scan for business ${businessId}: ${result.anomaliesFound} new/active anomalies, ${result.alertsCreated} new alerts, ${result.suppressed} suppressed`);
     return result;
   } catch (error) {
     logger.error(`Anomaly scan failed for business ${businessId}: ${error.message}`);

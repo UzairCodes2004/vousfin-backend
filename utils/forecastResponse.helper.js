@@ -1,9 +1,16 @@
 /**
- * forecastResponse.helper.js
+ * forecastResponse.helper.js — v3
  *
- * Transforms the raw lstmForecastService output into the API response shape
- * consumed by the frontend. All monetary values stay in raw PKR — the frontend
- * formatter (formatCurrency / Y-axis tick) handles display scaling.
+ * Transforms lstmForecastService output into the API response shape
+ * consumed by the frontend. All monetary values stay in raw PKR.
+ *
+ * v3 additions:
+ *  - scenarios (optimistic/base/pessimistic)
+ *  - featureImportance
+ *  - riskIndicators
+ *  - anomalyRisk in kpiSummary
+ *  - momentum object
+ *  - categoryBreakdown
  */
 
 const METRIC_API_TO_TARGET = {
@@ -12,31 +19,30 @@ const METRIC_API_TO_TARGET = {
   netCashFlow: 'Net Cash Flow',
 };
 
-/* ── Label → ISO date (first day of that calendar month) ── */
+/* ── Label → ISO date ── */
 const MONTH_IDX = { Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11 };
 
 function labelToIsoDate(label, fallbackIndex) {
-  const mIdx  = MONTH_IDX[label] ?? (fallbackIndex % 12);
-  // If the label month is earlier than today, put it in next year (it's a forecast label)
-  const now   = new Date();
-  let   year  = now.getFullYear();
+  const mIdx = MONTH_IDX[label] ?? (fallbackIndex % 12);
+  const now  = new Date();
+  let year   = now.getFullYear();
   if (mIdx < now.getMonth() && fallbackIndex >= 6) year += 1;
   return new Date(year, mIdx, 1).toISOString();
 }
 
-/* ── Convert parallel value/label arrays into chart-point objects ── */
+/* ── Parallel value/label arrays → chart-point objects ── */
 function seriesToChartPoints(values, labels, startIndex) {
   return values.map((value, i) => {
     const label = labels[startIndex + i] || `M${startIndex + i + 1}`;
     return {
       period: label,
       date:   labelToIsoDate(label, startIndex + i),
-      value:  value ?? 0,   // raw PKR — never null/undefined
+      value:  value ?? 0,
     };
   });
 }
 
-/* ── Convert the rich interpretation object to a flat list of insight items ── */
+/* ── Rich interpretation → flat insight list ── */
 function interpretationToList(interp) {
   if (!interp) return [];
   return [
@@ -49,20 +55,20 @@ function interpretationToList(interp) {
 }
 
 /**
- * Main formatter — called by both ai.controller and forecast.controller.
+ * Main formatter — called by ai.controller and forecast.controller.
  *
- * @param {string} metric  – API metric key ('revenue'|'expenses'|'netCashFlow')
+ * @param {string} metric  – 'revenue'|'expenses'|'netCashFlow'
  * @param {number} horizon – months
  * @param {object} result  – raw output from generateLSTMForecast()
  */
 function formatForecastApiResponse(metric, horizon, result) {
   const {
-    historical  = [],
-    predicted   = [],
-    upper       = [],
-    lower       = [],
-    labels      = [],
-    confidence  = [],
+    historical        = [],
+    predicted         = [],
+    upper             = [],
+    lower             = [],
+    labels            = [],
+    confidence        = [],
     target,
     interpretation,
     kpiSummary,
@@ -70,55 +76,84 @@ function formatForecastApiResponse(metric, horizon, result) {
     modelType,
     lookBack,
     sequencesUsed,
+    // v3 fields
+    scenarios,
+    anomalyRisk,
+    featureImportance,
+    riskIndicators,
+    momentum,
+    categoryBreakdown,
   } = result;
 
   const historicalPoints = seriesToChartPoints(historical, labels, 0);
   const predictedPoints  = seriesToChartPoints(predicted,  labels, historical.length);
 
-  // Confidence score as human-readable string + numeric
   const confLabel  = confidence[0] ?? 'Medium';
-  const confScore  = confLabel === 'High' ? 92 : confLabel === 'Medium' ? 85 : 74;
-  const confString = `${confScore}%`;
+  const baseScore  = confLabel === 'High' ? 92 : confLabel === 'Medium' ? 85 : 74;
+  const penalty    = anomalyRisk?.confidencePenalty || 0;
+  const confScore  = Math.max(50, baseScore - penalty);
 
-  // Confidence bands as chart-friendly [lo, hi] pairs
   const confidenceIntervals = predicted.map((_, i) => ({
     upper: upper[i] ?? predicted[i],
     lower: lower[i] ?? predicted[i],
   }));
 
-  // Insight items — prefer the rich interpretation from lstmForecastService,
-  // fall back to the legacy generateInsights() shape when using static service.
   const insights = interpretationToList(interpretation);
+
+  // Scenario chart points
+  const scenarioPoints = scenarios ? {
+    optimistic:  seriesToChartPoints(scenarios.optimistic,  labels, historical.length),
+    base:        seriesToChartPoints(scenarios.base,         labels, historical.length),
+    pessimistic: seriesToChartPoints(scenarios.pessimistic,  labels, historical.length),
+  } : null;
+
+  const normSource = dataSource || 'static';
+  const normModel  = modelType  || 'LSTM';
 
   return {
     metric: metric || target,
     target,
     months: horizon,
 
-    // Chart series — raw PKR values in {period, date, value} format
+    // Backward-compat shortcuts
+    dataSource: normSource,
+    modelType:  normModel,
+
+    // Chart series (raw PKR)
     historical: historicalPoints,
     predicted:  predictedPoints,
-    forecast:   predictedPoints,   // alias kept for backward compat
+    forecast:   predictedPoints,  // alias
 
-    // Confidence bands
+    // Confidence
     confidenceIntervals,
-    confidenceScore: confString,
+    confidenceScore:   `${confScore}%`,
     confidenceNumeric: confScore,
-    confidenceLabel: confLabel,
+    confidenceLabel:   confLabel,
 
-    // Business-readable KPI summary (all monetary values raw PKR)
-    kpiSummary: kpiSummary || null,
+    // KPI summary (enriched with anomalyRisk)
+    kpiSummary: kpiSummary
+      ? { ...kpiSummary, anomalyRisk: anomalyRisk?.riskScore || kpiSummary.anomalyRisk || 0 }
+      : null,
 
-    // Human-readable text insights (no raw ML values)
+    // Insights
     insights,
 
-    // Model metadata (non-sensitive)
+    // Model metadata
     modelMeta: {
-      modelType:     modelType     || 'LSTM',
+      modelType:     normModel,
       lookBack:      lookBack      ?? 6,
       sequencesUsed: sequencesUsed ?? 0,
-      dataSource:    dataSource    || 'static',
+      dataSource:    normSource,
     },
+
+    // ── v3 additions ──
+    scenarios:         scenarioPoints,
+    rawScenarios:      scenarios   || null,
+    anomalyRisk:       anomalyRisk || null,
+    featureImportance: featureImportance || [],
+    riskIndicators:    riskIndicators    || [],
+    momentum:          momentum          || null,
+    categoryBreakdown: categoryBreakdown || [],
   };
 }
 
