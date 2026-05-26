@@ -1,8 +1,11 @@
 // services/dashboard.service.js
 const reportService = require('./report.service');
 const transactionRepository = require('../repositories/transaction.repository');
+const accountRepository = require('../repositories/account.repository');
 const { ApiError } = require('../utils/ApiError');
-const { TRANSACTION_TYPES } = require('../config/constants');
+const { TRANSACTION_TYPES, JOURNAL_STATUS } = require('../config/constants');
+const mongoose = require('mongoose');
+const JournalEntry = require('../models/JournalEntry.model');
 const logger = require('../config/logger');
 const reportCache = require('../utils/reportCache');
 
@@ -31,6 +34,7 @@ class DashboardService {
 
   /**
    * Get revenue vs expenses time-series data for chart.
+   * Uses a single MongoDB $group aggregation — no Node.js memory accumulation.
    * @param {string} businessId
    * @param {Date} startDate
    * @param {Date} endDate
@@ -39,49 +43,63 @@ class DashboardService {
    */
   async getRevenueVsExpensesChart(businessId, startDate, endDate, interval = 'month') {
     if (!businessId) throw new ApiError(400, 'Business ID required');
-    
-    // Fetch all transactions within date range (only Income and Expense types)
-    const transactions = await transactionRepository.getByDateRange(businessId, startDate, endDate);
-    
-    // Group by interval
-    const grouped = this._groupTransactionsByInterval(transactions, interval);
-    
-    // Revenue types: all transaction types that represent business income
-    const REVENUE_TYPES = new Set([
-      TRANSACTION_TYPES.INCOME,
-      TRANSACTION_TYPES.CASH_SALE,
-      TRANSACTION_TYPES.CREDIT_SALE,
-      TRANSACTION_TYPES.INVENTORY_SALE,
-    ]);
-    // Expense types: all transaction types that represent business costs
-    const EXPENSE_TYPES = new Set([
-      TRANSACTION_TYPES.EXPENSE,
-      TRANSACTION_TYPES.CASH_PURCHASE,
-      TRANSACTION_TYPES.CREDIT_PURCHASE,
-      TRANSACTION_TYPES.INVENTORY_PURCHASE,
+
+    const validId = mongoose.Types.ObjectId.isValid(businessId)
+      ? new mongoose.Types.ObjectId(businessId)
+      : businessId;
+
+    const REVENUE_TYPES = [
+      TRANSACTION_TYPES.INCOME, TRANSACTION_TYPES.CASH_SALE,
+      TRANSACTION_TYPES.CREDIT_SALE, TRANSACTION_TYPES.INVENTORY_SALE,
+    ];
+    const EXPENSE_TYPES = [
+      TRANSACTION_TYPES.EXPENSE, TRANSACTION_TYPES.CASH_PURCHASE,
+      TRANSACTION_TYPES.CREDIT_PURCHASE, TRANSACTION_TYPES.INVENTORY_PURCHASE,
       TRANSACTION_TYPES.SALARY,
+    ];
+
+    const groupId = interval === 'day'
+      ? { year: { $year: '$transactionDate' }, month: { $month: '$transactionDate' }, day: { $dayOfMonth: '$transactionDate' } }
+      : interval === 'week'
+        ? { year: { $year: '$transactionDate' }, week: { $week: '$transactionDate' } }
+        : { year: { $year: '$transactionDate' }, month: { $month: '$transactionDate' } };
+
+    const rows = await JournalEntry.aggregate([
+      {
+        $match: {
+          businessId: validId,
+          transactionDate: { $gte: new Date(startDate), $lte: new Date(endDate) },
+          status: { $in: [JOURNAL_STATUS.POSTED, JOURNAL_STATUS.PARTIALLY_SETTLED, JOURNAL_STATUS.SETTLED] },
+          isArchived: { $ne: true },
+        },
+      },
+      {
+        $group: {
+          _id: groupId,
+          revenue:  { $sum: { $cond: [{ $in: ['$transactionType', REVENUE_TYPES] }, '$amount', 0] } },
+          expenses: { $sum: { $cond: [{ $in: ['$transactionType', EXPENSE_TYPES] }, '$amount', 0] } },
+        },
+      },
+      { $sort: { '_id.year': 1, '_id.month': 1, '_id.day': 1, '_id.week': 1 } },
     ]);
 
-    const chartData = [];
-    for (const [periodKey, group] of grouped) {
-      let revenue = 0, expenses = 0;
-      for (const tx of group) {
-        if (REVENUE_TYPES.has(tx.transactionType)) {
-          revenue += tx.amount;
-        } else if (EXPENSE_TYPES.has(tx.transactionType)) {
-          expenses += tx.amount;
-        }
+    return rows.map(r => {
+      let period;
+      if (interval === 'day') {
+        period = `${r._id.year}-${String(r._id.month).padStart(2,'0')}-${String(r._id.day).padStart(2,'0')}`;
+      } else if (interval === 'week') {
+        period = `${r._id.year}-W${String(r._id.week).padStart(2,'0')}`;
+      } else {
+        period = `${r._id.year}-${String(r._id.month).padStart(2,'0')}`;
       }
-      chartData.push({ period: periodKey, revenue, expenses });
-    }
-    
-    // Sort by period (chronologically)
-    chartData.sort((a, b) => new Date(a.period) - new Date(b.period));
-    return chartData;
+      return { period, revenue: r.revenue || 0, expenses: r.expenses || 0 };
+    });
   }
 
   /**
    * Get net cash flow trend over time.
+   * Uses MongoDB $group aggregation — no document hydration into Node.js memory.
+   * Handles multiple Cash/Bank accounts (petty cash + bank).
    * @param {string} businessId
    * @param {Date} startDate
    * @param {Date} endDate
@@ -90,44 +108,64 @@ class DashboardService {
    */
   async getCashFlowTrend(businessId, startDate, endDate, interval = 'month') {
     if (!businessId) throw new ApiError(400, 'Business ID required');
-    
-    // Get all transactions affecting cash (debit or credit to Cash account)
-    // First find Cash account ID
-    const accountRepository = require('../repositories/account.repository');
+
+    const validId = mongoose.Types.ObjectId.isValid(businessId)
+      ? new mongoose.Types.ObjectId(businessId)
+      : businessId;
+
     const accounts = await accountRepository.findByBusiness(businessId);
-    const cashAccount = accounts.find(acc => acc.accountName.toLowerCase() === 'cash');
-    if (!cashAccount) {
-      logger.warn(`No Cash account found for business ${businessId}`);
-      return [];
-    }
-    
-    // Get all transactions where cash is either debit or credit
-    const cashTransactions = await transactionRepository.getByAccount(
-      businessId, cashAccount._id, startDate, endDate
+    const cashAccounts = accounts.filter(
+      acc => acc.accountSubtype === 'Bank and Cash' || /\b(cash|bank)\b/i.test(acc.accountName)
     );
 
-    // Group by interval and sum net cash flow (inflow - outflow)
-    const grouped = new Map();
-    for (const tx of cashTransactions) {
-      const periodKey = this._getPeriodKey(tx.transactionDate, interval);
-      if (!grouped.has(periodKey)) grouped.set(periodKey, { inflow: 0, outflow: 0 });
-      const entry = grouped.get(periodKey);
-      // getByAccount returns .lean() docs — debitAccountId is a plain ObjectId, not a sub-doc.
-      // Use .toString() directly, NOT ._id.toString() (._id would be undefined on a BSON ObjectId).
-      const isDebit = tx.debitAccountId.toString() === cashAccount._id.toString();
-      if (isDebit) {
-        entry.inflow += tx.amount;
+    if (cashAccounts.length === 0) {
+      logger.warn(`No Cash/Bank account found for business ${businessId}`);
+      return [];
+    }
+
+    const cashAccountIds = cashAccounts.map(a => a._id);
+
+    const groupId = interval === 'day'
+      ? { year: { $year: '$transactionDate' }, month: { $month: '$transactionDate' }, day: { $dayOfMonth: '$transactionDate' } }
+      : interval === 'week'
+        ? { year: { $year: '$transactionDate' }, week: { $week: '$transactionDate' } }
+        : { year: { $year: '$transactionDate' }, month: { $month: '$transactionDate' } };
+
+    const rows = await JournalEntry.aggregate([
+      {
+        $match: {
+          businessId: validId,
+          transactionDate: { $gte: new Date(startDate), $lte: new Date(endDate) },
+          status: { $in: [JOURNAL_STATUS.POSTED, JOURNAL_STATUS.PARTIALLY_SETTLED, JOURNAL_STATUS.SETTLED] },
+          isArchived: { $ne: true },
+          $or: [
+            { debitAccountId:  { $in: cashAccountIds } },
+            { creditAccountId: { $in: cashAccountIds } },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: groupId,
+          // Inflow: cash debited (received); Outflow: cash credited (paid out)
+          inflow:  { $sum: { $cond: [{ $in: ['$debitAccountId',  cashAccountIds] }, '$amount', 0] } },
+          outflow: { $sum: { $cond: [{ $in: ['$creditAccountId', cashAccountIds] }, '$amount', 0] } },
+        },
+      },
+      { $sort: { '_id.year': 1, '_id.month': 1, '_id.day': 1, '_id.week': 1 } },
+    ]);
+
+    return rows.map(r => {
+      let period;
+      if (interval === 'day') {
+        period = `${r._id.year}-${String(r._id.month).padStart(2,'0')}-${String(r._id.day).padStart(2,'0')}`;
+      } else if (interval === 'week') {
+        period = `${r._id.year}-W${String(r._id.week).padStart(2,'0')}`;
       } else {
-        entry.outflow += tx.amount;
+        period = `${r._id.year}-${String(r._id.month).padStart(2,'0')}`;
       }
-    }
-    
-    const chartData = [];
-    for (const [periodKey, { inflow, outflow }] of grouped) {
-      chartData.push({ period: periodKey, netCashFlow: inflow - outflow });
-    }
-    chartData.sort((a, b) => new Date(a.period) - new Date(b.period));
-    return chartData;
+      return { period, netCashFlow: (r.inflow || 0) - (r.outflow || 0) };
+    });
   }
 
   /**
@@ -159,45 +197,7 @@ class DashboardService {
     return _dashResult;
   }
 
-  // ===============================
-  // Private helpers
-  // ===============================
-
-  /**
-   * Group transactions by period (day, week, month).
-   * @private
-   */
-  _groupTransactionsByInterval(transactions, interval) {
-    const grouped = new Map();
-    for (const tx of transactions) {
-      const key = this._getPeriodKey(tx.transactionDate, interval);
-      if (!grouped.has(key)) grouped.set(key, []);
-      grouped.get(key).push(tx);
-    }
-    return grouped;
-  }
-
-  /**
-   * Generate a period key string based on date and interval.
-   * @private
-   */
-  _getPeriodKey(date, interval) {
-    const d = new Date(date);
-    const year = d.getFullYear();
-    const month = d.getMonth() + 1;
-    const day = d.getDate();
-    if (interval === 'day') {
-      return `${year}-${month.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`;
-    } else if (interval === 'week') {
-      // Get week number (simple approximation)
-      const firstDayOfYear = new Date(year, 0, 1);
-      const pastDays = (d - firstDayOfYear) / 86400000;
-      const weekNo = Math.ceil((pastDays + firstDayOfYear.getDay() + 1) / 7);
-      return `${year}-W${weekNo.toString().padStart(2, '0')}`;
-    } else { // month
-      return `${year}-${month.toString().padStart(2, '0')}`;
-    }
-  }
 }
+
 
 module.exports = new DashboardService();
