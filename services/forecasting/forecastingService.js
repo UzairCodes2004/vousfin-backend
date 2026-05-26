@@ -1,7 +1,11 @@
 /**
  * @file forecastingService.js
- * @description Core forecasting intelligence layer. Transforms raw ML model
- *              outputs into business-meaningful financial projections:
+ * @description DEPRECATED — Phase 4 audit: uses shared Kaggle/static datasets.
+ *              Do NOT call generateForecast() in production routes.
+ *              Use lstmForecastService.generateLSTMForecast() instead — it is
+ *              fully businessId-isolated and currency-aware.
+ *
+ * Legacy core forecasting layer using ML model CSV outputs:
  *              - Revenue forecasts (monthly, quarterly)
  *              - Expense projections
  *              - Profit forecasts
