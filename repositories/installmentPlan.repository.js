@@ -99,7 +99,13 @@ class InstallmentPlanRepository extends BaseRepository {
     const validBusinessId = sanitizeAndValidateId(businessId);
     return this.model.find({
       businessId: validBusinessId,
-      status: INSTALLMENT_STATUS.ACTIVE,
+      status: {
+        $in: [
+          INSTALLMENT_STATUS.ACTIVE,
+          INSTALLMENT_STATUS.OVERDUE,
+          INSTALLMENT_STATUS.RESTRUCTURED,
+        ],
+      },
       nextDueDate: { $lt: new Date() },
     })
       .populate('linkedTransactionId', 'description amount')

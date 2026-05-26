@@ -72,6 +72,153 @@ function _mapTxnType(rawType) {
   return VOUSFIN_TYPE_MAP[rawType.toLowerCase().trim()] || rawType;
 }
 
+/* ════════════════════════════════════════════════════════════════════════════
+   CURRENCY — fetch business currency from DB (single lean field projection)
+════════════════════════════════════════════════════════════════════════════ */
+async function _fetchBusinessCurrency(businessId) {
+  try {
+    const Business = require('../../models/Business.model');
+    const validId  = mongoose.Types.ObjectId.isValid(businessId)
+      ? new mongoose.Types.ObjectId(businessId) : businessId;
+    const biz = await Business.findById(validId, { currency: 1 }).lean();
+    return (biz?.currency || 'USD').toUpperCase();
+  } catch {
+    return 'USD';
+  }
+}
+
+/**
+ * Currency-aware amount formatter.
+ * Produces compact labels like "USD 658.3K" or "PKR 2.1M" — no ₨ or ₹ hard-coding.
+ */
+function _fmtAmt(value, currency) {
+  const sym = (currency || 'USD').toUpperCase();
+  const abs = Math.abs(value || 0);
+  if (abs >= 1_000_000) return `${sym} ${(value / 1_000_000).toFixed(2)}M`;
+  if (abs >= 1_000)    return `${sym} ${(value / 1_000).toFixed(1)}K`;
+  return `${sym} ${Math.round(value || 0).toLocaleString()}`;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   DATA SUFFICIENCY — classify how much live data we have
+════════════════════════════════════════════════════════════════════════════ */
+/**
+ * Returns one of: 'insufficient' | 'sparse' | 'adequate' | 'rich'
+ * Based on the count of months that have non-zero revenue OR non-zero expenses.
+ *
+ * Thresholds (conservative for SMEs):
+ *   0  months → insufficient  (no forecast possible)
+ *   1–2       → sparse        (SES / flat extrapolation, low confidence)
+ *   3–5       → adequate      (Holt's Double ES, medium confidence)
+ *   6+        → rich          (Holt-Winters Tri-ES, high confidence)
+ */
+function _classifySufficiency(monthlyData) {
+  const nonZero = (monthlyData || [])
+    .filter(m => (m.revenue || 0) > 0 || (m.expenses || 0) > 0).length;
+  if (nonZero === 0)  return 'insufficient';
+  if (nonZero <= 2)   return 'sparse';
+  if (nonZero <= 5)   return 'adequate';
+  return 'rich';
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   DATA-DRIVEN CONFIDENCE SCORING
+   Replaces the previous hardcoded 92 / 85 / 74 values that had no statistical
+   basis. Confidence is now computed from:
+     1. Data sufficiency tier (primary driver)
+     2. Anomaly penalty (from AnomalyAlert collection)
+     3. Volatility penalty (coefficient of variation of the series)
+════════════════════════════════════════════════════════════════════════════ */
+function _computeRealConfidence(series, tier, anomalyPenalty) {
+  const validSeries = (series || []).filter(v => v > 0);
+  const mu          = mean(validSeries);
+  const cv          = (mu > 0 && validSeries.length >= 2)
+    ? std(validSeries, mu) / mu
+    : 0;
+
+  // Penalty: high volatility reduces trust (up to 15 points)
+  const volatilityPenalty = Math.round(clamp(cv * 25, 0, 15));
+
+  // Base score by tier — deliberately conservative
+  const baseByTier = {
+    insufficient: 30,   // no real data — shown as "Insufficient" not a fake score
+    sparse:       48,   // 1-2 months: simple smoothing, wide uncertainty
+    adequate:     62,   // 3-5 months: trend estimation, moderate confidence
+    rich:         80,   // 6+ months: seasonal model, high confidence
+  };
+
+  const base  = baseByTier[tier] ?? 50;
+  const score = Math.max(30, base - (anomalyPenalty || 0) - volatilityPenalty);
+  const label = score >= 70 ? 'High' : score >= 54 ? 'Medium' : 'Low';
+  return { score, label };
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   INSUFFICIENT DATA RESPONSE
+   Returned when a business has ZERO live accounting data.
+   Honest, user-friendly — never shows external dataset projections.
+════════════════════════════════════════════════════════════════════════════ */
+function _buildInsufficientDataResponse(target, horizonMonths, currency, anomalyRisk) {
+  const interp = {
+    trend:          'No transaction history found. Add transactions to enable AI forecasting.',
+    growth:         'Forecasting requires at least 1 month of recorded revenue or expense data.',
+    risk:           'Record your first accounting transactions to see a personalised risk analysis.',
+    recommendation: 'Open the Transactions page, record a few entries, then return here for AI-powered forecasts.',
+    sourceNote:     'No data — forecasting is unavailable until transactions are added.',
+  };
+
+  return {
+    target,
+    months:          horizonMonths,
+    historical:      [],
+    predicted:       [],
+    upper:           [],
+    lower:           [],
+    labels:          [],
+    confidence:      [],
+    dataSource:      'none',
+    modelType:       'No model — insufficient data',
+    lookBack:        0,
+    sequencesUsed:   0,
+    scalerParams:    { min: 0, range: 0 },
+    interpretation:  interp,
+    kpiSummary: {
+      nextMonthValue:       0,
+      nextMonthChangePct:   0,
+      nextMonthChangeAmt:   0,
+      lastActualValue:      0,
+      peakForecastValue:    0,
+      peakForecastIndex:    0,
+      cumulativeGrowthPct:  0,
+      confidenceScore:      0,
+      confidenceLabel:      'Insufficient',
+      upperBound:           0,
+      lowerBound:           0,
+      isPositiveTrend:      null,
+      target,
+      anomalyRisk:          0,
+      anomalyCount:         0,
+    },
+    scenarios:       { optimistic: [], base: [], pessimistic: [] },
+    anomalyRisk:     anomalyRisk || { total: 0, pending: 0, fraud: 0, riskScore: 0, hasFraud: false, hasUnreviewed: false, confidencePenalty: 0 },
+    featureImportance: [],
+    riskIndicators: [{
+      id: 'no_data', level: 'info',
+      title: 'No Transaction History',
+      message: `Add at least 1 month of ${target.toLowerCase()} transactions to enable AI forecasting for your ${currency} business.`,
+    }],
+    momentum:        { short: 0, long: 0, acceleration: 0 },
+    categoryBreakdown: [],
+    dataSufficiency: {
+      months: 0, tier: 'insufficient', isInsufficient: true,
+      message: 'No transaction data found. Record transactions to unlock AI forecasting.',
+    },
+    rollingBounds:   { upper: [], lower: [] },
+    currency,
+    generatedAt:     new Date().toISOString(),
+  };
+}
+
 /* ── Python service probe ── */
 async function _lstmServiceReady() {
   try {
@@ -372,19 +519,15 @@ function computeFeatureImportance(series, target, momentum, anomalyRisk, dataPoi
 /* ════════════════════════════════════════════════════════════════════════════
    RISK INDICATORS (Smart business intelligence)
 ════════════════════════════════════════════════════════════════════════════ */
-function buildRiskIndicators(target, predicted, historical, anomalyRisk, momentum) {
+function buildRiskIndicators(target, predicted, historical, anomalyRisk, momentum, currency) {
   const indicators = [];
   const mu    = mean(predicted);
   const sigma = std(predicted, mu);
   const cv    = mu > 0 ? sigma / mu : 0;
   const lastActual = historical[historical.length - 1] || 0;
   const firstPred  = predicted[0] || 0;
-  const fmt = v => {
-    const abs = Math.abs(v);
-    if (abs >= 1_000_000) return `PKR ${(v / 1_000_000).toFixed(1)}M`;
-    if (abs >= 1_000)    return `PKR ${(v / 1_000).toFixed(0)}K`;
-    return `PKR ${Math.round(v).toLocaleString()}`;
-  };
+  // Use business currency — no PKR hardcoding
+  const fmt = v => _fmtAmt(v, currency);
 
   // Cash shortage risk (cashflow going negative or too low)
   if (target === 'Net Cash Flow' && predicted.some(v => v < 0)) {
@@ -546,45 +689,21 @@ async function fetchCategoryBreakdown(businessId, monthsBack = 3) {
   }
 }
 
-/* ── Cafe fallback data (raw PKR) ── */
-function loadCafeSeries(metricKey) {
-  const fs   = require('fs');
-  const path = require('path');
-  const cafePath = path.join(__dirname, '..', '..', 'outputs', 'lahore_cafe_transactions.json');
-  if (!fs.existsSync(cafePath)) return { series: [], labels: [] };
-
-  const cafeData  = JSON.parse(fs.readFileSync(cafePath, 'utf8'));
-  const monthsMap = {};
-  cafeData.forEach(tx => {
-    const m = tx.date.substring(0, 7);
-    if (!monthsMap[m]) monthsMap[m] = { revenue: 0, expenses: 0 };
-    if (tx.transaction_type === 'sale' || tx.transaction_type === 'Revenue') {
-      monthsMap[m].revenue  += tx.total_amount;
-    } else {
-      monthsMap[m].expenses += tx.total_amount;
-    }
-  });
-
-  const series = [];
-  const labels = [];
-  Object.keys(monthsMap).sort().slice(-12).forEach(k => {
-    const rev      = monthsMap[k].revenue;
-    const exp      = monthsMap[k].expenses;
-    const profit   = rev * (1 - EXPENSE_RATIO) * (1 - TAX_RATE);
-    const cashFlow = profit * 0.85;
-    const val = metricKey === 'revenue'  ? rev
-              : metricKey === 'expenses' ? exp
-              : cashFlow;
-    series.push(val);
-    labels.push(MONTH_NAMES[parseInt(k.split('-')[1], 10) - 1]);
-  });
-  return { series, labels };
-}
+/*
+ * NOTE: loadCafeSeries() was removed — it loaded a shared Lahore Cafe static
+ * dataset as a fallback, which caused:
+ *   (a) PKR-scale projections for USD/EUR businesses
+ *   (b) Cross-tenant data contamination (all low-data businesses got the same fake data)
+ *   (c) Misleadingly high confidence scores for businesses with no real transactions
+ *
+ * The system now returns _buildInsufficientDataResponse() when live data is absent,
+ * giving users an honest "no data yet" message instead of a fabricated forecast.
+ */
 
 /* ════════════════════════════════════════════════════════════════════════════
    BUSINESS INTERPRETATION ENGINE (v3 — smarter reasoning)
 ════════════════════════════════════════════════════════════════════════════ */
-function buildInterpretation(target, historical, predicted, confidence, dataSource, momentum, anomalyRisk) {
+function buildInterpretation(target, historical, predicted, confidence, dataSource, momentum, anomalyRisk, currency) {
   const lastActual = historical[historical.length - 1] || 0;
   const firstPred  = predicted[0]                    || 0;
   const finalPred  = predicted[predicted.length - 1] || 0;
@@ -594,12 +713,8 @@ function buildInterpretation(target, historical, predicted, confidence, dataSour
   const horizon    = predicted.length;
   const isGrowing  = changePct > 0;
 
-  const fmt = v => {
-    const abs = Math.abs(v);
-    if (abs >= 1_000_000) return `PKR ${(v / 1_000_000).toFixed(2)}M`;
-    if (abs >= 1_000)    return `PKR ${(v / 1_000).toFixed(1)}K`;
-    return `PKR ${Math.round(v).toLocaleString('en-PK')}`;
-  };
+  // Use business currency — eliminates PKR hardcoding
+  const fmt = v => _fmtAmt(v, currency);
   const fmtPct = p => `${p >= 0 ? '+' : ''}${p.toFixed(1)}%`;
   const pct = Math.abs(changePct);
 
@@ -662,8 +777,8 @@ function buildInterpretation(target, historical, predicted, confidence, dataSour
   }
 
   const sourceNote = dataSource === 'live'
-    ? 'Forecast calibrated on your live accounting transactions.'
-    : 'Forecast uses reference industry data — add transactions to personalise.';
+    ? `Forecast calibrated on your live ${currency} accounting transactions. Accuracy improves as you record more data.`
+    : `Sparse data — forecast based on ${currency} transactions available. Add more entries to improve accuracy.`;
 
   return { trend, growth, risk, recommendation, sourceNote, momentum };
 }
@@ -671,10 +786,14 @@ function buildInterpretation(target, historical, predicted, confidence, dataSour
 /* ════════════════════════════════════════════════════════════════════════════
    KPI SUMMARY BUILDER
 ════════════════════════════════════════════════════════════════════════════ */
-function buildKpiSummary(target, historical, predicted, upper, lower, confidence, anomalyRisk) {
+/**
+ * @param preComputedConfScore — pass the output of _computeRealConfidence().score;
+ *   when provided, the old hardcoded 92/85/74 lookup is bypassed entirely.
+ */
+function buildKpiSummary(target, historical, predicted, upper, lower, confidence, anomalyRisk, preComputedConfScore) {
   const lastActual  = historical[historical.length - 1] || 0;
   const nextPred    = predicted[0] || 0;
-  const peakVal     = Math.max(...predicted);
+  const peakVal     = predicted.length ? Math.max(...predicted) : 0;
   const peakIdx     = predicted.indexOf(peakVal);
   const totalGrowth = lastActual > 0
     ? ((predicted[predicted.length - 1] - lastActual) / lastActual) * 100 : 0;
@@ -682,8 +801,10 @@ function buildKpiSummary(target, historical, predicted, upper, lower, confidence
     ? ((nextPred - lastActual) / lastActual) * 100 : 0;
 
   const confLabel  = confidence[0] || 'Medium';
-  const baseScore  = confLabel === 'High' ? 92 : confLabel === 'Medium' ? 85 : 74;
-  const confScore  = Math.max(50, baseScore - (anomalyRisk?.confidencePenalty || 0));
+  // Use the caller-supplied data-driven score when available; fall back gracefully
+  const confScore  = preComputedConfScore != null
+    ? Math.max(30, preComputedConfScore - (anomalyRisk?.confidencePenalty || 0))
+    : Math.max(30, (confLabel === 'High' ? 75 : confLabel === 'Medium' ? 60 : 45) - (anomalyRisk?.confidencePenalty || 0));
 
   return {
     nextMonthValue:       Math.round(nextPred),
@@ -720,7 +841,10 @@ async function generateLSTMForecast(businessId, target = 'Revenue', horizonMonth
   const cachedResult = _cacheGet(cacheKey);
   if (cachedResult) return cachedResult;
 
-  // ── PRIMARY: Python LSTM ──
+  // ── Fetch business currency (critical for all formatting) ──
+  const currency = await _fetchBusinessCurrency(businessId);
+
+  // ── PRIMARY: Python Bi-LSTM microservice ──
   if (LSTM_ENABLED) {
     try {
       const recentEntries = await _fetchRawEntriesForLSTM(businessId);
@@ -731,11 +855,12 @@ async function generateLSTMForecast(businessId, target = 'Revenue', horizonMonth
           if (lstmResult?.predicted?.length > 0) {
             lstmResult.modelType  = 'Bi-LSTM + Attention (Real ML)';
             lstmResult.dataSource = 'lstm_live';
-            // Enrich Python result with anomaly awareness + scenarios
+            lstmResult.currency   = currency;
             const anomalyRisk = await fetchAnomalyRisk(businessId);
             const scenarios   = generateScenarios(lstmResult.predicted, anomalyRisk.riskScore);
             lstmResult.scenarios   = scenarios;
             lstmResult.anomalyRisk = anomalyRisk;
+            lstmResult.dataSufficiency = { months: recentEntries.length, tier: 'rich', isInsufficient: false, message: 'Bi-LSTM trained on live transactions.' };
             _cacheSet(cacheKey, lstmResult);
             return lstmResult;
           }
@@ -746,87 +871,116 @@ async function generateLSTMForecast(businessId, target = 'Revenue', horizonMonth
     }
   }
 
-  // ── FALLBACK: Holt-Winters on live MongoDB data ──
+  // ── FALLBACK: Holt-Winters on LIVE MongoDB data only ──
+  // We NEVER use external/static datasets — isolation is absolute.
   const [monthlyData, anomalyRisk] = await Promise.all([
     fetchMonthlyData(businessId, 24),
     fetchAnomalyRisk(businessId),
   ]);
 
+  // ── Data sufficiency gate ──
+  const tier = _classifySufficiency(monthlyData);
+  if (tier === 'insufficient') {
+    // Return honest "no data" response — never fake a forecast
+    const result = _buildInsufficientDataResponse(target, horizonMonths, currency, anomalyRisk);
+    _cacheSet(cacheKey, result);
+    return result;
+  }
+
   const liveSeries = monthlyData.map(m => m[metricKey]);
-  const hasSufficientData = monthlyData.length >= 1 && liveSeries.some(v => v > 0);
+  const rawSeries  = liveSeries.filter(v => v >= 0); // non-negative values only
+  const labels     = monthlyData.map(m => MONTH_NAMES[m.month - 1]);
 
-  let rawSeries  = [];
-  let labels     = [];
-  let dataSource = 'live';
-
-  if (hasSufficientData) {
-    rawSeries = liveSeries;
-    labels    = monthlyData.map(m => MONTH_NAMES[m.month - 1]);
-  } else {
-    dataSource = 'static';
-    const cafe = loadCafeSeries(metricKey);
-    rawSeries  = cafe.series;
-    labels     = cafe.labels;
-  }
-
-  if (!rawSeries.length) {
-    throw new Error('No forecast data available — add transactions to enable forecasting.');
-  }
-
-  // ── Preprocessing ──
+  // ── Select model based on data tier ──
+  // sparse (1-2 months)  → Holt's Double ES (trend only, no seasonal)
+  // adequate (3-5)       → Holt-Winters period=2 (minimal seasonal)
+  // rich (6+)            → Holt-Winters period=3 (quarterly seasonal)
   const { scaled, min, range } = minMaxScale(rawSeries);
+  const LOOK_BACK = Math.min(6, Math.max(scaled.length - 1, 1));
+  const scaledWindow = scaled.slice(Math.max(0, scaled.length - LOOK_BACK));
 
-  // ── Holt-Winters on scaled series ──
-  const LOOK_BACK      = Math.min(6, Math.max(scaled.length - 1, 1));
-  const scaledWindow   = scaled.slice(Math.max(0, scaled.length - LOOK_BACK));
-  const scaledPredicted = holtsWinters(scaledWindow, horizonMonths, {
-    alpha: 0.45, beta: 0.20, gamma: 0.15,
-    period: Math.min(3, Math.max(2, scaledWindow.length - 1)),
-  });
+  let scaledPredicted;
+  let modelType;
+  if (tier === 'sparse') {
+    // Holt's Double ES — only trend, no seasonality component
+    scaledPredicted = _holtsDouble(scaledWindow, horizonMonths, { alpha: 0.45, beta: 0.20 });
+    modelType = 'Holt\'s Double ES (sparse data — trend only)';
+  } else if (tier === 'adequate') {
+    scaledPredicted = holtsWinters(scaledWindow, horizonMonths, {
+      alpha: 0.45, beta: 0.20, gamma: 0.12, period: 2,
+    });
+    modelType = 'Holt-Winters ES (moderate history — bi-monthly seasonal)';
+  } else {
+    scaledPredicted = holtsWinters(scaledWindow, horizonMonths, {
+      alpha: 0.45, beta: 0.20, gamma: 0.15, period: 3,
+    });
+    modelType = 'Holt-Winters Seasonal ES (Tri-exponential — quarterly)';
+  }
 
   // ── Inverse transform ──
-  const predicted = scaledPredicted.map(sv => Math.round(inverseScale(sv, min, range)));
+  const predicted = scaledPredicted.map(sv => Math.round(Math.max(0, inverseScale(sv, min, range))));
 
   // ── Historical slice ──
   const histCount  = Math.min(6, rawSeries.length);
   const historical = rawSeries.slice(-histCount).map(v => Math.round(v));
   const histLabels = labels.slice(-histCount);
 
-  // ── Forecast labels ──
+  // ── Forecast month labels ──
   const lastMonthIdx   = MONTH_NAMES.indexOf(histLabels[histLabels.length - 1]);
   const forecastLabels = Array.from({ length: horizonMonths }, (_, i) =>
     MONTH_NAMES[(lastMonthIdx + 1 + i) % 12]
   );
 
-  // ── Confidence bands — wider with anomaly risk ──
-  const baseUncertainty = 0.04 + anomalyRisk.riskScore * 0.04;
-  const uncertainty = predicted.map((_, i) => baseUncertainty + i * 0.018);
+  // ── DATA-DRIVEN confidence — replaces the hardcoded 92/85/74 ──
+  const confResult = _computeRealConfidence(rawSeries, tier, anomalyRisk.confidencePenalty || 0);
+  // Confidence degrades with forecast horizon (first month is most reliable)
+  const confidence = predicted.map((_, i) => {
+    if (i === 0)             return confResult.label;
+    if (i < 3)               return confResult.label === 'High' ? 'Medium' : confResult.label;
+    return 'Low';
+  });
+
+  // ── Confidence bands — scale with data tier + anomaly risk ──
+  const tierBandWidth = { insufficient: 0.30, sparse: 0.20, adequate: 0.12, rich: 0.06 }[tier] || 0.10;
+  const baseUncertainty = tierBandWidth + anomalyRisk.riskScore * 0.04;
+  const uncertainty = predicted.map((_, i) => baseUncertainty + i * 0.02);
   const upper       = predicted.map((v, i) => Math.round(v * (1 + uncertainty[i])));
-  const lower       = predicted.map((v, i) => Math.round(v * (1 - uncertainty[i])));
+  const lower       = predicted.map((v, i) => Math.round(Math.max(0, v * (1 - uncertainty[i]))));
 
-  const confidence = predicted.map((_, i) =>
-    i < 2 ? 'High' : i < 4 ? 'Medium' : 'Low'
-  );
+  // ── Data sufficiency object (sent to frontend) ──
+  const dataSufficiency = {
+    months:         monthlyData.length,
+    nonZeroMonths:  monthlyData.filter(m => (m.revenue || 0) > 0 || (m.expenses || 0) > 0).length,
+    tier,
+    isInsufficient: false,
+    message:
+      tier === 'sparse'   ? `Limited history (${monthlyData.length} month${monthlyData.length > 1 ? 's' : ''}) — forecast is indicative only. Add more transactions for higher accuracy.`
+    : tier === 'adequate' ? `Moderate history (${monthlyData.length} months) — trend forecast enabled. Seasonality improves after 6 months.`
+    : `Rich history (${monthlyData.length} months) — full seasonal model active.`,
+  };
 
-  // ── Momentum + feature importance + risk ──
-  const momentum         = computeTrendMomentum(rawSeries);
+  // ── Momentum + feature importance + risk indicators ──
+  const momentum          = computeTrendMomentum(rawSeries);
   const featureImportance = computeFeatureImportance(rawSeries, target, momentum, anomalyRisk, rawSeries.length);
-  const riskIndicators   = buildRiskIndicators(target, predicted, historical, anomalyRisk, momentum);
-  const scenarios        = generateScenarios(predicted, anomalyRisk.riskScore);
+  const riskIndicators    = buildRiskIndicators(target, predicted, historical, anomalyRisk, momentum, currency);
+  const scenarios         = generateScenarios(predicted, anomalyRisk.riskScore);
 
   // ── Category breakdown (async, non-blocking) ──
   const categoryBreakdown = await fetchCategoryBreakdown(businessId, 3);
 
-  // ── Business interpretation ──
-  const interpretation = buildInterpretation(target, historical, predicted, confidence, dataSource, momentum, anomalyRisk);
-  const kpiSummary     = buildKpiSummary(target, historical, predicted, upper, lower, confidence, anomalyRisk);
+  // ── Business interpretation (currency-aware) ──
+  const dataSource    = 'live';
+  const interpretation = buildInterpretation(target, historical, predicted, confidence, dataSource, momentum, anomalyRisk, currency);
+
+  // ── KPI summary (data-driven confidence score) ──
+  const kpiSummary = buildKpiSummary(target, historical, predicted, upper, lower, confidence, anomalyRisk, confResult.score);
 
   // ── Rolling statistics (for chart overlay) ──
-  const rollingMeans = rollingMean(rawSeries, 3);
-  const rollingStds  = rollingStd(rawSeries, 3);
+  const rollingMeans  = rollingMean(rawSeries, 3);
+  const rollingStdArr = rollingStd(rawSeries, 3);
   const rollingBounds = {
-    upper: rawSeries.map((v, i) => Math.round((rollingMeans[i] + rollingStds[i]) * 1.1)),
-    lower: rawSeries.map((v, i) => Math.round(Math.max(0, rollingMeans[i] - rollingStds[i] * 0.8))),
+    upper: rawSeries.map((v, i) => Math.round((rollingMeans[i] + rollingStdArr[i]) * 1.1)),
+    lower: rawSeries.map((v, i) => Math.round(Math.max(0, rollingMeans[i] - rollingStdArr[i] * 0.8))),
   };
 
   const result = {
@@ -839,13 +993,12 @@ async function generateLSTMForecast(businessId, target = 'Revenue', horizonMonth
     labels:          [...histLabels, ...forecastLabels],
     confidence,
     dataSource,
-    modelType:       'Holt-Winters Seasonal ES (Tri-exponential)',
+    modelType,
     lookBack:        LOOK_BACK,
     sequencesUsed:   scaled.length,
     scalerParams:    { min, range },
     interpretation,
     kpiSummary,
-    // NEW v3 fields
     scenarios,
     anomalyRisk,
     featureImportance,
@@ -853,7 +1006,9 @@ async function generateLSTMForecast(businessId, target = 'Revenue', horizonMonth
     momentum,
     categoryBreakdown,
     rollingBounds,
-    generatedAt: new Date().toISOString(),
+    dataSufficiency,
+    currency,
+    generatedAt:     new Date().toISOString(),
   };
 
   _cacheSet(cacheKey, result);
@@ -864,6 +1019,9 @@ async function generateLSTMForecast(businessId, target = 'Revenue', horizonMonth
    BUSINESS GROWTH FORECAST
 ════════════════════════════════════════════════════════════════════════════ */
 async function generateBusinessGrowthForecast(businessId, horizonMonths = 6) {
+  // ── Fetch business currency first — never assume PKR ──
+  const currency = await _fetchBusinessCurrency(businessId);
+
   const [monthlyData, anomalyRisk] = await Promise.all([
     fetchMonthlyData(businessId, 24),
     fetchAnomalyRisk(businessId),
@@ -872,12 +1030,30 @@ async function generateBusinessGrowthForecast(businessId, horizonMonths = 6) {
   const liveRevenue = monthlyData.map(m => m.revenue);
   const hasSufficientData = monthlyData.length >= 1 && liveRevenue.some(v => v > 0);
 
-  const revSeries = hasSufficientData
-    ? liveRevenue
-    : loadCafeSeries('revenue').series.slice(-12);
-  const profitSeries = hasSufficientData
-    ? monthlyData.map(m => m.profit)
-    : revSeries.map(v => v * 0.23);
+  // ── Never use static cafe data — return honest response if no data ──
+  if (!hasSufficientData) {
+    return {
+      target: 'Business Growth',
+      months: horizonMonths,
+      historicalRevenue: [], historicalProfit: [],
+      forecastRevenue:   [], forecastProfit:   [],
+      histLabels: [], forecastLabels: [],
+      avgMonthlyGrowthRate: 0, cumulativeGrowthPercent: 0,
+      growthTrend: 'No Data',
+      outlookText: `No revenue transactions found. Record ${currency} revenue entries to unlock business growth forecasting.`,
+      dataSource: 'none',
+      momentum: { value: 0, direction: 'stable', acceleration: 0 },
+      anomalyRisk,
+      revenueScenarios: {},
+      dataSufficiency: { months: 0, tier: 'insufficient', isInsufficient: true,
+        message: 'No revenue data found. Add transactions to enable business growth forecasting.' },
+      currency,
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  const revSeries    = liveRevenue;
+  const profitSeries = monthlyData.map(m => m.profit);
 
   // MoM growth rates
   const momRates = [];
@@ -923,11 +1099,7 @@ async function generateBusinessGrowthForecast(businessId, horizonMonths = 6) {
     : cumulativeGrowth > -10 ? 'Slight Decline'
     : 'Declining';
 
-  const fmt = v => {
-    if (v >= 1_000_000) return `PKR ${(v / 1_000_000).toFixed(2)}M`;
-    if (v >= 1_000)    return `PKR ${(v / 1_000).toFixed(1)}K`;
-    return `PKR ${Math.round(v).toLocaleString('en-PK')}`;
-  };
+  const fmt = v => _fmtAmt(v, currency);
 
   const totalForecastRev = forecastRevenue.reduce((a, b) => a + b, 0);
   let outlookText = `Your business is forecast to generate ${fmt(totalForecastRev)} in cumulative revenue over the next ${horizonMonths} months. `;
@@ -942,6 +1114,18 @@ async function generateBusinessGrowthForecast(businessId, horizonMonths = 6) {
     }
   }
 
+  const tier = _classifySufficiency(monthlyData);
+  const dataSufficiency = {
+    months:         monthlyData.length,
+    nonZeroMonths:  monthlyData.filter(m => (m.revenue || 0) > 0).length,
+    tier,
+    isInsufficient: false,
+    message:
+      tier === 'sparse'   ? `Limited history (${monthlyData.length} month${monthlyData.length > 1 ? 's' : ''}) — growth forecast is indicative only.`
+    : tier === 'adequate' ? `Moderate history (${monthlyData.length} months) — trend model active.`
+    : `Rich history (${monthlyData.length} months) — full seasonal growth model active.`,
+  };
+
   return {
     target: 'Business Growth',
     months: horizonMonths,
@@ -955,10 +1139,12 @@ async function generateBusinessGrowthForecast(businessId, horizonMonths = 6) {
     cumulativeGrowthPercent: Math.round(cumulativeGrowth * 100) / 100,
     growthTrend,
     outlookText,
-    dataSource: hasSufficientData ? 'live' : 'static',
+    dataSource: 'live',
     momentum,
     anomalyRisk,
     revenueScenarios,
+    dataSufficiency,
+    currency,
     generatedAt: new Date().toISOString(),
   };
 }

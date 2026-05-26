@@ -200,6 +200,12 @@ const journalEntrySchema = new mongoose.Schema(
       trim: true,
       maxlength: 100,
     },
+    invoiceNumber: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: 50,
+    },
     transactionCategory: {
       type: String,
       enum: [...Object.values(TRANSACTION_CATEGORIES), null],
@@ -320,13 +326,14 @@ const journalEntrySchema = new mongoose.Schema(
 // ===============================
 // Indexes (optimized for reporting queries)
 // ===============================
-// Original indexes (preserved)
+
+// ── Core indexes (preserved from v1) ──────────────────────────────────────
 journalEntrySchema.index({ businessId: 1, transactionDate: -1, transactionType: 1 });
 journalEntrySchema.index({ businessId: 1, amount: 1, transactionDate: -1 });
 journalEntrySchema.index({ reversalOf: 1 });
 journalEntrySchema.index({ createdBy: 1, createdAt: -1 });
 
-// New indexes (v2)
+// ── AR/AP indexes (v2) ────────────────────────────────────────────────────
 journalEntrySchema.index({ businessId: 1, customerId: 1 });
 journalEntrySchema.index({ businessId: 1, vendorId: 1 });
 journalEntrySchema.index({ businessId: 1, paymentStatus: 1 });
@@ -334,6 +341,50 @@ journalEntrySchema.index({ parentTransactionId: 1 });
 journalEntrySchema.index({ businessId: 1, dueDate: 1, paymentStatus: 1 });
 journalEntrySchema.index({ businessId: 1, isArchived: 1, status: 1 });
 journalEntrySchema.index({ installmentPlanId: 1 });
+
+// ── PERFORMANCE: Compound indexes for the most common report queries ───────
+//
+// 1. Core report filter: businessId + date range + status (not archived)
+//    Used by: getByDateRange, getIncomeStatementData, _getBalancesAsOf, dashboard
+journalEntrySchema.index(
+  { businessId: 1, transactionDate: -1, status: 1 },
+  { name: 'idx_report_core' }
+);
+
+// 2. Transaction listing with archived filter — covers the default list page sort
+journalEntrySchema.index(
+  { businessId: 1, isArchived: 1, transactionDate: -1, status: 1 },
+  { name: 'idx_listing_sorted' }
+);
+
+// 3. AR queries — outstanding receivables filtered by remaining balance
+journalEntrySchema.index(
+  { businessId: 1, customerId: 1, remainingBalance: 1, paymentStatus: 1 },
+  { name: 'idx_ar_outstanding', sparse: true }
+);
+
+// 4. AP queries — outstanding payables filtered by remaining balance
+journalEntrySchema.index(
+  { businessId: 1, vendorId: 1, remainingBalance: 1, paymentStatus: 1 },
+  { name: 'idx_ap_outstanding', sparse: true }
+);
+
+// 5. Account-level ledger queries — covers getByAccount() used by cash flow + ledger
+journalEntrySchema.index(
+  { businessId: 1, debitAccountId: 1, transactionDate: -1, status: 1 },
+  { name: 'idx_ledger_debit' }
+);
+journalEntrySchema.index(
+  { businessId: 1, creditAccountId: 1, transactionDate: -1, status: 1 },
+  { name: 'idx_ledger_credit' }
+);
+
+// 6. Description text search — replaces slow regex scan
+//    Usage: findManyWithFilters({ search: '...' })
+journalEntrySchema.index(
+  { description: 'text' },
+  { name: 'idx_description_text', default_language: 'none' }
+);
 
 // ===============================
 // Virtuals
@@ -484,6 +535,32 @@ journalEntrySchema.pre('save', function () {
   // Auto-set baseCurrencyAmount if not provided
   if (this.isNew && this.baseCurrencyAmount === null) {
     this.baseCurrencyAmount = this.amount * (this.exchangeRate || 1);
+  }
+
+  // ── Invariant: keep paymentStatus and JournalStatus consistent with remainingBalance ──
+  // Only applies to AR/AP/installment entries (those that track remainingBalance).
+  // Cash-side entries have remainingBalance === null and should not be touched.
+  if (this.remainingBalance !== null && this.remainingBalance !== undefined) {
+    if (this.remainingBalance <= 0) {
+      // Fully settled — force status invariants
+      this.paymentStatus = PAYMENT_STATUS.PAID;
+      if (this.status !== JOURNAL_STATUS.REVERSED) {
+        this.status = JOURNAL_STATUS.SETTLED;
+      }
+      this.remainingBalance = 0;  // normalise: never store negative
+    } else if (this.partiallyPaidAmount > 0) {
+      // Some payment received but not fully settled
+      this.paymentStatus = PAYMENT_STATUS.PARTIALLY_PAID;
+      if (this.status === JOURNAL_STATUS.POSTED) {
+        this.status = JOURNAL_STATUS.PARTIALLY_SETTLED;
+      }
+    } else if (this.dueDate && new Date() > new Date(this.dueDate)) {
+      // Overdue (no payment, past due date)
+      this.paymentStatus = PAYMENT_STATUS.OVERDUE;
+    } else {
+      // Unpaid, not overdue, no partial payments
+      if (!this.paymentStatus) this.paymentStatus = PAYMENT_STATUS.UNPAID;
+    }
   }
 });
 

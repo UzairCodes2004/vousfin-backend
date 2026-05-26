@@ -2,6 +2,16 @@
  * @module dateParser
  * @description Parses relative and natural date expressions into ISO-8601 format.
  * Handles expressions like "today", "yesterday", "last Friday", "2 days ago", etc.
+ *
+ * BUG FIX: Added plausibility guard on the Date.parse() fallback.
+ * Dates more than 15 years in the past or 2 years in the future are implausible
+ * for SME accounting — they indicate the AI hallucinated or misread a number.
+ * Those are now rejected (returned as null) instead of being silently accepted
+ * with confidence 0.7 which previously bypassed the requiresReview flag.
+ *
+ * Additionally, explicit ISO dates (YYYY-MM-DD) older than 10 years receive a
+ * reduced confidence of 0.35 (below the 0.6 review threshold) so the user is
+ * forced to verify before submitting.
  */
 
 /**
@@ -29,9 +39,18 @@ function parseDate(dateStr, referenceDate = new Date()) {
   }
 
   const input = dateStr.trim().toLowerCase();
+  const currentYear = new Date().getFullYear();
 
-  // Already ISO format
+  // Already ISO format (YYYY-MM-DD)
   if (/^\d{4}-\d{2}-\d{2}$/.test(input)) {
+    const year = parseInt(input.slice(0, 4), 10);
+    const ageYears = currentYear - year;
+    // Dates more than 10 years old are suspicious in SME accounting context —
+    // lower confidence below the 0.6 requiresReview threshold so the user
+    // must verify before confirming. Still return the date so they can edit it.
+    if (ageYears > 10 || year > currentYear + 2) {
+      return { date: input, confidence: 0.35 };
+    }
     return { date: input, confidence: 1.0 };
   }
 
@@ -123,10 +142,21 @@ function parseDate(dateStr, referenceDate = new Date()) {
     }
   }
 
-  // Try native Date.parse as fallback
+  // Try native Date.parse as last-resort fallback.
+  // BUG FIX: Date.parse() is locale-dependent and can accept ambiguous strings
+  // (e.g. "5/4") and map them to implausible years (the year 2001, Unix epoch
+  // era, etc.).  Reject any fallback result that is more than 15 years old or
+  // more than 2 years in the future — these are almost certainly parsing errors
+  // rather than intentional historic dates in an SME accounting context.
   const parsed = Date.parse(dateStr);
   if (!isNaN(parsed)) {
-    return { date: formatISO(new Date(parsed)), confidence: 0.7 };
+    const d = new Date(parsed);
+    const ageYears = currentYear - d.getFullYear();
+    if (ageYears > 15 || d.getFullYear() > currentYear + 2) {
+      // Date is implausible — return null so the caller defaults to today
+      return { date: null, confidence: 0 };
+    }
+    return { date: formatISO(d), confidence: 0.7 };
   }
 
   return { date: null, confidence: 0 };

@@ -147,7 +147,8 @@ const createInstallmentTransaction = async (req, res, next) => {
     const {
       transactionDate, description, amount, debitAccountId, creditAccountId,
       customerId, vendorId,
-      downPayment, installmentCount, installmentFrequency
+      downPayment, installmentCount, installmentFrequency, interestRate,
+      firstPaymentDate, interestMethod,
     } = req.body;
 
     const transactionData = {
@@ -163,9 +164,12 @@ const createInstallmentTransaction = async (req, res, next) => {
     };
 
     const installmentConfig = {
-      downPayment: downPayment || 0,
+      downPayment:          downPayment || 0,
       installmentCount,
-      installmentFrequency
+      installmentFrequency,
+      interestRate:         Number(interestRate || 0),
+      interestMethod:       interestMethod || 'reducing_balance',
+      firstPaymentDate:     firstPaymentDate || null,
     };
 
     const result = await installmentService.createInstallmentPlan(
@@ -213,25 +217,73 @@ const processNaturalLanguage = async (req, res, next) => {
     if (!text || text.trim().length < 5) {
       throw new ApiError(400, 'Please provide a longer transaction description');
     }
-    const parsed = await parserService.parseTransaction(text);
+
+    // Phase 3: Load live business accounts so Gemini uses real CoA names.
+    // Non-fatal — parsing still proceeds with empty accounts on failure.
+    let businessAccounts = [];
+    try {
+      businessAccounts = await accountRepository.findByBusiness(req.user.businessId);
+    } catch (acctErr) {
+      logger.warn('NL parse: could not load business accounts (non-fatal):', acctErr.message);
+    }
+
+    const parsed = await parserService.parseTransaction(text, businessAccounts);
     const preview = mapParserToPreview(parsed, text);
 
     if (req.user.businessId && (preview.debitAccount || preview.creditAccount)) {
-      // Gracefully resolve — fuzzy match, don't throw if not found
+      // Build an in-memory resolver from the accounts we already loaded (no extra DB round-trips).
+      const resolve = businessAccounts.length ? buildAccountResolver(businessAccounts) : null;
+
+      // Gracefully resolve primary accounts — fuzzy match, don't throw if not found
       try {
         if (preview.debitAccount) {
-          const debit = await accountRepository.findByBusinessAndName(req.user.businessId, preview.debitAccount);
+          const debit = resolve
+            ? resolve(preview.debitAccount)
+            : await accountRepository.findByBusinessAndName(req.user.businessId, preview.debitAccount);
           preview.debitAccountId = debit?._id || null;
-          if (debit) preview.debitAccount = debit.accountName; // normalize to actual name
+          if (debit) preview.debitAccount = debit.accountName; // normalize to canonical name
         }
         if (preview.creditAccount) {
-          const credit = await accountRepository.findByBusinessAndName(req.user.businessId, preview.creditAccount);
+          const credit = resolve
+            ? resolve(preview.creditAccount)
+            : await accountRepository.findByBusinessAndName(req.user.businessId, preview.creditAccount);
           preview.creditAccountId = credit?._id || null;
           if (credit) preview.creditAccount = credit.accountName;
         }
       } catch (resolveErr) {
         logger.warn('NL account resolution partial failure (non-fatal):', resolveErr.message);
         // Continue — user will pick accounts manually in preview step
+      }
+
+      // ── Phase 4: Resolve multi-line journal entries (names → IDs) ────────────
+      // journalEntries are already in the preview (from mapParserToPreview).
+      // Resolve each line's account name to a MongoDB ID so the confirm step can
+      // forward the full journal line set without another round-trip.
+      if (Array.isArray(preview.journalEntries) && preview.journalEntries.length > 0) {
+        const resolvedLines = [];
+        for (const entry of preview.journalEntries) {
+          try {
+            const acc = resolve
+              ? resolve(entry.account)
+              : await accountRepository.findByBusinessAndName(req.user.businessId, entry.account);
+            resolvedLines.push({
+              accountId:   acc?._id    || null,
+              accountName: acc?.accountName || entry.account,
+              type:        entry.entryType,   // 'debit' | 'credit'
+              amount:      entry.amount,
+              resolved:    !!acc,
+            });
+          } catch (_) {
+            resolvedLines.push({
+              accountId:   null,
+              accountName: entry.account,
+              type:        entry.entryType,
+              amount:      entry.amount,
+              resolved:    false,
+            });
+          }
+        }
+        preview.resolvedJournalLines = resolvedLines;
       }
     }
 
@@ -243,14 +295,50 @@ const processNaturalLanguage = async (req, res, next) => {
 
 /**
  * Confirm and save a natural language transaction (after preview).
+ *
+ * Phase 3: when `isInstallment: true` is present in the body (set by the NL
+ * preview step), route through InstallmentService instead of plain createTransaction.
+ * The installment engine now supports asset-only plans (no customerId/vendorId required).
  */
 const confirmNaturalLanguage = async (req, res, next) => {
   try {
-    const { transactionDate, description, transactionType, amount } = req.body;
+    const {
+      transactionDate,
+      description,
+      transactionType,
+      amount,
+      // Installment fields forwarded from the NL preview
+      isInstallment,
+      installmentCount,
+      installmentFrequency,
+      downPayment,
+      installmentPeriodMonths,
+      interestRate,
+    } = req.body;
+
     const { debitAccountId, creditAccountId } = await resolveAccountIds(req.user.businessId, req.body);
     if (!debitAccountId || !creditAccountId) {
       throw new ApiError(400, 'Debit and credit accounts are required. Resolve account names or pass account IDs.');
     }
+
+    // ── Phase 4: Accept multi-line journal lines forwarded from the preview ──
+    // The preview step resolves account names → IDs and stores them as
+    // resolvedJournalLines. The frontend forwards them back here as journalLines.
+    // Only include fully-resolved lines (accountId present) to avoid partial saves.
+    let journalLines;
+    const rawJournalLines = req.body.journalLines || req.body.resolvedJournalLines;
+    if (Array.isArray(rawJournalLines) && rawJournalLines.length > 2) {
+      const validLines = rawJournalLines.filter((l) => l.accountId);
+      if (validLines.length >= 2) {
+        journalLines = validLines.map((l) => ({
+          accountId: l.accountId,
+          type:      l.type,
+          amount:    Number(l.amount),
+          description: l.accountName || '',
+        }));
+      }
+    }
+
     const transactionData = {
       transactionDate,
       description,
@@ -260,7 +348,33 @@ const confirmNaturalLanguage = async (req, res, next) => {
       creditAccountId,
       businessId: req.user.businessId,
       inputMethod: 'nlp',
+      // Include journal lines for multi-entry accounting (Phase 4).
+      // When present, the service uses these for balance updates and storage.
+      ...(journalLines ? { journalLines } : {}),
     };
+
+    // ── Phase 3: Installment routing ─────────────────────────────────────────
+    const effectiveCount = installmentCount || installmentPeriodMonths;
+    if (isInstallment && effectiveCount) {
+      const installmentConfig = {
+        downPayment:          Number(downPayment   || 0),
+        installmentCount:     Number(effectiveCount),
+        installmentFrequency: installmentFrequency || 'monthly',
+        interestRate:         Number(interestRate  || 0),
+        interestMethod:       req.body.interestMethod || 'reducing_balance',
+        firstPaymentDate:     req.body.firstPaymentDate || null,
+      };
+
+      const plan = await installmentService.createInstallmentPlan(
+        transactionData,
+        installmentConfig,
+        req.user.id,
+        req.ip
+      );
+      return ApiResponse.created(res, plan, 'Installment plan created from natural language');
+    }
+
+    // ── Standard (non-installment) transaction ────────────────────────────────
     const transaction = await transactionService.createTransaction(
       transactionData,
       req.user.id,
@@ -326,7 +440,7 @@ const downloadExcelTemplate = async (req, res, next) => {
       ['2024-01-18', 'Salary payment',                       60000, 'Salaries Expense',      'Bank',              'Expense',    '',         '',         '',         'Staff salaries'],
       ['2024-01-19', 'Purchase inventory from supplier',     40000, 'Inventory',             'Accounts Payable',  'Credit Purchase','',    'Ali Traders','PO-005',  ''],
       ['2024-01-20', 'Loan from bank',                      200000, 'Bank',                  'Loan Payable',      'Loan Disbursement','','',            '',         'MCB Business Loan'],
-      ['2024-01-21', 'Owner puts in capital',               100000, 'Cash',                  "Owner's Equity",    'Owner Investment','','',            '',         ''],
+      ['2024-01-21', 'Owner puts in capital',               100000, 'Cash at Bank',          'Capital / Investment','Owner Investment','','',          '',         ''],
     ];
     examples.forEach((row, idx) => {
       const r = ws.addRow(row);
@@ -630,7 +744,8 @@ const updateTransaction = async (req, res, next) => {
 };
 
 /**
- * Delete (reverse) a transaction.
+ * Delete (reverse) a transaction — legacy endpoint kept for backward compat.
+ * Prefer POST /:id/reverse for new code.
  */
 const deleteTransaction = async (req, res, next) => {
   try {
@@ -642,6 +757,258 @@ const deleteTransaction = async (req, res, next) => {
       req.ip
     );
     ApiResponse.success(res, reversal, 'Transaction reversed successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Reverse a posted transaction — GAAP-compliant dedicated reversal.
+ * POST /api/v1/transactions/:id/reverse
+ *
+ * Body: { reversalDate?: ISO date, reason?: string }
+ */
+const reverseTransaction = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { reversalDate, reason } = req.body;
+    const reversal = await transactionService.reverseTransaction(
+      id,
+      req.user.businessId,
+      { reversalDate, reason },
+      req.user.id,
+      req.ip
+    );
+    ApiResponse.created(res, reversal, 'Transaction reversed successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get full audit/reversal history for a transaction.
+ * GET /api/v1/transactions/:id/history
+ */
+const getTransactionAuditHistory = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const history = await transactionService.getTransactionAuditHistory(id, req.user.businessId);
+    ApiResponse.success(res, history, 'Transaction history retrieved');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Repair orphaned AR/AP transactions for this business.
+ *
+ * POST /api/v1/transactions/repair-ar-ap
+ *
+ * Finds transactions where the account pair indicates AR/AP (debit = Accounts
+ * Receivable + credit = Revenue, or credit = Accounts Payable + debit = Expense)
+ * but paymentStatus was never set (wrong preset used at entry time).
+ *
+ * Idempotent — safe to call multiple times. Only processes transactions where
+ * paymentStatus is currently null.
+ *
+ * Returns: { arFixed, apFixed, message }
+ */
+const repairARAPTransactions = async (req, res, next) => {
+  try {
+    const result = await transactionService.repairOrphanedARAPTransactions(req.user.businessId);
+    const msg = result.arFixed === 0 && result.apFixed === 0
+      ? 'No orphaned AR/AP entries found — books are consistent.'
+      : `Repaired ${result.arFixed} receivable${result.arFixed !== 1 ? 's' : ''} and ${result.apFixed} payable${result.apFixed !== 1 ? 's' : ''}.`;
+    ApiResponse.success(res, result, msg);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/* Advanced Installment Lifecycle Controllers                                  */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * GET /api/v1/transactions/installments
+ * List all installment plans for the current business.
+ */
+const getInstallmentPlans = async (req, res, next) => {
+  try {
+    const filters = req.query; // status, customerId, vendorId, etc.
+    const plans = await installmentService.getInstallmentsByBusiness(req.user.businessId, filters);
+    ApiResponse.success(res, plans, 'Installment plans retrieved successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /api/v1/transactions/installment/:planId
+ * Get a single installment plan with full schedule.
+ */
+const getInstallmentPlan = async (req, res, next) => {
+  try {
+    const plan = await installmentService.getInstallmentPlan(req.params.planId, req.user.businessId);
+    ApiResponse.success(res, plan, 'Installment plan retrieved');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /api/v1/transactions/installments/reminders?daysAhead=7
+ * Upcoming due installments within the look-ahead window.
+ */
+const getInstallmentReminders = async (req, res, next) => {
+  try {
+    const daysAhead = Number(req.query.daysAhead) || 7;
+    const reminders = await installmentService.getUpcomingReminders(req.user.businessId, daysAhead);
+    ApiResponse.success(res, reminders, `${reminders.length} upcoming installment(s) within ${daysAhead} days`);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /api/v1/transactions/installments/overdue-alerts
+ * All overdue plans with per-row detail and severity.
+ */
+const getOverdueAlerts = async (req, res, next) => {
+  try {
+    const result = await installmentService.getOverdueAlerts(req.user.businessId);
+    ApiResponse.success(res, result, `${result.planCount} overdue installment plan(s)`);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/v1/transactions/installment/:planId/penalty
+ * Accrue late-payment penalty on a single plan.
+ *
+ * Body: { flatPenaltyPerRow?, annualPenaltyRate? }
+ */
+const accrueInstallmentPenalty = async (req, res, next) => {
+  try {
+    const { planId } = req.params;
+    const opts = {
+      flatPenaltyPerRow: req.body.flatPenaltyPerRow != null ? Number(req.body.flatPenaltyPerRow) : undefined,
+      annualPenaltyRate: req.body.annualPenaltyRate != null ? Number(req.body.annualPenaltyRate) : undefined,
+    };
+    const result = await installmentService.accrueInstallmentPenalty(
+      planId,
+      req.user.businessId,
+      opts,
+      req.user.id,
+      req.ip
+    );
+    const msg = result.penaltiesApplied.length > 0
+      ? `Penalty of ${result.totalPenalty} accrued across ${result.penaltiesApplied.length} overdue row(s)`
+      : 'No overdue rows found — no penalty accrued';
+    ApiResponse.success(res, result, msg);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/v1/transactions/installments/accrue-all-penalties
+ * Batch penalty accrual for ALL overdue plans of the business.
+ * Designed for cron-job use.
+ *
+ * Body: { flatPenaltyPerRow?, annualPenaltyRate? }
+ */
+const accrueAllPenalties = async (req, res, next) => {
+  try {
+    const opts = {
+      flatPenaltyPerRow: req.body.flatPenaltyPerRow != null ? Number(req.body.flatPenaltyPerRow) : undefined,
+      annualPenaltyRate: req.body.annualPenaltyRate != null ? Number(req.body.annualPenaltyRate) : undefined,
+    };
+    const result = await installmentService.accrueAllPenalties(
+      req.user.businessId,
+      opts,
+      req.user.id,
+      req.ip
+    );
+    ApiResponse.success(
+      res,
+      result,
+      `Penalty run complete: ${result.plansProcessed} plan(s) processed, total ${result.totalPenalty} accrued`
+    );
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/v1/transactions/installment/:planId/restructure
+ * Restructure (modify terms of) an installment plan.
+ *
+ * Body: {
+ *   installmentCount,
+ *   installmentFrequency?,
+ *   interestRate?,
+ *   interestMethod?,
+ *   firstPaymentDate?,
+ *   reason?
+ * }
+ */
+const restructureInstallmentPlan = async (req, res, next) => {
+  try {
+    const { planId } = req.params;
+    if (!req.body.installmentCount) {
+      throw new ApiError(400, 'installmentCount is required for restructuring');
+    }
+    const plan = await installmentService.restructurePlan(
+      planId,
+      req.user.businessId,
+      req.body,
+      req.user.id,
+      req.ip
+    );
+    ApiResponse.success(res, plan, 'Installment plan restructured successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/v1/transactions/installment/:planId/settle-early
+ * Early settlement of an installment plan.
+ *
+ * Body: {
+ *   amount,           – actual cash paid
+ *   discountAmount?,  – waived/forgiven amount (optional)
+ *   paymentAccountId, – cash/bank account
+ *   transactionDate?, description?
+ * }
+ */
+const settleInstallmentEarly = async (req, res, next) => {
+  try {
+    const { planId } = req.params;
+    const result = await installmentService.settleEarly(
+      planId,
+      req.user.businessId,
+      req.body,
+      req.user.id,
+      req.ip
+    );
+    ApiResponse.success(res, result, 'Installment plan settled early successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/v1/transactions/installments/refresh-overdue
+ * Manually trigger overdue status refresh for all active plans.
+ * Normally called by a daily cron.
+ */
+const refreshOverdueStatuses = async (req, res, next) => {
+  try {
+    const result = await installmentService.refreshOverdueStatuses(req.user.businessId);
+    ApiResponse.success(res, result, `Refreshed ${result.scanned} plans (${result.updated} updated)`);
   } catch (error) {
     next(error);
   }
@@ -663,4 +1030,17 @@ module.exports = {
   getTransactionById,
   updateTransaction,
   deleteTransaction,
+  reverseTransaction,
+  getTransactionAuditHistory,
+  repairARAPTransactions,
+  // ── Advanced installment lifecycle ─────────────────────────────────────
+  getInstallmentPlans,
+  getInstallmentPlan,
+  getInstallmentReminders,
+  getOverdueAlerts,
+  accrueInstallmentPenalty,
+  accrueAllPenalties,
+  restructureInstallmentPlan,
+  settleInstallmentEarly,
+  refreshOverdueStatuses,
 };

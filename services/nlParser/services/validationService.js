@@ -9,11 +9,12 @@ const { validateJournalAccounts } = require('./accountingRulesService');
 
 /**
  * Validate the complete parsed result before returning to the client.
- * @param {object} parsedData - Normalized transaction data.
- * @param {Array<{ account: string, entryType: string, amount: number }>} journalEntries
+ * @param {object} parsedData      - Normalized transaction data.
+ * @param {Array}  journalEntries  - Journal entries from journalGeneratorService.
+ * @param {Array}  businessAccounts - Live ChartOfAccount docs for custom-account validation.
  * @returns {object} Validation result with balance info and any issues.
  */
-function validateResult(parsedData, journalEntries) {
+function validateResult(parsedData, journalEntries, businessAccounts = []) {
   const errors = [];
   const warnings = [];
 
@@ -68,9 +69,9 @@ function validateResult(parsedData, journalEntries) {
     }
   }
 
-  // 8. Validate accounts against chart of accounts
+  // 8. Validate accounts against chart of accounts (live MongoDB accounts take priority)
   const accountValidation = journalEntries
-    ? validateJournalAccounts(journalEntries, parsedData.transactionType)
+    ? validateJournalAccounts(journalEntries, parsedData.transactionType, businessAccounts)
     : { valid: false, warnings: [], unresolvedAccounts: [] };
 
   if (accountValidation.unresolvedAccounts.length > 0) {

@@ -1,6 +1,8 @@
 // validations/business.validation.js
 const Joi = require('joi');
-const { BUSINESS_TYPES, DEFAULT_CURRENCY, ACCOUNT_TYPES, NORMAL_BALANCE } = require('../config/constants');
+const { BUSINESS_TYPES, DEFAULT_CURRENCY, ACCOUNT_TYPES, ACCOUNT_SUBTYPES, NORMAL_BALANCE } = require('../config/constants');
+
+const objectIdPattern = /^[0-9a-fA-F]{24}$/;
 
 /**
  * Schema for creating a new business profile.
@@ -55,6 +57,9 @@ const addCustomAccountSchema = Joi.object({
     'any.only': `Account type must be one of: ${Object.values(ACCOUNT_TYPES).join(', ')}`,
     'any.required': 'Account type is required',
   }),
+  accountSubtype: Joi.string().valid(...Object.values(ACCOUNT_SUBTYPES)).allow(null, '').optional(),
+  accountCode: Joi.string().max(20).trim().allow(null, '').optional(),
+  parentAccountId: Joi.string().pattern(objectIdPattern).allow(null).optional(),
   normalBalance: Joi.string().valid(...Object.values(NORMAL_BALANCE)).required().messages({
     'any.only': `Normal balance must be one of: ${Object.values(NORMAL_BALANCE).join(', ')}`,
     'any.required': 'Normal balance is required',
@@ -68,17 +73,21 @@ const addCustomAccountSchema = Joi.object({
 const updateAccountSchema = Joi.object({
   accountName: Joi.string().min(2).max(100).trim().optional(),
   accountType: Joi.string().valid(...Object.values(ACCOUNT_TYPES)).optional(),
+  accountSubtype: Joi.string().valid(...Object.values(ACCOUNT_SUBTYPES)).allow(null, '').optional(),
+  accountCode: Joi.string().max(20).trim().allow(null, '').optional(),
+  parentAccountId: Joi.string().pattern(objectIdPattern).allow(null).optional(),
   normalBalance: Joi.string().valid(...Object.values(NORMAL_BALANCE)).optional(),
 }).min(1);
 
 /**
  * Schema for listing accounts (query parameters).
  * Used in GET /business/accounts
+ *
+ * NOTE: page/limit are intentionally removed. The endpoint now returns the
+ * complete Chart of Accounts without pagination. See controller comment.
  */
 const listAccountsQuerySchema = Joi.object({
   accountType: Joi.string().valid(...Object.values(ACCOUNT_TYPES)).optional(),
-  page: Joi.number().integer().min(1).default(1).optional(),
-  limit: Joi.number().integer().min(1).max(100).default(25).optional(),
 });
 
 module.exports = {

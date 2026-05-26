@@ -137,10 +137,21 @@ class CustomerService {
       {
         $group: {
           _id: null,
+          // Revenue types: Credit Sale (primary) + legacy/mis-labeled types that
+          // are still revenue (Inventory Sale, Income, Cash Sale).
+          // Under GAAP, any debit to AR with a revenue credit is a sale regardless
+          // of the type label — so we count all sale-like types here for resilience.
           lifetimeRevenue: {
             $sum: {
               $cond: [
-                { $in: ['$transactionType', [TRANSACTION_TYPES.CREDIT_SALE, TRANSACTION_TYPES.INCOME]] },
+                {
+                  $in: ['$transactionType', [
+                    TRANSACTION_TYPES.CREDIT_SALE,
+                    TRANSACTION_TYPES.INVENTORY_SALE,
+                    TRANSACTION_TYPES.CASH_SALE,
+                    TRANSACTION_TYPES.INCOME,
+                  ]],
+                },
                 '$amount',
                 0,
               ],
@@ -155,9 +166,15 @@ class CustomerService {
               ],
             },
           },
+          // Invoice count: Credit Sale + Inventory Sale (both create AR obligations)
           invoiceCount: {
             $sum: {
-              $cond: [{ $eq: ['$transactionType', TRANSACTION_TYPES.CREDIT_SALE] }, 1, 0],
+              $cond: [{
+                $in: ['$transactionType', [
+                  TRANSACTION_TYPES.CREDIT_SALE,
+                  TRANSACTION_TYPES.INVENTORY_SALE,
+                ]],
+              }, 1, 0],
             },
           },
           paymentCount: {
@@ -170,15 +187,26 @@ class CustomerService {
               $cond: [{ $eq: ['$paymentStatus', PAYMENT_STATUS.OVERDUE] }, 1, 0],
             },
           },
+          // Invoice amount sum: same broad types as invoiceCount
           invoiceAmountSum: {
             $sum: {
-              $cond: [{ $eq: ['$transactionType', TRANSACTION_TYPES.CREDIT_SALE] }, '$amount', 0],
+              $cond: [{
+                $in: ['$transactionType', [
+                  TRANSACTION_TYPES.CREDIT_SALE,
+                  TRANSACTION_TYPES.INVENTORY_SALE,
+                ]],
+              }, '$amount', 0],
             },
           },
           lastInvoiceDate: {
             $max: {
               $cond: [
-                { $eq: ['$transactionType', TRANSACTION_TYPES.CREDIT_SALE] },
+                {
+                  $in: ['$transactionType', [
+                    TRANSACTION_TYPES.CREDIT_SALE,
+                    TRANSACTION_TYPES.INVENTORY_SALE,
+                  ]],
+                },
                 '$transactionDate',
                 null,
               ],

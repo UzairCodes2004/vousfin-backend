@@ -67,11 +67,15 @@ function evaluateReviewNeed(confidence, parsedData) {
   if (!parsedData.transactionType) {
     reasons.push('Missing transaction type');
   }
-  if (!parsedData.sourceAccount && !parsedData.paymentMethod) {
+  // Only flag missing payment source for cash-flow transactions.
+  // Non-cash transactions (depreciation, financed asset purchases, transfers)
+  // never have a sourceAccount by design — flagging them is a false positive.
+  if (
+    !parsedData.sourceAccount &&
+    !parsedData.paymentMethod &&
+    parsedData.cashFlowDirection !== 'non_cash'
+  ) {
     reasons.push('Ambiguous payment source');
-  }
-  if (parsedData.counterpartyName === null && parsedData.transactionType === 'income') {
-    reasons.push('Unclear counterparty for income transaction');
   }
 
   return {

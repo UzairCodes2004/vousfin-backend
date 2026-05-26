@@ -14,10 +14,11 @@ const RETRY_DELAY_MS = 1000;
 /**
  * Call the Gemini API with natural language transaction input.
  * @param {string} rawInput - Raw transaction text from user.
+ * @param {Array}  businessAccounts - Live accounts from MongoDB for context injection.
  * @returns {Promise<object>} Parsed JSON response from Gemini.
  * @throws {Error} If all retries fail or response is invalid.
  */
-async function callGeminiAPI(rawInput) {
+async function callGeminiAPI(rawInput, businessAccounts = []) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY environment variable is not set');
@@ -25,7 +26,7 @@ async function callGeminiAPI(rawInput) {
 
   const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
 
-  const systemPrompt = buildSystemPrompt();
+  const systemPrompt = buildSystemPrompt(businessAccounts);
   const userPrompt = buildUserPrompt(rawInput);
 
   const requestBody = {

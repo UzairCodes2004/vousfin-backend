@@ -1,6 +1,6 @@
 // models/ChartOfAccount.model.js
 const mongoose = require('mongoose');
-const { ACCOUNT_TYPES, NORMAL_BALANCE } = require('../config/constants');
+const { ACCOUNT_TYPES, ACCOUNT_SUBTYPES, NORMAL_BALANCE } = require('../config/constants');
 
 /**
  * ChartOfAccount Schema
@@ -24,6 +24,37 @@ const chartOfAccountSchema = new mongoose.Schema(
       type: String,
       enum: Object.values(ACCOUNT_TYPES),
       required: true,
+    },
+    /**
+     * Sub-grouping label used for Chart of Accounts hierarchy and dropdown
+     * grouping. Optional — accounts created before this field existed will
+     * have it backfilled by the migration in migrations/.
+     */
+    accountSubtype: {
+      type: String,
+      enum: [...Object.values(ACCOUNT_SUBTYPES), null],
+      default: null,
+      index: true,
+    },
+    /**
+     * Numeric/text code (e.g., "1010", "4110"). Optional but recommended.
+     * Unique per business when set.
+     */
+    accountCode: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: 20,
+    },
+    /**
+     * Optional parent account for hierarchical Chart of Accounts.
+     * Currently unused by default seeds (subtype provides the grouping)
+     * but available for future tree-style account structures.
+     */
+    parentAccountId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'ChartOfAccount',
+      default: null,
     },
     normalBalance: {
       type: String,
@@ -60,6 +91,24 @@ chartOfAccountSchema.index({ businessId: 1, accountName: 1 }, { unique: true });
 chartOfAccountSchema.index({ businessId: 1, accountType: 1 });
 // Index for normal balance (used in report generation)
 chartOfAccountSchema.index({ businessId: 1, normalBalance: 1 });
+// Optional unique-per-business code (partial filter ignores accounts without code)
+chartOfAccountSchema.index(
+  { businessId: 1, accountCode: 1 },
+  { unique: true, partialFilterExpression: { accountCode: { $type: 'string' } } }
+);
+
+// ── PERFORMANCE: Additional compound indexes ───────────────────────────────
+//
+// Covers accountRepository.findByBusiness() sort (type + name) in one scan
+chartOfAccountSchema.index(
+  { businessId: 1, accountType: 1, accountName: 1 },
+  { name: 'idx_coa_type_name' }
+);
+// Text index on accountName for fast fuzzy search in NL/Excel import resolution
+chartOfAccountSchema.index(
+  { accountName: 'text' },
+  { name: 'idx_coa_name_text', default_language: 'none' }
+);
 
 // ===============================
 // Virtuals

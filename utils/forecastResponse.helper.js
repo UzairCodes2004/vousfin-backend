@@ -1,8 +1,15 @@
 /**
- * forecastResponse.helper.js — v3
+ * forecastResponse.helper.js — v4
  *
  * Transforms lstmForecastService output into the API response shape
- * consumed by the frontend. All monetary values stay in raw PKR.
+ * consumed by the frontend. Monetary values are in the business's own
+ * currency (never hardcoded PKR). Confidence scores are passed through
+ * from the service's data-driven calculation — never recomputed here.
+ *
+ * v4 additions:
+ *  - dataSufficiency object (tier, months, message)
+ *  - currency field (business base currency)
+ *  - confidence score passed through from kpiSummary (no re-hardcoding)
  *
  * v3 additions:
  *  - scenarios (optimistic/base/pessimistic)
@@ -83,15 +90,17 @@ function formatForecastApiResponse(metric, horizon, result) {
     riskIndicators,
     momentum,
     categoryBreakdown,
+    // v4 fields — currency isolation + data sufficiency
+    dataSufficiency,
+    currency,
   } = result;
 
   const historicalPoints = seriesToChartPoints(historical, labels, 0);
   const predictedPoints  = seriesToChartPoints(predicted,  labels, historical.length);
 
-  const confLabel  = confidence[0] ?? 'Medium';
-  const baseScore  = confLabel === 'High' ? 92 : confLabel === 'Medium' ? 85 : 74;
-  const penalty    = anomalyRisk?.confidencePenalty || 0;
-  const confScore  = Math.max(50, baseScore - penalty);
+  // Use the pre-computed data-driven score from kpiSummary (never recompute with hardcoded values)
+  const confLabel  = confidence[0] ?? (kpiSummary?.confidenceLabel ?? 'Low');
+  const confScore  = kpiSummary?.confidenceScore ?? 30;
 
   const confidenceIntervals = predicted.map((_, i) => ({
     upper: upper[i] ?? predicted[i],
@@ -107,8 +116,8 @@ function formatForecastApiResponse(metric, horizon, result) {
     pessimistic: seriesToChartPoints(scenarios.pessimistic,  labels, historical.length),
   } : null;
 
-  const normSource = dataSource || 'static';
-  const normModel  = modelType  || 'LSTM';
+  const normSource = dataSource || 'live';
+  const normModel  = modelType  || 'Holt-Winters ES';
 
   return {
     metric: metric || target,
@@ -119,12 +128,12 @@ function formatForecastApiResponse(metric, horizon, result) {
     dataSource: normSource,
     modelType:  normModel,
 
-    // Chart series (raw PKR)
+    // Chart series (raw values — currency in `currency` field below)
     historical: historicalPoints,
     predicted:  predictedPoints,
     forecast:   predictedPoints,  // alias
 
-    // Confidence
+    // Confidence — passed through from data-driven kpiSummary, never recomputed
     confidenceIntervals,
     confidenceScore:   `${confScore}%`,
     confidenceNumeric: confScore,
@@ -154,6 +163,10 @@ function formatForecastApiResponse(metric, horizon, result) {
     riskIndicators:    riskIndicators    || [],
     momentum:          momentum          || null,
     categoryBreakdown: categoryBreakdown || [],
+
+    // ── v4 additions — currency isolation + data sufficiency ──
+    dataSufficiency:   dataSufficiency || null,
+    currency:          currency || 'USD',
   };
 }
 

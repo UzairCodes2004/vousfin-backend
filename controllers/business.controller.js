@@ -60,7 +60,17 @@ const updateBusiness = async (req, res, next) => {
 /**
  * List chart of accounts for the current business.
  * GET /api/v1/business/accounts
- * Query: accountType (optional), page, limit (optional)
+ * Query: accountType (optional)
+ *
+ * ARCHITECTURE NOTE: This endpoint returns the COMPLETE Chart of Accounts
+ * without pagination. Pagination was removed because:
+ *  1. A CoA is a bounded, finite dataset (typically 30–300 accounts per SME).
+ *  2. Transaction form dropdowns MUST show ALL accounts — a paginated API
+ *     would silently truncate the account list, breaking account selection.
+ *  3. The full CoA is cached on the client (TanStack Query) so repeated
+ *     dropdown opens don't re-fetch.
+ * If a business eventually exceeds ~500 accounts, add client-side search
+ * filtering rather than server-side pagination.
  */
 const getAccounts = async (req, res, next) => {
   try {
@@ -69,14 +79,10 @@ const getAccounts = async (req, res, next) => {
     if (!business) {
       throw new ApiError(404, 'Business profile not found');
     }
-    const { accountType, page, limit } = req.query;
-    // For simplicity, we use the repository directly (or add a method in accountRepository)
-    let query = { businessId: business._id };
-    if (accountType) {
-      query.accountType = accountType;
-    }
-    const pagination = { page: parseInt(page, 10) || 1, limit: parseInt(limit, 10) || 25 };
-    const accounts = await accountRepository.findAll(query, pagination);
+    const { accountType } = req.query;
+    // findByBusiness returns ALL accounts sorted by accountType → accountName.
+    // No pagination — the full CoA is required for transaction form dropdowns.
+    const accounts = await accountRepository.findByBusiness(business._id, accountType || null);
     ApiResponse.success(res, accounts, 'Chart of accounts retrieved');
   } catch (error) {
     next(error);

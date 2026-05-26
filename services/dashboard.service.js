@@ -4,6 +4,7 @@ const transactionRepository = require('../repositories/transaction.repository');
 const { ApiError } = require('../utils/ApiError');
 const { TRANSACTION_TYPES } = require('../config/constants');
 const logger = require('../config/logger');
+const reportCache = require('../utils/reportCache');
 
 class DashboardService {
   /**
@@ -89,14 +90,16 @@ class DashboardService {
     const cashTransactions = await transactionRepository.getByAccount(
       businessId, cashAccount._id, startDate, endDate
     );
-    
+
     // Group by interval and sum net cash flow (inflow - outflow)
     const grouped = new Map();
     for (const tx of cashTransactions) {
       const periodKey = this._getPeriodKey(tx.transactionDate, interval);
       if (!grouped.has(periodKey)) grouped.set(periodKey, { inflow: 0, outflow: 0 });
       const entry = grouped.get(periodKey);
-      const isDebit = tx.debitAccountId._id.toString() === cashAccount._id.toString();
+      // getByAccount returns .lean() docs — debitAccountId is a plain ObjectId, not a sub-doc.
+      // Use .toString() directly, NOT ._id.toString() (._id would be undefined on a BSON ObjectId).
+      const isDebit = tx.debitAccountId.toString() === cashAccount._id.toString();
       if (isDebit) {
         entry.inflow += tx.amount;
       } else {
@@ -120,16 +123,25 @@ class DashboardService {
    * @returns {Promise<Object>}
    */
   async getAllDashboardData(businessId, startDate, endDate) {
+    // ── Cache layer ────────────────────────────────────────────────────────────
+    // The dashboard aggregates KPIs + 2 chart series — all expensive operations.
+    // Cache is invalidated by transaction writes, so data is always fresh after a write.
+    const _dashParams = {
+      start: new Date(startDate).toISOString(),
+      end:   new Date(endDate).toISOString(),
+    };
+    const _dashCached = reportCache.get('dashboard-all', businessId.toString(), _dashParams);
+    if (_dashCached) return _dashCached;
+
     const [kpis, revenueVsExpenses, cashFlowTrend] = await Promise.all([
       this.getKPIs(businessId, startDate, endDate),
       this.getRevenueVsExpensesChart(businessId, startDate, endDate),
       this.getCashFlowTrend(businessId, startDate, endDate),
     ]);
-    return {
-      kpis,
-      revenueVsExpenses,
-      cashFlowTrend,
-    };
+
+    const _dashResult = { kpis, revenueVsExpenses, cashFlowTrend };
+    reportCache.set('dashboard-all', businessId.toString(), _dashParams, _dashResult);
+    return _dashResult;
   }
 
   // ===============================

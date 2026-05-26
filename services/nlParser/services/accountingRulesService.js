@@ -82,25 +82,69 @@ function validateNormalBalance(accountName, entryType, transactionType) {
 
 /**
  * Validate that all accounts in journal entries are accounting-valid.
+ *
+ * Resolution priority:
+ *   1. Live business accounts from MongoDB (case-insensitive exact match)
+ *   2. Static ACCOUNT_ALIAS_MAP (default CoA template — fallback only)
+ *
+ * This ensures businesses with custom account names (e.g. "Trade Debtors",
+ * "HSBC Current Account") are validated correctly instead of being flagged
+ * as unresolved.
+ *
  * @param {Array<{ account: string, entryType: string, amount: number }>} entries
  * @param {string} transactionType
+ * @param {Array}  businessAccounts - Live ChartOfAccount docs from MongoDB (optional).
  * @returns {{ valid: boolean, warnings: string[], unresolvedAccounts: string[] }}
  */
-function validateJournalAccounts(entries, transactionType) {
+function validateJournalAccounts(entries, transactionType, businessAccounts = []) {
   const warnings = [];
   const unresolvedAccounts = [];
 
-  for (const entry of entries) {
-    const { account, resolved } = resolveAccount(entry.account);
-
-    if (!resolved) {
-      unresolvedAccounts.push(entry.account);
-      warnings.push(`Account "${entry.account}" not found in chart of accounts`);
+  // Build a fast lookup from live business accounts (populated from MongoDB)
+  const liveAccountMap = new Map();
+  for (const acct of businessAccounts) {
+    if (acct?.accountName) {
+      liveAccountMap.set(acct.accountName.toLowerCase().trim(), {
+        name: acct.accountName,
+        type: acct.accountType?.toLowerCase(),
+      });
     }
+  }
 
-    const balanceCheck = validateNormalBalance(entry.account, entry.entryType, transactionType);
-    if (balanceCheck.warning) {
-      warnings.push(balanceCheck.warning);
+  for (const entry of entries) {
+    const liveKey = entry.account?.toLowerCase().trim();
+    const liveMatch = liveKey ? liveAccountMap.get(liveKey) : null;
+
+    if (liveMatch) {
+      // ── Found in live MongoDB accounts ──────────────────────────────────────
+      // Validate normal balance using live account type
+      if (!REVERSAL_TYPES.has(transactionType)) {
+        const { type } = liveMatch;
+        const normalIncrease = (type === 'asset' || type === 'expense') ? 'debit' : 'credit';
+        if (entry.entryType !== normalIncrease) {
+          if (type === 'expense' && entry.entryType === 'credit') {
+            warnings.push(`Crediting expense account "${entry.account}" — verify this is intentional`);
+          } else if (type === 'revenue' && entry.entryType === 'debit') {
+            warnings.push(`Debiting revenue account "${entry.account}" — verify this is intentional`);
+          }
+        }
+      }
+    } else {
+      // ── Fall back to static alias map ───────────────────────────────────────
+      const { account, resolved } = resolveAccount(entry.account);
+
+      if (!resolved) {
+        // Only flag as unresolved when both live accounts AND static map have no match.
+        // This means the account name is genuinely unknown — not just a custom name.
+        unresolvedAccounts.push(entry.account);
+        // Downgrade to a softer warning — may be a custom account not in template
+        warnings.push(`Account "${entry.account}" not in default template (verify it exists in your Chart of Accounts)`);
+      } else {
+        const balanceCheck = validateNormalBalance(entry.account, entry.entryType, transactionType);
+        if (balanceCheck.warning) {
+          warnings.push(balanceCheck.warning);
+        }
+      }
     }
   }
 

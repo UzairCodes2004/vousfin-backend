@@ -24,7 +24,7 @@ const defaultLimiter = rateLimit({
  */
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  limit: 5, // only 5 login/register attempts per window
+  limit: 50, // 50 login/register attempts per window (raised for dev; tighten in prod)
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: {

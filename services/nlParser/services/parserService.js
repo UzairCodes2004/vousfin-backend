@@ -16,7 +16,7 @@ const { calculateConfidence, evaluateReviewNeed } = require('../utils/confidence
  * accounting journal entry object.
  *
  * Pipeline:
- *   1. AI Extraction (GROK API)
+ *   1. AI Extraction (Gemini API — with live business accounts injected)
  *   2. Normalization
  *   3. Accounting Rules Engine
  *   4. Journal Entry Generation
@@ -24,11 +24,12 @@ const { calculateConfidence, evaluateReviewNeed } = require('../utils/confidence
  *   6. Confidence & Review Assessment
  *
  * @param {string} rawInput - Natural language transaction description.
+ * @param {Array}  businessAccounts - Live ChartOfAccount docs for CoA-aware parsing.
  * @returns {Promise<object>} Structured journal entry response.
  */
-async function parseTransaction(rawInput) {
-  // ── Step 1: AI Extraction ──
-  const rawExtraction = await callGeminiAPI(rawInput);
+async function parseTransaction(rawInput, businessAccounts = []) {
+  // ── Step 1: AI Extraction — inject live accounts so Gemini uses real names ──
+  const rawExtraction = await callGeminiAPI(rawInput, businessAccounts);
 
   // ── Step 2: Normalization ──
   const { normalized, confidence: rawConfidence } = normalizeExtraction(rawExtraction);
@@ -36,8 +37,8 @@ async function parseTransaction(rawInput) {
   // ── Step 3 & 4: Journal Entry Generation (includes accounting rules) ──
   const journalEntries = generateJournalEntries(normalized);
 
-  // ── Step 5: Validation ──
-  const { validation, errors, warnings, isValid } = validateResult(normalized, journalEntries);
+  // ── Step 5: Validation — pass live accounts so custom names resolve correctly ──
+  const { validation, errors, warnings, isValid } = validateResult(normalized, journalEntries, businessAccounts);
 
   // ── Step 6: Confidence & Review ──
   const confidence = calculateConfidence(rawConfidence);
@@ -61,7 +62,7 @@ async function parseTransaction(rawInput) {
     reviewReasons.push(...errors.map((e) => `VALIDATION ERROR: ${e}`));
   }
 
-  // Build final response
+  // Build final response — include all fields the frontend needs
   const parsedData = {
     intent: normalized.intent,
     transactionType: normalized.transactionType,
@@ -73,10 +74,30 @@ async function parseTransaction(rawInput) {
     counterpartyName: normalized.counterpartyName,
     paymentMethod: normalized.paymentMethod,
     sourceAccount: normalized.sourceAccount,
+    // Explicit debit/credit suggestions from Gemini (new Phase 1 fields)
+    debitAccount: normalized.debitAccount,
+    creditAccount: normalized.creditAccount,
     cashFlowDirection: normalized.cashFlowDirection,
+    // Installment / financing metadata — must NOT be dropped
     isInstallment: normalized.isInstallment,
     totalInstallmentAmount: normalized.totalInstallmentAmount,
     installmentPeriodMonths: normalized.installmentPeriodMonths,
+    downPayment:      normalized.downPayment,
+    interestRate:     normalized.interestRate,
+    firstPaymentDate: normalized.firstPaymentDate,
+    interestMethod:   normalized.interestMethod,
+    // Tax fields — preserved for journal generation (payroll, GST sale)
+    taxAmount:        normalized.taxAmount,
+    taxRate:          normalized.taxRate,
+    // Phase 3 Step 4 — Tax + Liability + Inventory
+    taxType:          normalized.taxType,
+    isTaxExclusive:   normalized.isTaxExclusive,
+    isTaxInclusive:   normalized.isTaxInclusive,
+    costAmount:       normalized.costAmount,
+    grossAmount:      normalized.grossAmount,
+    netAmount:        normalized.netAmount,
+    adjustmentType:   normalized.adjustmentType,
+    eobi:             normalized.eobi,
   };
 
   return {

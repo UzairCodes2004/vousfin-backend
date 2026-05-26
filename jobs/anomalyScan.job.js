@@ -1,9 +1,86 @@
 // jobs/anomalyScan.job.js
-const cron = require('node-cron');
+const cron    = require('node-cron');
+const os      = require('os');
+const mongoose = require('mongoose');
 const anomalyDetectionService = require('../services/anomalyDetection.service');
 const userRepository = require('../repositories/user.repository');
-const logger = require('../config/logger');
-const config = require('../config');
+const logger  = require('../config/logger');
+const config  = require('../config');
+
+// ─── Distributed cron lock ─────────────────────────────────────────────────────
+// Prevents duplicate scans when Render scales to 2+ instances.
+// A MongoDB document acts as a distributed mutex:
+//   - Each instance tries to acquire the lock before running.
+//   - The lock has a 7-hour TTL. If a scan hangs, the next instance can steal
+//     the lock after the TTL expires.
+//   - Release happens explicitly when the scan completes.
+//
+// ⚠ WARNING: The lock is stored in a collection defined inline here using a raw
+// mongoose model to avoid adding a new model file. In production, move this to
+// a proper SystemLock model file.
+const LOCK_COLLECTION = 'cronlocks';
+const LOCK_ID         = 'anomaly-scan-lock';
+const LOCK_TTL_MS     = 7 * 60 * 60 * 1000;  // 7 hours
+const INSTANCE_ID     = `${os.hostname()}-${process.pid}`;
+
+let CronLock;
+const getCronLockModel = () => {
+  if (CronLock) return CronLock;
+  const schema = new mongoose.Schema({
+    _id:          String,
+    lockedBy:     String,
+    lockedAt:     Date,
+    lockedUntil:  Date,
+  }, { collection: LOCK_COLLECTION, _id: false, versionKey: false });
+  CronLock = mongoose.models['CronLock'] || mongoose.model('CronLock', schema);
+  return CronLock;
+};
+
+/**
+ * Try to acquire the distributed anomaly-scan lock.
+ * Returns true if acquired, false if another instance holds it.
+ */
+const acquireLock = async () => {
+  const model = getCronLockModel();
+  const now   = new Date();
+  const until = new Date(Date.now() + LOCK_TTL_MS);
+  try {
+    // Attempt to update an expired/missing lock atomically
+    const result = await model.findOneAndUpdate(
+      {
+        _id: LOCK_ID,
+        $or: [
+          { lockedUntil: { $lt: now } },   // lock has expired
+          { _id: { $exists: false } },       // lock document not yet created
+        ],
+      },
+      {
+        $set: { lockedBy: INSTANCE_ID, lockedAt: now, lockedUntil: until },
+        $setOnInsert: { _id: LOCK_ID },
+      },
+      { upsert: true, new: true }
+    );
+    // If result is null, the $or filter didn't match — lock is held by another instance
+    return !!result;
+  } catch (err) {
+    // Upsert duplicate key = another instance just grabbed it
+    if (err.code === 11000) return false;
+    logger.warn(`Anomaly cron: lock acquisition error (${err.message}) — skipping to be safe`);
+    return false;
+  }
+};
+
+/**
+ * Release the lock if this instance holds it.
+ */
+const releaseLock = async () => {
+  const model = getCronLockModel();
+  try {
+    await model.deleteOne({ _id: LOCK_ID, lockedBy: INSTANCE_ID });
+  } catch (err) {
+    logger.warn(`Anomaly cron: failed to release lock — ${err.message}`);
+  }
+};
 
 /**
  * Run anomaly detection for a single business.
@@ -76,17 +153,30 @@ const scanAllActiveBusinesses = async () => {
  
 const scheduleAnomalyScan = () => {
   const cronSchedule = config.ANOMALY_SCAN_CRON || '0 */6 * * *';
-  
+
   cron.schedule(cronSchedule, async () => {
-    logger.info(`Running scheduled anomaly scan at ${new Date().toISOString()}`);
+    const now = new Date().toISOString();
+
+    // ── Distributed lock guard ──────────────────────────────────────────────
+    // Prevents duplicate scans when 2+ instances run this cron simultaneously.
+    const acquired = await acquireLock();
+    if (!acquired) {
+      logger.info(`Anomaly cron skipped at ${now} — lock held by another instance`);
+      return;
+    }
+
+    logger.info(`Anomaly cron lock acquired by ${INSTANCE_ID} at ${now}`);
     try {
       await scanAllActiveBusinesses();
     } catch (error) {
       logger.error(`Scheduled anomaly scan failed: ${error.message}`);
+    } finally {
+      await releaseLock();
+      logger.info(`Anomaly cron lock released by ${INSTANCE_ID}`);
     }
   });
-  
-  logger.info(`Anomaly scan job scheduled with cron: ${cronSchedule}`);
+
+  logger.info(`Anomaly scan job scheduled with cron: ${cronSchedule} (instance: ${INSTANCE_ID})`);
 };
 
 module.exports = {

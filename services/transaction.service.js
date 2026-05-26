@@ -5,8 +5,9 @@ const customerRepository = require('../repositories/customer.repository');
 const vendorRepository = require('../repositories/vendor.repository');
 const auditService = require('./audit.service');
 const { ApiError } = require('../utils/ApiError');
-const { ENTITY_TYPES, TRANSACTION_TYPES, INPUT_METHODS, JOURNAL_STATUS, PAYMENT_STATUS, TRANSACTION_MODES } = require('../config/constants');
+const { ENTITY_TYPES, TRANSACTION_TYPES, INPUT_METHODS, JOURNAL_STATUS, PAYMENT_STATUS, TRANSACTION_MODES, TRANSACTION_SOURCES } = require('../config/constants');
 const logger = require('../config/logger');
+const reportCache = require('../utils/reportCache');
 
 class TransactionService {
   /**
@@ -14,6 +15,17 @@ class TransactionService {
    * Supports standard entries, AR/AP (Credit Sales/Purchases), and multi-line journals.
    */
   async createTransaction(data, userId, ipAddress) {
+    // 0. Phase 4 — Multi-line journal: derive primary accounts from journalLines when
+    //    the caller supplies lines but omits explicit debitAccountId / creditAccountId.
+    //    This lets the NL confirm flow forward the full journal line set and still satisfy
+    //    the 1:1 schema fields required for backward-compatible reporting.
+    if (data.journalLines?.length > 0 && (!data.debitAccountId || !data.creditAccountId)) {
+      const firstDebit  = data.journalLines.find((l) => l.type === 'debit');
+      const firstCredit = data.journalLines.find((l) => l.type === 'credit');
+      if (!data.debitAccountId  && firstDebit)  data.debitAccountId  = firstDebit.accountId;
+      if (!data.creditAccountId && firstCredit) data.creditAccountId = firstCredit.accountId;
+    }
+
     // 1. Core Validation
     if (!data.businessId || !data.transactionDate || !data.amount || !data.debitAccountId || !data.creditAccountId) {
       throw new ApiError(400, 'Missing required transaction fields');
@@ -76,22 +88,46 @@ class TransactionService {
       lastModifiedBy: userId,
     };
 
-    // 6. Handle AR (Credit Sale) Workflow — customer optional
-    if (data.transactionType === TRANSACTION_TYPES.CREDIT_SALE) {
-      entryData.paymentStatus = PAYMENT_STATUS.UNPAID;
+    // ── GAAP compliance: Account-pair determines AR/AP treatment ────────────────
+    // Under GAAP, debiting Accounts Receivable with a Revenue credit IS a credit
+    // sale — the type label ("Inventory Sale", "Income", etc.) is irrelevant.
+    // Crediting Accounts Payable with an Expense/Asset debit IS a credit purchase.
+    // This prevents the common mistake of choosing the wrong preset but correct accounts.
+    const debitAccName  = debitAccount.accountName.toLowerCase();
+    const creditAccName = creditAccount.accountName.toLowerCase();
+
+    // AR detection: DR Accounts Receivable + CR Revenue account
+    const isARSaleByAccount = debitAccName.includes('accounts receivable') &&
+                              creditAccount.accountType === 'Revenue';
+
+    // AP detection: CR Accounts Payable + DR Expense or Asset account
+    // Exclude "Loan Payable", "Tax Payable", "Wages Payable", "GST Payable" etc.
+    const isAPPurchaseByAccount = creditAccName.includes('accounts payable') &&
+                                  (debitAccount.accountType === 'Expense' || debitAccount.accountType === 'Asset') &&
+                                  !debitAccName.includes('payable'); // guard: DR AP / CR AP is impossible but safe
+
+    // 6. Handle AR (Credit Sale) Workflow
+    // Triggers when: (a) explicit Credit Sale type, OR (b) account pair identifies it as AR
+    if (data.transactionType === TRANSACTION_TYPES.CREDIT_SALE || isARSaleByAccount) {
+      // Normalize type so the entire AR lifecycle (stats, aging, settlement) works
+      entryData.transactionType  = TRANSACTION_TYPES.CREDIT_SALE;
+      entryData.paymentStatus    = PAYMENT_STATUS.UNPAID;
       entryData.remainingBalance = data.amount;
-      entryData.transactionMode = TRANSACTION_MODES.CREDIT;
+      entryData.transactionMode  = TRANSACTION_MODES.CREDIT;
       if (data.customerId) {
         const customer = await customerRepository.findByBusinessAndId(data.businessId, data.customerId);
         if (customer) await customerRepository.updateReceivableBalance(data.customerId, data.amount);
       }
     }
 
-    // 7. Handle AP (Credit Purchase) Workflow — vendor optional
-    if (data.transactionType === TRANSACTION_TYPES.CREDIT_PURCHASE) {
-      entryData.paymentStatus = PAYMENT_STATUS.UNPAID;
+    // 7. Handle AP (Credit Purchase) Workflow
+    // Triggers when: (a) explicit Credit Purchase type, OR (b) account pair identifies it as AP
+    else if (data.transactionType === TRANSACTION_TYPES.CREDIT_PURCHASE || isAPPurchaseByAccount) {
+      // Normalize type so the entire AP lifecycle works
+      entryData.transactionType  = TRANSACTION_TYPES.CREDIT_PURCHASE;
+      entryData.paymentStatus    = PAYMENT_STATUS.UNPAID;
       entryData.remainingBalance = data.amount;
-      entryData.transactionMode = TRANSACTION_MODES.CREDIT;
+      entryData.transactionMode  = TRANSACTION_MODES.CREDIT;
       if (data.vendorId) {
         const vendor = await vendorRepository.findByBusinessAndId(data.businessId, data.vendorId);
         if (vendor) await vendorRepository.updatePayableBalance(data.vendorId, data.amount);
@@ -136,6 +172,9 @@ class TransactionService {
       ipAddress
     );
 
+    // Invalidate report cache so Balance Sheet, Income Statement, etc. reflect the new entry
+    reportCache.invalidate(data.businessId.toString());
+
     logger.info(`Transaction created: ${transaction._id} by user ${userId}`);
     return transaction;
   }
@@ -148,11 +187,22 @@ class TransactionService {
     const parent = await transactionRepository.findByIdWithDetails(parentTransactionId, businessId);
     if (!parent) throw new ApiError(404, 'Parent transaction not found');
     if (parent.status === JOURNAL_STATUS.REVERSED) throw new ApiError(400, 'Cannot pay a reversed transaction');
-    const hasOutstanding = typeof parent.hasOutstandingBalance === 'function'
-      ? parent.hasOutstandingBalance()
-      : (parent.remainingBalance !== null && parent.remainingBalance > 0);
-    if (!hasOutstanding) throw new ApiError(400, 'Transaction is already fully paid');
-    
+
+    // Distinguish three states clearly so the user gets a precise error:
+    //   remainingBalance === null  → this is a cash/non-AR/non-AP entry; payment doesn't apply
+    //   remainingBalance === 0     → balance has been fully paid
+    //   remainingBalance > 0       → outstanding balance exists, proceed
+    if (parent.remainingBalance === null || parent.remainingBalance === undefined) {
+      throw new ApiError(
+        400,
+        'This transaction does not track an outstanding balance (cash sales / cash expenses do not accept payments). ' +
+        'Only Credit Sales, Credit Purchases, and Installment plans accept partial payments.'
+      );
+    }
+    if (parent.remainingBalance === 0) {
+      throw new ApiError(400, 'Transaction is already fully paid');
+    }
+
     // 2. Validate Payment Amount
     if (paymentData.amount <= 0) throw new ApiError(400, 'Payment amount must be greater than zero');
     if (paymentData.amount > parent.remainingBalance) {
@@ -251,7 +301,20 @@ class TransactionService {
       // Credit entry: increases credit-normal accounts, decreases debit-normal accounts
       delta = account.normalBalance === 'Credit' ? amount : -amount;
     }
-    await accountRepository.updateRunningBalance(accountId, delta);
+
+    try {
+      await accountRepository.updateRunningBalance(accountId, delta);
+    } catch (balanceErr) {
+      // Balance update failed AFTER the journal entry was already saved.
+      // Log the drift so it can be reconciled — do NOT silently swallow.
+      logger.error(
+        `BALANCE_DRIFT_WARNING: Failed to update runningBalance for account ${accountId} ` +
+        `(delta=${delta}, side=${side}). The journal entry was saved but the balance is stale. ` +
+        `Error: ${balanceErr.message}`
+      );
+      // Re-throw so the caller (and any wrapping transaction) can act on this.
+      throw balanceErr;
+    }
   }
 
   /**
@@ -354,7 +417,162 @@ class TransactionService {
       ipAddress
     );
 
+    reportCache.invalidate(businessId.toString());
     return updated;
+  }
+
+  /**
+   * Reverse a posted transaction — GAAP-compliant dedicated reversal.
+   *
+   * Creates a counter-entry that negates the original, marks the original
+   * status: REVERSED, and stores a back-reference in metadata.reversalId.
+   * Supports both standard 1:1 entries and multi-line compound journals.
+   *
+   * This is the PREFERRED reversal path (separate from deleteTransaction).
+   * POST /transactions/:id/reverse
+   *
+   * @param {string} transactionId
+   * @param {string} businessId
+   * @param {object} options       - { reversalDate?, reason? }
+   * @param {string} userId
+   * @param {string} ipAddress
+   * @returns {Promise<Object>}    - The new reversal JournalEntry
+   */
+  async reverseTransaction(transactionId, businessId, { reversalDate, reason } = {}, userId, ipAddress) {
+    // 1. Load original with populated accounts
+    const original = await transactionRepository.findByIdWithDetails(transactionId, businessId);
+    if (!original) throw new ApiError(404, 'Transaction not found');
+
+    // 2. Guard clauses
+    if (original.status === JOURNAL_STATUS.REVERSED) {
+      throw new ApiError(400, 'This transaction has already been reversed');
+    }
+    if (original.partiallyPaidAmount > 0) {
+      throw new ApiError(400, 'Cannot reverse a transaction that has partial payments applied. Reverse the payments first.');
+    }
+
+    // 3. Build reversal entry data
+    const effectiveDate = reversalDate ? new Date(reversalDate) : new Date();
+    const reasonLabel   = reason ? `Reversal (${reason})` : 'Reversal';
+    const reversalDesc  = `${reasonLabel}: ${original.description}`;
+
+    const reversalData = {
+      businessId,
+      transactionDate:  effectiveDate,
+      description:      reversalDesc,
+      transactionType:  original.transactionType,
+      amount:           original.amount,
+      // Flip the primary 1:1 accounts (preserved for backward-compat reporting)
+      debitAccountId:   original.creditAccountId._id,
+      creditAccountId:  original.debitAccountId._id,
+      inputMethod:      original.inputMethod,
+      status:           JOURNAL_STATUS.POSTED,
+      reversalOf:       original._id,
+      transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+      createdBy:        userId,
+      lastModifiedBy:   userId,
+    };
+
+    // Flip multi-line journal lines if the original had compound entries
+    if (original.journalLines && original.journalLines.length > 0) {
+      reversalData.journalLines = original.journalLines.map((line) => ({
+        accountId:   line.accountId,
+        type:        line.type === 'debit' ? 'credit' : 'debit',
+        amount:      line.amount,
+        description: line.description || '',
+      }));
+    }
+
+    // 4. Persist reversal entry
+    const reversal = await transactionRepository.createTransaction(reversalData);
+
+    // 5. Update account balances
+    if (reversalData.journalLines?.length > 0) {
+      for (const line of reversalData.journalLines) {
+        await this._updateAccountBalance(line.accountId, line.amount, line.type);
+      }
+    } else {
+      await this._updateAccountBalance(reversal.debitAccountId,  original.amount, 'debit');
+      await this._updateAccountBalance(reversal.creditAccountId, original.amount, 'credit');
+    }
+
+    // 6. Roll back customer / vendor AR/AP balances
+    if (original.transactionType === TRANSACTION_TYPES.CREDIT_SALE && original.customerId) {
+      await customerRepository.updateReceivableBalance(original.customerId._id, -original.amount);
+    } else if (original.transactionType === TRANSACTION_TYPES.CREDIT_PURCHASE && original.vendorId) {
+      await vendorRepository.updatePayableBalance(original.vendorId._id, -original.amount);
+    }
+
+    // 7. Mark original REVERSED; store forward reference to the reversal
+    const updatedMeta = { ...(original.metadata || {}), reversalId: reversal._id.toString() };
+    await transactionRepository.updateTransaction(transactionId, businessId, {
+      status:         JOURNAL_STATUS.REVERSED,
+      paymentStatus:  null,
+      remainingBalance: 0,
+      metadata:       updatedMeta,
+    });
+
+    // 7b. Cascade: if this transaction has a linked installment plan, cancel it
+    if (original.installmentPlanId) {
+      try {
+        const InstallmentPlan = require('../models/InstallmentPlan.model');
+        const planId = original.installmentPlanId._id || original.installmentPlanId;
+        await InstallmentPlan.findOneAndUpdate(
+          { _id: planId, businessId },
+          { status: 'cancelled' }
+        );
+        logger.info(`Installment plan ${planId} cancelled (parent transaction reversed)`);
+      } catch (planErr) {
+        // Non-fatal — log and continue. Reversal is more important than cascade.
+        logger.warn(`Could not cancel linked installment plan: ${planErr.message}`);
+      }
+    }
+
+    // 8. Audit log
+    await auditService.logReversal(
+      ENTITY_TYPES.JOURNAL_ENTRY,
+      transactionId,
+      businessId,
+      userId,
+      original,
+      { reversalId: reversal._id, reason: reason || null },
+      ipAddress
+    );
+
+    reportCache.invalidate(businessId.toString());
+    logger.info(`Transaction ${transactionId} reversed → reversal ${reversal._id} by user ${userId}`);
+    return reversal;
+  }
+
+  /**
+   * Get full audit history for a specific transaction:
+   *  - The transaction document (with populated accounts)
+   *  - Any reversal entry that references this transaction
+   *  - Chronological audit log entries
+   *
+   * GET /transactions/:id/history
+   */
+  async getTransactionAuditHistory(transactionId, businessId) {
+    const JournalEntry = require('../models/JournalEntry.model');
+
+    const transaction = await transactionRepository.findByIdWithDetails(transactionId, businessId);
+    if (!transaction) throw new ApiError(404, 'Transaction not found');
+
+    // Find the reversal entry that points back to this transaction (if any)
+    const reversal = await JournalEntry
+      .findOne({ reversalOf: transactionId })
+      .populate('debitAccountId',  'accountName accountType')
+      .populate('creditAccountId', 'accountName accountType')
+      .lean();
+
+    // Get chronological audit trail
+    const auditResult = await auditService.getAuditTrail(ENTITY_TYPES.JOURNAL_ENTRY, transactionId);
+
+    return {
+      transaction,
+      reversal:   reversal || null,
+      auditTrail: auditResult?.data || [],
+    };
   }
 
   /**
@@ -408,6 +626,7 @@ class TransactionService {
       ipAddress
     );
 
+    reportCache.invalidate(businessId.toString());
     return reversal;
   }
 
@@ -496,6 +715,107 @@ class TransactionService {
    */
   async getSettlementHistory(parentTransactionId, businessId) {
     return transactionRepository.findByParentTransaction(parentTransactionId, businessId);
+  }
+
+  /**
+   * Repair orphaned AR/AP transactions — idempotent, GAAP-compliant data fix.
+   *
+   * Finds existing JournalEntries where the account pair indicates AR or AP
+   * (DR Accounts Receivable + CR Revenue, or CR Accounts Payable + DR Expense/Asset)
+   * but the AR/AP lifecycle fields (paymentStatus, remainingBalance) were never set
+   * — typically because the wrong preset type was selected at the time of entry.
+   *
+   * What it does:
+   *  1. Identifies the AR and AP account IDs for this business
+   *  2. Finds un-repaired AR entries (debitAccountId = AR, paymentStatus = null)
+   *  3. Sets paymentStatus = UNPAID, remainingBalance = amount, type = Credit Sale
+   *  4. Updates the Customer.currentReceivableBalance for linked customers
+   *  5. Repeats for AP entries
+   *
+   * Idempotency: only processes entries where paymentStatus is currently null,
+   * so running it multiple times is safe.
+   *
+   * @param {string} businessId
+   * @returns {Promise<{ arFixed: number, apFixed: number }>}
+   */
+  async repairOrphanedARAPTransactions(businessId) {
+    const JournalEntry = require('../models/JournalEntry.model');
+    const ChartOfAccount = require('../models/ChartOfAccount.model');
+    const mongoose = require('mongoose');
+
+    const validBusinessId = new mongoose.Types.ObjectId(String(businessId));
+
+    // 1. Find AR and AP accounts for this business
+    const arAccount = await ChartOfAccount.findOne({
+      businessId: validBusinessId,
+      accountName: { $regex: /accounts receivable/i },
+    }).lean();
+
+    const apAccount = await ChartOfAccount.findOne({
+      businessId: validBusinessId,
+      accountName: { $regex: /accounts payable/i },
+    }).lean();
+
+    let arFixed = 0, apFixed = 0;
+
+    // 2. Repair orphaned AR entries
+    if (arAccount) {
+      const orphanedAR = await JournalEntry.find({
+        businessId: validBusinessId,
+        debitAccountId: arAccount._id,
+        paymentStatus: null,
+        status: { $in: [JOURNAL_STATUS.POSTED] },
+        isArchived: { $ne: true },
+      }).lean();
+
+      for (const tx of orphanedAR) {
+        await transactionRepository.updateTransaction(tx._id, businessId, {
+          transactionType:  TRANSACTION_TYPES.CREDIT_SALE,
+          paymentStatus:    PAYMENT_STATUS.UNPAID,
+          remainingBalance: tx.amount,
+          transactionMode:  TRANSACTION_MODES.CREDIT,
+        });
+
+        // Update customer running balance if linked
+        if (tx.customerId) {
+          try {
+            await customerRepository.updateReceivableBalance(tx.customerId, tx.amount);
+          } catch (_) { /* customer may have been deleted */ }
+        }
+        arFixed++;
+      }
+    }
+
+    // 3. Repair orphaned AP entries
+    if (apAccount) {
+      const orphanedAP = await JournalEntry.find({
+        businessId: validBusinessId,
+        creditAccountId: apAccount._id,
+        paymentStatus: null,
+        status: { $in: [JOURNAL_STATUS.POSTED] },
+        isArchived: { $ne: true },
+      }).lean();
+
+      for (const tx of orphanedAP) {
+        await transactionRepository.updateTransaction(tx._id, businessId, {
+          transactionType:  TRANSACTION_TYPES.CREDIT_PURCHASE,
+          paymentStatus:    PAYMENT_STATUS.UNPAID,
+          remainingBalance: tx.amount,
+          transactionMode:  TRANSACTION_MODES.CREDIT,
+        });
+
+        if (tx.vendorId) {
+          try {
+            await vendorRepository.updatePayableBalance(tx.vendorId, tx.amount);
+          } catch (_) { /* vendor may have been deleted */ }
+        }
+        apFixed++;
+      }
+    }
+
+    logger.info(`AR/AP repair: fixed ${arFixed} AR + ${apFixed} AP entries for business ${businessId}`);
+    reportCache.invalidate(String(businessId));
+    return { arFixed, apFixed };
   }
 
   /**

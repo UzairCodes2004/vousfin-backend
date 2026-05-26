@@ -4,6 +4,7 @@ const accountRepository = require('../repositories/account.repository');
 const { ApiError } = require('../utils/ApiError');
 const { ACCOUNT_TYPES } = require('../config/constants');
 const logger = require('../config/logger');
+const reportCache = require('../utils/reportCache');
 
 class ReportService {
   /**
@@ -13,6 +14,14 @@ class ReportService {
     if (!businessId || !startDate || !endDate) {
       throw new ApiError(400, 'Missing required parameters: businessId, startDate, endDate');
     }
+
+    // ── Cache layer ────────────────────────────────────────────────────────────
+    const _isParams = {
+      start: new Date(startDate).toISOString(),
+      end:   new Date(endDate).toISOString(),
+    };
+    const _isCached = reportCache.get('income-statement', businessId.toString(), _isParams);
+    if (_isCached) return _isCached;
 
     const { revenue, expenses } = await transactionRepository.getIncomeStatementData(businessId, startDate, endDate);
 
@@ -33,7 +42,7 @@ class ReportService {
     const grossProfit = totalRevenue - totalCogs;
     const netIncome = grossProfit - totalOpex;
 
-    return {
+    const _isResult = {
       revenue: { accounts: revenueAccounts, total: totalRevenue },
       cogs: { accounts: cogsAccounts, total: totalCogs },
       operatingExpenses: { accounts: opexAccounts, total: totalOpex },
@@ -46,6 +55,8 @@ class ReportService {
       operatingProfit: netIncome,
       period: { startDate, endDate },
     };
+    reportCache.set('income-statement', businessId.toString(), _isParams, _isResult);
+    return _isResult;
   }
 
   /**
@@ -55,6 +66,11 @@ class ReportService {
     if (!businessId || !asOfDate) {
       throw new ApiError(400, 'Missing required parameters: businessId, asOfDate');
     }
+
+    // ── Cache layer ────────────────────────────────────────────────────────────
+    const _bsParams = { asOf: new Date(asOfDate).toISOString() };
+    const _bsCached = reportCache.get('balance-sheet', businessId.toString(), _bsParams);
+    if (_bsCached) return _bsCached;
 
     const accounts = await accountRepository.getGroupedByType(businessId);
     const balanceMap = await this._getBalancesAsOf(businessId, asOfDate);
@@ -77,7 +93,7 @@ class ReportService {
     const totalEquity = equityAccounts.reduce((sum, e) => sum + e.balance, 0);
     const equationValid = Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01;
 
-    return {
+    const _bsResult = {
       assets: { accounts: assetAccounts, total: totalAssets },
       liabilities: { accounts: liabilityAccounts, total: totalLiabilities },
       equity: { accounts: equityAccounts, total: totalEquity },
@@ -87,6 +103,8 @@ class ReportService {
       equationValid,
       asOfDate,
     };
+    reportCache.set('balance-sheet', businessId.toString(), _bsParams, _bsResult);
+    return _bsResult;
   }
 
   /**
@@ -97,9 +115,19 @@ class ReportService {
       throw new ApiError(400, 'Missing required parameters');
     }
 
+    // ── Cache layer ────────────────────────────────────────────────────────────
+    const _cfParams = {
+      start: new Date(startDate).toISOString(),
+      end:   new Date(endDate).toISOString(),
+    };
+    const _cfCached = reportCache.get('cash-flow', businessId.toString(), _cfParams);
+    if (_cfCached) return _cfCached;
+
     const accounts = await accountRepository.findByBusiness(businessId);
-    const cashAccount = accounts.find(acc => acc.accountName.toLowerCase() === 'cash' || acc.accountName.toLowerCase() === 'bank');
-    
+    const cashAccount = accounts.find(
+      acc => acc.accountName.toLowerCase() === 'cash' || acc.accountName.toLowerCase() === 'bank'
+    );
+
     if (!cashAccount) {
       throw new ApiError(500, 'Cash or Bank account not found. Please ensure chart of accounts includes Cash/Bank.');
     }
@@ -107,7 +135,9 @@ class ReportService {
     const cashTransactions = await transactionRepository.getByAccount(businessId, cashAccount._id, startDate, endDate);
     let cashInflow = 0, cashOutflow = 0;
     for (const tx of cashTransactions) {
-      const isDebitCash = tx.debitAccountId._id.toString() === cashAccount._id.toString();
+      // getByAccount returns .lean() docs — debitAccountId is a plain ObjectId, NOT a populated sub-doc.
+      // Use .toString() directly, not ._id.toString(), to avoid TypeError on an ObjectId reference.
+      const isDebitCash = tx.debitAccountId.toString() === cashAccount._id.toString();
       if (isDebitCash) {
         cashInflow += tx.amount;
       } else {
@@ -120,18 +150,19 @@ class ReportService {
     const financing = [];
     const netCashFlow = netOperatingCashFlow;
 
-    // Map to {description, amount} shape expected by frontend
     const operatingItems = [{ description: 'Net Cash from Operations', amount: netOperatingCashFlow }];
     const investingItems = investing.map(i => ({ description: i.name || i.description, amount: i.amount }));
     const financingItems = financing.map(i => ({ description: i.name || i.description, amount: i.amount }));
 
-    return {
+    const _cfResult = {
       operating: { items: operatingItems, total: netOperatingCashFlow },
       investing: { items: investingItems, total: investingItems.reduce((s, i) => s + i.amount, 0) },
       financing: { items: financingItems, total: financingItems.reduce((s, i) => s + i.amount, 0) },
       netCashFlow,
       period: { startDate, endDate },
     };
+    reportCache.set('cash-flow', businessId.toString(), _cfParams, _cfResult);
+    return _cfResult;
   }
 
   /**
@@ -212,24 +243,53 @@ class ReportService {
   }
 
   /**
-   * Helper: Get account balances as of a specific date by summing all posted transactions up to that date.
+   * Helper: Compute account balances as of a specific date.
+   *
+   * ── OPTIMISATION ─────────────────────────────────────────────────────────────
+   * BEFORE: getByDateRange(epoch, asOfDate)
+   *   → loads EVERY transaction document with full populate into Node.js memory
+   *   → O(n) JS loop over potentially thousands of populated objects
+   *   → 2 serial DB round-trips (range query + populate)
+   *
+   * AFTER: getDebitCreditTotals() + accountRepository.findByBusiness() in PARALLEL
+   *   → single $facet aggregation: MongoDB groups all debits/credits per account ID
+   *   → returns only the group sums (one tiny object, not thousands of documents)
+   *   → O(accounts) JS arithmetic, all heavy math done in MongoDB
+   *   → 2 PARALLEL DB round-trips → total latency ≈ max(aggregation, accounts find)
+   *
    * @private
    */
   async _getBalancesAsOf(businessId, asOfDate) {
-    const allTransactions = await transactionRepository.getByDateRange(businessId, new Date(0), asOfDate);
+    const [{ debitTotals, creditTotals }, accounts] = await Promise.all([
+      transactionRepository.getDebitCreditTotals(businessId, asOfDate),
+      accountRepository.findByBusiness(businessId),
+    ]);
+
+    // Build a normalBalance lookup: accountId (string) → 'Debit' | 'Credit'
+    const normalBalanceMap = new Map(
+      accounts.map(acc => [acc._id.toString(), acc.normalBalance])
+    );
+
     const balanceMap = new Map();
 
-    for (const tx of allTransactions) {
-      const debitId = tx.debitAccountId._id.toString();
-      const creditId = tx.creditAccountId._id.toString();
-      const debitAccount = tx.debitAccountId;
-      const creditAccount = tx.creditAccountId;
+    // Apply debit-side totals
+    // Debiting a Debit-normal account increases its balance (+)
+    // Debiting a Credit-normal account decreases its balance (-)
+    for (const { _id, total } of debitTotals) {
+      const id    = _id.toString();
+      const nb    = normalBalanceMap.get(id) || 'Debit';
+      const delta = nb === 'Debit' ? total : -total;
+      balanceMap.set(id, (balanceMap.get(id) || 0) + delta);
+    }
 
-      const debitDelta = debitAccount.normalBalance === 'Debit' ? tx.amount : -tx.amount;
-      balanceMap.set(debitId, (balanceMap.get(debitId) || 0) + debitDelta);
-
-      const creditDelta = creditAccount.normalBalance === 'Credit' ? tx.amount : -tx.amount;
-      balanceMap.set(creditId, (balanceMap.get(creditId) || 0) + creditDelta);
+    // Apply credit-side totals
+    // Crediting a Credit-normal account increases its balance (+)
+    // Crediting a Debit-normal account decreases its balance (-)
+    for (const { _id, total } of creditTotals) {
+      const id    = _id.toString();
+      const nb    = normalBalanceMap.get(id) || 'Credit';
+      const delta = nb === 'Credit' ? total : -total;
+      balanceMap.set(id, (balanceMap.get(id) || 0) + delta);
     }
 
     return Object.fromEntries(balanceMap);
@@ -242,6 +302,11 @@ class ReportService {
     if (!businessId || !asOfDate) {
       throw new ApiError(400, 'Missing required parameters: businessId, asOfDate');
     }
+
+    // ── Cache layer ────────────────────────────────────────────────────────────
+    const _tbParams = { asOf: new Date(asOfDate).toISOString() };
+    const _tbCached = reportCache.get('trial-balance', businessId.toString(), _tbParams);
+    if (_tbCached) return _tbCached;
 
     const accounts = await accountRepository.findByBusiness(businessId);
     const balanceMap = await this._getBalancesAsOf(businessId, asOfDate);
@@ -274,13 +339,15 @@ class ReportService {
 
     const isBalanced = Math.abs(totalDebits - totalCredits) < 0.01;
 
-    return {
+    const _tbResult = {
       rows,
       totalDebits,
       totalCredits,
       isBalanced,
       asOfDate,
     };
+    reportCache.set('trial-balance', businessId.toString(), _tbParams, _tbResult);
+    return _tbResult;
   }
 
   /**
@@ -295,21 +362,39 @@ class ReportService {
    * Get KPI summary for dashboard.
    */
   async getKPISummary(businessId, startDate, endDate) {
-    const incomeStatement = await this.getIncomeStatement(businessId, startDate, endDate);
+    // ── Cache layer ────────────────────────────────────────────────────────────
+    const _kpiParams = {
+      start: new Date(startDate).toISOString(),
+      end:   new Date(endDate).toISOString(),
+    };
+    const _kpiCached = reportCache.get('kpi-summary', businessId.toString(), _kpiParams);
+    if (_kpiCached) return _kpiCached;
+
+    // ── Parallel fetch ─────────────────────────────────────────────────────────
+    // incomeStatement is already cached after its first computation this window.
+    // _getBalancesAsOf fires its own parallel internals (aggregation + account find).
+    // The outer accountRepository.findByBusiness is a fast indexed scan and is needed
+    // here to look up cash/AR/AP accounts by name.
+    const [incomeStatement, balances, accounts] = await Promise.all([
+      this.getIncomeStatement(businessId, startDate, endDate),
+      this._getBalancesAsOf(businessId, endDate),
+      accountRepository.findByBusiness(businessId),
+    ]);
+
     const { totalRevenue, totalExpenses, netProfit } = incomeStatement;
     const profitMargin = totalRevenue > 0 ? (netProfit / totalRevenue) * 100 : 0;
 
-    const balances = await this._getBalancesAsOf(businessId, endDate);
-    const accounts = await accountRepository.findByBusiness(businessId);
-    const cashAccount = accounts.find(acc => acc.accountName.toLowerCase() === 'cash' || acc.accountName.toLowerCase() === 'bank');
-    const cashBalance = cashAccount ? (balances[cashAccount._id.toString()] || 0) : 0;
-
+    const cashAccount = accounts.find(
+      acc => acc.accountName.toLowerCase() === 'cash' || acc.accountName.toLowerCase() === 'bank'
+    );
     const arAccount = accounts.find(acc => acc.accountName.toLowerCase() === 'accounts receivable');
     const apAccount = accounts.find(acc => acc.accountName.toLowerCase() === 'accounts payable');
-    const accountsReceivable = arAccount ? (balances[arAccount._id.toString()] || 0) : 0;
-    const accountsPayable = apAccount ? (balances[apAccount._id.toString()] || 0) : 0;
 
-    return {
+    const cashBalance        = cashAccount ? (balances[cashAccount._id.toString()] || 0) : 0;
+    const accountsReceivable = arAccount   ? (balances[arAccount._id.toString()]   || 0) : 0;
+    const accountsPayable    = apAccount   ? (balances[apAccount._id.toString()]   || 0) : 0;
+
+    const _kpiResult = {
       revenue: totalRevenue,
       expenses: totalExpenses,
       netProfit,
@@ -319,6 +404,8 @@ class ReportService {
       accountsPayable,
       period: { startDate, endDate },
     };
+    reportCache.set('kpi-summary', businessId.toString(), _kpiParams, _kpiResult);
+    return _kpiResult;
   }
 }
 

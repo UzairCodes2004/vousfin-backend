@@ -117,7 +117,7 @@ const recordPaymentSchema = Joi.object({
 });
 
 /**
- * Schema for creating an installment plan
+ * Schema for creating an installment plan (structured form — POST /installment)
  */
 const createInstallmentSchema = Joi.object({
   // Transaction part
@@ -126,24 +126,45 @@ const createInstallmentSchema = Joi.object({
   amount: Joi.number().positive().precision(2).required(),
   debitAccountId: Joi.string().pattern(objectIdPattern).required(),
   creditAccountId: Joi.string().pattern(objectIdPattern).required(),
-  
+
   customerId: Joi.string().pattern(objectIdPattern).allow(null).optional(),
   vendorId: Joi.string().pattern(objectIdPattern).allow(null).optional(),
-  
+
   // Plan part
   downPayment: Joi.number().min(0).precision(2).default(0),
   installmentCount: Joi.number().integer().min(1).max(120).required(),
   installmentFrequency: Joi.string().valid('weekly', 'biweekly', 'monthly', 'quarterly').required(),
+
+  // Interest / financing (Phase 3)
+  interestRate: Joi.number().min(0).max(100).optional(),
 });
 
 /**
- * Legacy NL schemas
+ * NL parse schema
  */
 const naturalLanguageSchema = Joi.object({
   text: Joi.string().min(5).max(500).required().trim(),
 });
 
-const confirmNaturalLanguageSchema = createTransactionSchema; // Re-use the full schema for validation
+/**
+ * NL confirm schema — extends the base transaction schema with installment / financing
+ * fields that the NL preview step may forward back (Phase 3).
+ *
+ * Previously this was an alias for createTransactionSchema which caused Joi to reject
+ * isInstallment / installmentCount / downPayment / installmentFrequency /
+ * installmentPeriodMonths / interestRate as unknown keys → "Validation failed" toast.
+ */
+const confirmNaturalLanguageSchema = createTransactionSchema.keys({
+  // Installment routing (Phase 3)
+  isInstallment:           Joi.boolean().optional(),
+  installmentCount:        Joi.number().integer().min(1).max(120).optional(),
+  installmentFrequency:    Joi.string().valid('weekly', 'biweekly', 'monthly', 'quarterly').optional(),
+  downPayment:             Joi.number().min(0).precision(2).optional(),
+  installmentPeriodMonths: Joi.number().integer().min(1).max(120).optional(),
+
+  // Interest / financing (Phase 3)
+  interestRate:            Joi.number().min(0).max(100).optional(),
+});
 
 /**
  * Legacy Excel schemas
@@ -182,7 +203,7 @@ const transactionFiltersSchema = Joi.object({
   hasOutstandingBalance: Joi.boolean().optional(),
   search: Joi.string().max(100).optional().allow(''),
   page: Joi.number().integer().min(1).default(1),
-  limit: Joi.number().integer().min(1).max(100).default(25),
+  limit: Joi.number().integer().min(1).max(500).default(50),
   sortBy: Joi.string().valid('transactionDate', 'amount', 'createdAt', 'updatedAt', 'dueDate').default('transactionDate'),
   sortOrder: Joi.number().valid(1, -1).default(-1),
 }).custom((value, helpers) => {
@@ -199,6 +220,15 @@ const transactionIdParamSchema = Joi.object({
   id: Joi.string().pattern(objectIdPattern).required(),
 });
 
+/**
+ * Schema for reversing a posted transaction.
+ * POST /transactions/:id/reverse
+ */
+const reverseTransactionSchema = Joi.object({
+  reversalDate: Joi.date().iso().allow(null).optional(),
+  reason:       Joi.string().max(500).allow('', null).trim().optional(),
+});
+
 module.exports = {
   createTransactionSchema,
   updateTransactionSchema,
@@ -210,4 +240,5 @@ module.exports = {
   confirmExcelImportSchema,
   transactionFiltersSchema,
   transactionIdParamSchema,
+  reverseTransactionSchema,
 };
