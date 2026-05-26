@@ -584,6 +584,145 @@ async function getCurrentPeriod(businessId) {
   }).lean();
 }
 
+/* ════════════════════════════════════════════════════════════════════════════
+   OPENING BALANCES — carry forward balance sheet accounts to next fiscal year
+════════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Create opening balance journal entries for a new fiscal year.
+ * Takes the ending balance of every Asset, Liability, and Equity account
+ * from the PREVIOUS fiscal year and posts an opening_balance entry at the
+ * start of the new fiscal year.
+ *
+ * This records the opening position so the new year's books start correctly.
+ */
+async function createOpeningBalances(businessId, fiscalYearId, userId) {
+  const bizId = new mongoose.Types.ObjectId(String(businessId));
+  const fy    = await getFiscalYear(businessId, fiscalYearId);
+
+  if (fy.openingBalanceEntryId) {
+    throw new ApiError(409, `Opening balances for "${fy.name}" have already been created.`);
+  }
+
+  // Find the previous fiscal year (ends just before this one starts)
+  const prevFY = await FiscalYear.findOne({
+    businessId: bizId,
+    endDate: { $lt: fy.startDate },
+  }).sort({ endDate: -1 }).lean();
+
+  // Get all Balance Sheet accounts for this business
+  const bsAccounts = await ChartOfAccount.find({
+    businessId: bizId,
+    accountType: { $in: ['Asset', 'Liability', 'Equity'] },
+  }).lean();
+
+  if (bsAccounts.length === 0) {
+    throw new ApiError(400, 'No Balance Sheet accounts found. Set up Chart of Accounts first.');
+  }
+
+  // Compute ending balances as of the day before this FY starts
+  const asOf = new Date(fy.startDate);
+  asOf.setDate(asOf.getDate() - 1);
+
+  const [debitTotals, creditTotals] = await Promise.all([
+    JournalEntry.aggregate([
+      {
+        $match: {
+          businessId: bizId,
+          transactionDate: { $lte: asOf },
+          status: { $in: [JOURNAL_STATUS.POSTED, JOURNAL_STATUS.SETTLED, JOURNAL_STATUS.PARTIALLY_SETTLED] },
+          isArchived: { $ne: true },
+        },
+      },
+      { $group: { _id: '$debitAccountId', total: { $sum: '$amount' } } },
+    ]),
+    JournalEntry.aggregate([
+      {
+        $match: {
+          businessId: bizId,
+          transactionDate: { $lte: asOf },
+          status: { $in: [JOURNAL_STATUS.POSTED, JOURNAL_STATUS.SETTLED, JOURNAL_STATUS.PARTIALLY_SETTLED] },
+          isArchived: { $ne: true },
+        },
+      },
+      { $group: { _id: '$creditAccountId', total: { $sum: '$amount' } } },
+    ]),
+  ]);
+
+  const debitMap  = new Map(debitTotals.map(r => [r._id.toString(), r.total]));
+  const creditMap = new Map(creditTotals.map(r => [r._id.toString(), r.total]));
+
+  // Find a "Retained Earnings" equity account for the balancing entry
+  const retainedEarningsAcct = await ChartOfAccount.findOne({
+    businessId: bizId,
+    $or: [
+      { accountName: { $regex: /retained earnings/i } },
+      { accountName: { $regex: /retained profit/i } },
+    ],
+  }).lean();
+
+  const createdEntryIds = [];
+
+  // Create one opening balance journal entry per BS account with a non-zero balance
+  for (const acc of bsAccounts) {
+    const accId = acc._id.toString();
+    const debits  = debitMap.get(accId)  || 0;
+    const credits = creditMap.get(accId) || 0;
+
+    // Normal balance determines the "balance" direction
+    let balance;
+    if (acc.normalBalance === 'Debit') {
+      balance = debits - credits; // positive = debit balance
+    } else {
+      balance = credits - debits; // positive = credit balance
+    }
+
+    if (Math.abs(balance) < 0.01) continue; // skip zero balances
+
+    // For a debit-normal account with a debit balance: DR account / CR Retained Earnings
+    // For a credit-normal account with a credit balance: DR Retained Earnings / CR account
+    let debitAccountId, creditAccountId;
+    const contraAcct = retainedEarningsAcct || acc; // fallback: self (shouldn't happen)
+
+    if (acc.normalBalance === 'Debit') {
+      debitAccountId  = acc._id;
+      creditAccountId = contraAcct._id;
+    } else {
+      debitAccountId  = contraAcct._id;
+      creditAccountId = acc._id;
+    }
+
+    const entry = await JournalEntry.create({
+      businessId:      bizId,
+      transactionDate: new Date(fy.startDate),
+      description:     `Opening balance — ${acc.accountName} (${fy.name})`,
+      transactionType: TRANSACTION_TYPES.JOURNAL_ENTRY,
+      amount:          Math.abs(balance),
+      debitAccountId,
+      creditAccountId,
+      status:          JOURNAL_STATUS.POSTED,
+      entryType:       ENTRY_TYPE.OPENING_BALANCE,
+      transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+      lastModifiedBy:  new mongoose.Types.ObjectId(String(userId)),
+      tags:            ['opening-balance', `fy-${fy.name}`, acc.accountType.toLowerCase()],
+    });
+
+    createdEntryIds.push(entry._id);
+  }
+
+  // Record the opening balance entry IDs on the fiscal year
+  if (createdEntryIds.length > 0) {
+    await FiscalYear.updateOne(
+      { _id: fy._id },
+      { $set: { openingBalanceEntryId: createdEntryIds[0] } }
+    );
+  }
+
+  reportCache.invalidate(String(businessId));
+  logger.info(`Opening balances created for ${fy.name}: ${createdEntryIds.length} entries`);
+  return { fiscalYearId, entriesCreated: createdEntryIds.length, entryIds: createdEntryIds };
+}
+
 module.exports = {
   createFiscalYear,
   listFiscalYears,
@@ -595,6 +734,7 @@ module.exports = {
   closeFiscalYear,
   lockFiscalYear,
   postAdjustingEntry,
+  createOpeningBalances,
   enforcePeriodLock,
   getCurrentPeriod,
 };
