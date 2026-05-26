@@ -1,66 +1,69 @@
 // controllers/fiscalYear.controller.js — Phase 5.1 Accounting Period Engine
 'use strict';
 
-const fiscalYearService = require('../services/fiscalYear.service');
-const ApiResponse       = require('../utils/ApiResponse');
-const { ApiError }      = require('../utils/ApiError');
+const svc          = require('../services/fiscalYear.service');
+const ApiResponse  = require('../utils/ApiResponse');
+const { ApiError } = require('../utils/ApiError');
+
+const _uid = (req) => req.user._id || req.user.id;
+const _bid = (req) => req.user.businessId;
 
 /* ── Fiscal Years ─────────────────────────────────────────────────────────── */
 
 const createFiscalYear = async (req, res, next) => {
   try {
     const { name, startDate, endDate } = req.body;
-    if (!name || !startDate || !endDate) {
-      throw new ApiError(400, 'name, startDate and endDate are required');
-    }
-    const fy = await fiscalYearService.createFiscalYear(
-      req.user.businessId, { name, startDate, endDate }, req.user._id || req.user.id
-    );
-    ApiResponse.success(res, fy, 'Fiscal year created', 201);
+    if (!name || !startDate || !endDate) throw new ApiError(400, 'name, startDate, endDate required');
+    const fy = await svc.createFiscalYear(_bid(req), { name, startDate, endDate }, _uid(req));
+    ApiResponse.success(res, fy, 'Fiscal year created with 12 monthly periods', 201);
   } catch (err) { next(err); }
 };
 
 const listFiscalYears = async (req, res, next) => {
   try {
-    const years = await fiscalYearService.listFiscalYears(req.user.businessId);
+    const years = await svc.listFiscalYears(_bid(req));
     ApiResponse.success(res, years, 'Fiscal years retrieved');
   } catch (err) { next(err); }
 };
 
-const getFiscalYear = async (req, res, next) => {
+const getCurrentPeriod = async (req, res, next) => {
   try {
-    const fy = await fiscalYearService.getFiscalYear(req.user.businessId, req.params.id);
-    ApiResponse.success(res, fy, 'Fiscal year retrieved');
+    const period = await svc.getCurrentPeriod(_bid(req));
+    ApiResponse.success(res, period ?? null, 'Current accounting period');
   } catch (err) { next(err); }
 };
 
-const closeFiscalYear = async (req, res, next) => {
+/** POST /:fiscalYearId/close — run closing entries */
+const runClosingEntries = async (req, res, next) => {
   try {
     const { reason = '' } = req.body || {};
-    const result = await fiscalYearService.closeFiscalYear(
-      req.user.businessId, req.params.id, req.user._id || req.user.id, { reason }
-    );
+    const result = await svc.closeFiscalYear(_bid(req), req.params.fiscalYearId, _uid(req), { reason });
     ApiResponse.success(res, result, 'Fiscal year closed and closing entries generated');
   } catch (err) { next(err); }
 };
 
+/** POST /:fiscalYearId/opening-balances — carry forward BS balances */
+const createOpeningBalances = async (req, res, next) => {
+  try {
+    const result = await svc.createOpeningBalances(_bid(req), req.params.fiscalYearId, _uid(req));
+    ApiResponse.success(res, result, `Opening balances created (${result.entriesCreated} entries)`, 201);
+  } catch (err) { next(err); }
+};
+
+/** POST /:fiscalYearId/lock */
 const lockFiscalYear = async (req, res, next) => {
   try {
     const { reason = '' } = req.body || {};
-    const result = await fiscalYearService.lockFiscalYear(
-      req.user.businessId, req.params.id, req.user._id || req.user.id, { reason }
-    );
+    const result = await svc.lockFiscalYear(_bid(req), req.params.fiscalYearId, _uid(req), { reason });
     ApiResponse.success(res, result, 'Fiscal year permanently locked');
   } catch (err) { next(err); }
 };
 
 /* ── Accounting Periods ───────────────────────────────────────────────────── */
 
-const getPeriodsForYear = async (req, res, next) => {
+const listPeriods = async (req, res, next) => {
   try {
-    const periods = await fiscalYearService.getPeriodsForYear(
-      req.user.businessId, req.params.id
-    );
+    const periods = await svc.getPeriodsForYear(_bid(req), req.params.fiscalYearId);
     ApiResponse.success(res, periods, 'Accounting periods retrieved');
   } catch (err) { next(err); }
 };
@@ -68,19 +71,15 @@ const getPeriodsForYear = async (req, res, next) => {
 const closePeriod = async (req, res, next) => {
   try {
     const { reason = '' } = req.body || {};
-    const result = await fiscalYearService.closePeriod(
-      req.user.businessId, req.params.periodId, req.user._id || req.user.id, { reason }
-    );
-    ApiResponse.success(res, result, `Period closed`);
+    const result = await svc.closePeriod(_bid(req), req.params.periodId, _uid(req), { reason });
+    ApiResponse.success(res, result, 'Period closed');
   } catch (err) { next(err); }
 };
 
 const lockPeriod = async (req, res, next) => {
   try {
     const { reason = '' } = req.body || {};
-    const result = await fiscalYearService.lockPeriod(
-      req.user.businessId, req.params.periodId, req.user._id || req.user.id, { reason }
-    );
+    const result = await svc.lockPeriod(_bid(req), req.params.periodId, _uid(req), { reason });
     ApiResponse.success(res, result, 'Period locked');
   } catch (err) { next(err); }
 };
@@ -88,45 +87,38 @@ const lockPeriod = async (req, res, next) => {
 const reopenPeriod = async (req, res, next) => {
   try {
     const { reason = '' } = req.body || {};
-    const result = await fiscalYearService.reopenPeriod(
-      req.user.businessId, req.params.periodId, req.user._id || req.user.id, { reason, isAdminOverride: true }
-    );
+    const result = await svc.reopenPeriod(_bid(req), req.params.periodId, _uid(req), { reason, isAdminOverride: true });
     ApiResponse.success(res, result, 'Period reopened');
   } catch (err) { next(err); }
 };
 
 /* ── Adjusting Entries ────────────────────────────────────────────────────── */
 
-const postAdjustingEntry = async (req, res, next) => {
+const createAdjustingEntry = async (req, res, next) => {
   try {
-    const {
-      adjustingType, periodId, description,
-      amount, debitAccountId, creditAccountId, memo,
-    } = req.body;
+    const { adjustingType, periodId, description, amount, debitAccountId, creditAccountId, memo } = req.body;
     if (!adjustingType || !periodId || !amount || !debitAccountId || !creditAccountId) {
       throw new ApiError(400, 'adjustingType, periodId, amount, debitAccountId, creditAccountId required');
     }
-    const entry = await fiscalYearService.postAdjustingEntry(
-      req.user.businessId,
+    const entry = await svc.postAdjustingEntry(
+      _bid(req),
       { adjustingType, periodId, description, amount, debitAccountId, creditAccountId, memo },
-      req.user._id || req.user.id
+      _uid(req)
     );
     ApiResponse.success(res, entry, 'Adjusting entry posted', 201);
   } catch (err) { next(err); }
 };
 
-/* ── Current Period (for UI banner) ──────────────────────────────────────── */
-
-const getCurrentPeriod = async (req, res, next) => {
-  try {
-    const period = await fiscalYearService.getCurrentPeriod(req.user.businessId);
-    ApiResponse.success(res, period || null, 'Current period retrieved');
-  } catch (err) { next(err); }
-};
-
 module.exports = {
-  createFiscalYear, listFiscalYears, getFiscalYear,
-  closeFiscalYear, lockFiscalYear,
-  getPeriodsForYear, closePeriod, lockPeriod, reopenPeriod,
-  postAdjustingEntry, getCurrentPeriod,
+  createFiscalYear,
+  listFiscalYears,
+  getCurrentPeriod,
+  runClosingEntries,
+  createOpeningBalances,
+  lockFiscalYear,
+  listPeriods,
+  closePeriod,
+  lockPeriod,
+  reopenPeriod,
+  createAdjustingEntry,
 };

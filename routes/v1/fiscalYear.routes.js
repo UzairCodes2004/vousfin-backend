@@ -13,6 +13,7 @@ router.use(authMiddleware, requireBusiness);
 
 /* ── Fiscal Years ─────────────────────────────────────────────────────────── */
 router.get( '/',                             ctrl.listFiscalYears);
+router.get( '/current-period',               ctrl.getCurrentPeriod);
 router.post('/',                             ctrl.createFiscalYear);
 router.post('/:fiscalYearId/close',          ctrl.runClosingEntries);
 router.post('/:fiscalYearId/opening-balances', ctrl.createOpeningBalances);
