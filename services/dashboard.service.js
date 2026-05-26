@@ -46,14 +46,29 @@ class DashboardService {
     // Group by interval
     const grouped = this._groupTransactionsByInterval(transactions, interval);
     
-    // Format for chart: each entry has period label, revenue, expenses
+    // Revenue types: all transaction types that represent business income
+    const REVENUE_TYPES = new Set([
+      TRANSACTION_TYPES.INCOME,
+      TRANSACTION_TYPES.CASH_SALE,
+      TRANSACTION_TYPES.CREDIT_SALE,
+      TRANSACTION_TYPES.INVENTORY_SALE,
+    ]);
+    // Expense types: all transaction types that represent business costs
+    const EXPENSE_TYPES = new Set([
+      TRANSACTION_TYPES.EXPENSE,
+      TRANSACTION_TYPES.CASH_PURCHASE,
+      TRANSACTION_TYPES.CREDIT_PURCHASE,
+      TRANSACTION_TYPES.INVENTORY_PURCHASE,
+      TRANSACTION_TYPES.SALARY,
+    ]);
+
     const chartData = [];
     for (const [periodKey, group] of grouped) {
       let revenue = 0, expenses = 0;
       for (const tx of group) {
-        if (tx.transactionType === TRANSACTION_TYPES.INCOME) {
+        if (REVENUE_TYPES.has(tx.transactionType)) {
           revenue += tx.amount;
-        } else if (tx.transactionType === TRANSACTION_TYPES.EXPENSE) {
+        } else if (EXPENSE_TYPES.has(tx.transactionType)) {
           expenses += tx.amount;
         }
       }

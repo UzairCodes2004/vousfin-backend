@@ -4,7 +4,6 @@ const aiPlaceholderService = require('../services/aiPlaceholder.service');
 const anomalyDetectionService = require('../services/anomalyDetection.service');
 const accountantSuggestionsService = require('../services/accountantSuggestions.service');
 const parserService = require('../services/nlParser/services/parserService');
-const forecastingService = require('../services/forecasting/forecastingService');
 const { generateLSTMForecast } = require('../services/forecasting/lstmForecastService');
 const { METRIC_API_TO_TARGET, formatForecastApiResponse } = require('../utils/forecastResponse.helper');
 const ApiResponse = require('../utils/ApiResponse');
@@ -69,14 +68,8 @@ const forecast = async (req, res, next) => {
     }
     const target = METRIC_API_TO_TARGET[metric] || 'Revenue';
 
-    // Prefer LSTM live forecast using business's actual accounting data
-    let forecastResult;
-    try {
-      forecastResult = await generateLSTMForecast(req.user.businessId, target, horizon);
-    } catch {
-      // Fall back to static model output if live data fetch fails
-      forecastResult = forecastingService.generateForecast(target, horizon);
-    }
+    // LSTM forecast uses only this business's own accounting data — no static fallback
+    const forecastResult = await generateLSTMForecast(req.user.businessId, target, horizon);
 
     const payload = formatForecastApiResponse(metric, horizon, forecastResult);
     ApiResponse.success(res, payload, 'Forecast generated');

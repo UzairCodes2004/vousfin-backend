@@ -635,7 +635,7 @@ async function fetchMonthlyData(businessId, monthsBack = 24) {
 
   return rows.map(r => {
     const revenue  = r.revenue  || 0;
-    const expenses = r.expenses || (revenue * EXPENSE_RATIO);
+    const expenses = r.expenses || 0;
     const taxable  = Math.max(0, revenue - expenses);
     const profit   = taxable * (1 - TAX_RATE);
     return {
