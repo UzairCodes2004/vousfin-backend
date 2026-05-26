@@ -226,24 +226,43 @@ class ReportService {
       }
     }));
 
-    const operatingItems = [];
-    const investingItems = [];
-    const financingItems = [];
+    const TYPE_LABELS = {
+      SALE:              'Collections from Customers',
+      PURCHASE:          'Payments to Suppliers',
+      EXPENSE:           'Operating Expenses Paid',
+      SALARY:            'Salaries & Wages Paid',
+      INCOME_TAX:        'Income Tax Paid',
+      VAT:               'VAT / GST Paid',
+      ASSET_PURCHASE:    'Purchase of Fixed Assets',
+      DEPRECIATION:      'Depreciation Adjustment',
+      LOAN_DISBURSEMENT: 'Proceeds from Loans',
+      LOAN_REPAYMENT:    'Repayment of Loans',
+      OWNER_INVESTMENT:  'Owner Capital Contribution',
+      OWNER_WITHDRAWAL:  'Owner Withdrawals',
+    };
+
+    const operatingBuckets = {};
+    const investingBuckets = {};
+    const financingBuckets = {};
 
     for (const { tx, cashAccId } of allCashTxns) {
       const isDebitCash = tx.debitAccountId.toString() === cashAccId;
       const cashEffect  = isDebitCash ? tx.amount : -tx.amount;
-      const item = {
-        description:     tx.description || tx.transactionType || 'Transaction',
-        amount:          cashEffect,
-        transactionType: tx.transactionType,
-        date:            tx.transactionDate,
-        reference:       tx.transactionReference || tx.invoiceNumber || '',
-      };
-      if (INVESTING_TYPES.has(tx.transactionType))  investingItems.push(item);
-      else if (FINANCING_TYPES.has(tx.transactionType)) financingItems.push(item);
-      else operatingItems.push(item);
+      const key         = tx.transactionType || 'Other';
+      const label       = TYPE_LABELS[key] || (key.charAt(0) + key.slice(1).toLowerCase().replace(/_/g, ' '));
+
+      let buckets;
+      if (INVESTING_TYPES.has(tx.transactionType))       buckets = investingBuckets;
+      else if (FINANCING_TYPES.has(tx.transactionType))  buckets = financingBuckets;
+      else                                                buckets = operatingBuckets;
+
+      if (!buckets[key]) buckets[key] = { description: label, amount: 0, transactionType: key };
+      buckets[key].amount += cashEffect;
     }
+
+    const operatingItems = Object.values(operatingBuckets).filter(i => i.amount !== 0);
+    const investingItems = Object.values(investingBuckets).filter(i => i.amount !== 0);
+    const financingItems = Object.values(financingBuckets).filter(i => i.amount !== 0);
 
     const sumItems = arr => arr.reduce((s, i) => s + i.amount, 0);
     const netOperating = sumItems(operatingItems);

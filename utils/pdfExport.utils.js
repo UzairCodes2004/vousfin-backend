@@ -105,12 +105,17 @@ function totalLine(doc, label, amount, currency, highlight = true) {
 }
 
 function pageFooter(doc) {
-  const y = doc.page.height - 30;
-  doc.rect(0, y - 5, PAGE_W, 35).fill(COLORS.headerBg);
+  // Footer must stay inside PDFKit's safe zone: 0 to (page.height - bottom margin).
+  // Placing text beyond that triggers an automatic new page — which is what caused
+  // the blank-page explosion when finalise() iterated over buffered pages.
+  const safeBottom = doc.page.height - MARGIN; // 841.89 - 40 = 801.89
+  const footerH = 20;
+  const y = safeBottom - footerH; // ~781
+  doc.rect(0, y, PAGE_W, footerH).fill(COLORS.headerBg);
   doc.fillColor('#a0aec0').fontSize(7).font('Helvetica')
      .text(
        'This is a system-generated report. For accounting purposes only.',
-       MARGIN, y + 2, { width: CONTENT_W, align: 'center' }
+       MARGIN, y + 7, { width: CONTENT_W, align: 'center', lineBreak: false }
      );
 }
 
