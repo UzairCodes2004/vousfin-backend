@@ -596,9 +596,9 @@ function buildRiskIndicators(target, predicted, historical, anomalyRisk, momentu
 /* ════════════════════════════════════════════════════════════════════════════
    DATA LAYER — monthly aggregates from MongoDB
 ════════════════════════════════════════════════════════════════════════════ */
-const EXPENSE_RATIO = 0.62;
-const TAX_RATE      = 0.15;
-const MONTH_NAMES   = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+// Pakistan default corporate tax rate — used only to estimate net profit for forecast display
+const TAX_RATE    = 0.15;
+const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
 async function fetchMonthlyData(businessId, monthsBack = 24) {
   const validId = mongoose.Types.ObjectId.isValid(businessId)
@@ -626,7 +626,8 @@ async function fetchMonthlyData(businessId, monthsBack = 24) {
       $group: {
         _id: { year: { $year: '$transactionDate' }, month: { $month: '$transactionDate' } },
         revenue:  { $sum: { $cond: [{ $in: ['$creditAcc.accountType', ['Revenue', 'Income']] }, '$amount', 0] } },
-        expenses: { $sum: { $cond: [{ $in: ['$debitAcc.accountType',  ['Expense', 'Cost']]  }, '$amount', 0] } },
+        // 'Direct Cost' captures COGS accounts; 'Cost' is a legacy fallback label
+        expenses: { $sum: { $cond: [{ $in: ['$debitAcc.accountType',  ['Expense', 'Direct Cost', 'Cost']] }, '$amount', 0] } },
         entries:  { $sum: 1 },
       },
     },
@@ -636,8 +637,10 @@ async function fetchMonthlyData(businessId, monthsBack = 24) {
   return rows.map(r => {
     const revenue  = r.revenue  || 0;
     const expenses = r.expenses || 0;
-    const taxable  = Math.max(0, revenue - expenses);
-    const profit   = taxable * (1 - TAX_RATE);
+    const grossProfit = Math.max(0, revenue - expenses);
+    const profit      = grossProfit * (1 - TAX_RATE);
+    // Operating cash flow approximation: revenue inflows minus expense outflows
+    const cashFlow    = revenue - expenses;
     return {
       year:     r._id.year,
       month:    r._id.month,
@@ -645,7 +648,7 @@ async function fetchMonthlyData(businessId, monthsBack = 24) {
       revenue,
       expenses,
       profit,
-      cashFlow: profit * 0.85,
+      cashFlow,
       entries:  r.entries || 0,
     };
   });
