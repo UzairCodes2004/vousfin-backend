@@ -82,12 +82,50 @@ class TransactionService {
       data.vendorId = vendor._id;
     }
 
+    // 4.5 Accounting Period Lock Check (Phase 5.1)
+    // Skip for closing/opening_balance/adjusting entries (they bypass period locks)
+    const skipPeriodCheck = [
+      'closing', 'opening_balance', 'adjusting',
+    ].includes(data.entryType);
+
+    let resolvedPeriodId   = data.periodId   || null;
+    let resolvedFiscalYearId = data.fiscalYearId || null;
+
+    if (!skipPeriodCheck) {
+      const AccountingPeriod = require('../models/AccountingPeriod.model');
+      const period = await AccountingPeriod.findCoveringPeriod(
+        data.businessId,
+        data.transactionDate
+      );
+      if (period) {
+        resolvedPeriodId = period._id;
+        // Find fiscal year from the period
+        if (!resolvedFiscalYearId) resolvedFiscalYearId = period.fiscalYearId;
+
+        if (period.status === 'locked') {
+          // Only allow admin override
+          if (!data.adminOverride) {
+            throw new ApiError(423, `Accounting period "${period.name}" is locked. Contact an administrator to override.`);
+          }
+          logger.warn(`Admin override used to post into locked period ${period.name} by user ${userId}`);
+        } else if (period.status === 'closed') {
+          if (!data.adminOverride) {
+            throw new ApiError(423, `Accounting period "${period.name}" is closed. Reopen the period or use an admin override.`);
+          }
+          logger.warn(`Admin override used to post into closed period ${period.name} by user ${userId}`);
+        }
+      }
+    }
+
     // 5. Setup v2 entry data
     const entryData = {
       ...data,
       status: JOURNAL_STATUS.POSTED,
       createdBy: userId,
       lastModifiedBy: userId,
+      periodId: resolvedPeriodId,
+      fiscalYearId: resolvedFiscalYearId,
+      entryType: data.entryType || 'normal',
     };
 
     // ── GAAP compliance: Account-pair determines AR/AP treatment ────────────────
@@ -420,6 +458,15 @@ class TransactionService {
     if (original.status === JOURNAL_STATUS.REVERSED) throw new ApiError(400, 'Cannot edit a reversed transaction');
     if (original.partiallyPaidAmount > 0) throw new ApiError(400, 'Cannot edit a transaction that has payments applied against it');
 
+    // Period Lock Check — check the ORIGINAL transaction's date period
+    if (!updateData.adminOverride && original.entryType === 'normal') {
+      const AccountingPeriod = require('../models/AccountingPeriod.model');
+      const period = await AccountingPeriod.findCoveringPeriod(businessId, original.transactionDate);
+      if (period && (period.status === 'locked' || period.status === 'closed')) {
+        throw new ApiError(423, `Accounting period "${period.name}" is ${period.status}. Cannot edit transactions in a ${period.status} period.`);
+      }
+    }
+
     delete updateData.businessId;
 
     const amountChanged = updateData.amount && updateData.amount !== original.amount;
@@ -507,6 +554,15 @@ class TransactionService {
     }
     if (original.partiallyPaidAmount > 0) {
       throw new ApiError(400, 'Cannot reverse a transaction that has partial payments applied. Reverse the payments first.');
+    }
+
+    // Period Lock Check for original transaction's period
+    if (original.entryType === 'normal') {
+      const AccountingPeriod = require('../models/AccountingPeriod.model');
+      const period = await AccountingPeriod.findCoveringPeriod(businessId, original.transactionDate);
+      if (period && period.status === 'locked') {
+        throw new ApiError(423, `Accounting period "${period.name}" is locked. Cannot reverse transactions in a locked period.`);
+      }
     }
 
     // 3. Build reversal entry data
