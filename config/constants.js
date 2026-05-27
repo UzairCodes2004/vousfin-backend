@@ -342,6 +342,16 @@ module.exports = {
     PERIOD_LOCKED: 'Period Locked',
     PERIOD_REOPENED: 'Period Reopened',
     YEAR_CLOSED:   'Fiscal Year Closed',
+    // ── Phase 1: Invoice / Bill workflow actions ──────────────────────────────
+    SUBMITTED:     'Submitted for Approval',
+    APPROVED:      'Approved',
+    REJECTED:      'Rejected',
+    SENT:          'Sent',
+    CANCELLED:     'Cancelled',
+    DISPUTED:      'Disputed',
+    WRITTEN_OFF:   'Written Off',
+    STATE_CHANGED: 'State Changed',
+    SCHEDULED:     'Scheduled',
   },
 
   ENTITY_TYPES: {
@@ -355,7 +365,105 @@ module.exports = {
     INSTALLMENT_PLAN:  'installmentPlan',
     FISCAL_YEAR:       'fiscalYear',
     ACCOUNTING_PERIOD: 'accountingPeriod',
+    // ── Phase 1: First-class Invoice / Bill domain entities ───────────────────
+    INVOICE:           'invoice',
+    BILL:              'bill',
   },
+
+  // ===============================
+  // Phase 1 — Invoice State Machine
+  // (first-class AR document built on top of JournalEntry ledger)
+  // Lifecycle: draft → pending_approval → approved → sent → partially_paid → paid
+  //                 ↘ cancelled / disputed / written_off (terminal)
+  //                 ↘ overdue (auto-set when dueDate passed & not paid)
+  // ===============================
+  INVOICE_STATES: {
+    DRAFT:             'draft',
+    PENDING_APPROVAL:  'pending_approval',
+    APPROVED:          'approved',
+    SENT:              'sent',
+    PARTIALLY_PAID:    'partially_paid',
+    PAID:              'paid',
+    OVERDUE:           'overdue',
+    CANCELLED:         'cancelled',
+    DISPUTED:          'disputed',
+    WRITTEN_OFF:       'written_off',
+  },
+
+  /**
+   * Allowed forward state transitions for Invoice.
+   * Each key is the CURRENT state; the value is an array of states the
+   * invoice may legally move to next.  Used by service-layer guards.
+   */
+  INVOICE_TRANSITIONS: {
+    draft:             ['pending_approval', 'approved', 'cancelled'],
+    pending_approval:  ['approved', 'rejected', 'draft', 'cancelled'],
+    approved:          ['sent', 'partially_paid', 'paid', 'cancelled', 'disputed', 'overdue'],
+    sent:              ['partially_paid', 'paid', 'overdue', 'disputed', 'cancelled'],
+    partially_paid:    ['paid', 'overdue', 'disputed', 'written_off'],
+    paid:              [], // terminal
+    overdue:           ['partially_paid', 'paid', 'disputed', 'written_off', 'cancelled'],
+    cancelled:         [], // terminal
+    disputed:          ['approved', 'sent', 'partially_paid', 'paid', 'written_off', 'cancelled'],
+    written_off:       [], // terminal
+    rejected:          ['draft', 'cancelled'],
+  },
+
+  // ===============================
+  // Phase 1 — Bill State Machine
+  // Lifecycle: draft → awaiting_approval → approved → scheduled → partially_paid → paid
+  //                 ↘ cancelled (terminal)
+  //                 ↘ overdue (auto-set when dueDate passed & not paid)
+  // ===============================
+  BILL_STATES: {
+    DRAFT:               'draft',
+    AWAITING_APPROVAL:   'awaiting_approval',
+    APPROVED:            'approved',
+    SCHEDULED:           'scheduled',
+    PARTIALLY_PAID:      'partially_paid',
+    PAID:                'paid',
+    OVERDUE:             'overdue',
+    CANCELLED:           'cancelled',
+  },
+
+  BILL_TRANSITIONS: {
+    draft:               ['awaiting_approval', 'approved', 'cancelled'],
+    awaiting_approval:   ['approved', 'rejected', 'draft', 'cancelled'],
+    approved:            ['scheduled', 'partially_paid', 'paid', 'cancelled', 'overdue'],
+    scheduled:           ['partially_paid', 'paid', 'overdue', 'cancelled'],
+    partially_paid:      ['paid', 'overdue', 'cancelled'],
+    paid:                [], // terminal
+    overdue:             ['partially_paid', 'paid', 'cancelled'],
+    cancelled:           [], // terminal
+    rejected:            ['draft', 'cancelled'],
+  },
+
+  /**
+   * Approval workflow constants — shared by Invoice and Bill.
+   * approvalThreshold drives whether a document requires approval based on amount.
+   * approverRoles defines who is permitted to approve.
+   */
+  APPROVAL_STATUS: {
+    NOT_REQUIRED: 'not_required',
+    PENDING:      'pending',
+    APPROVED:     'approved',
+    REJECTED:     'rejected',
+  },
+
+  APPROVER_ROLES: {
+    OWNER:      'owner',          // business owner — can approve any amount
+    ACCOUNTANT: 'accountant',     // accountant role — standard approval
+    MANAGER:    'manager',        // manager — mid-tier approval
+    ADMIN:      'admin',          // platform admin — override approval
+  },
+
+  /**
+   * Default approval threshold (base currency).
+   * Documents above this amount default to requiring approval.
+   * Per-business overrides live on Business.approvalConfig (future phase).
+   */
+  DEFAULT_APPROVAL_THRESHOLD: 50000,
+
 
   // ===============================
   // Anomaly Alert Constants

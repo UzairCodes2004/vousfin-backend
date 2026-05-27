@@ -493,8 +493,54 @@ class TransactionService {
     // Invalidate report cache so Balance Sheet, Income Statement, etc. reflect the new entry
     reportCache.invalidate(data.businessId.toString());
 
+    // ── Phase 1 dual-write: mirror Credit Sale / Inventory Sale → Invoice ────
+    //                         mirror Credit Purchase / Inventory Purchase → Bill
+    // Non-fatal: any failure is logged but the ledger entry is preserved.
+    try {
+      await this._mirrorInvoiceOrBill(transaction, userId, ipAddress);
+    } catch (mirrorErr) {
+      logger.warn(`[invoice/bill] dual-write mirror failed (non-fatal): ${mirrorErr.message}`);
+    }
+
     logger.info(`Transaction created: ${transaction._id} by user ${userId}`);
     return transaction;
+  }
+
+  /**
+   * Phase 1 — Dual-write helper.  Given a newly-created JournalEntry, mirror it
+   * into the Invoice or Bill domain collection so the new AR/AP workflow has a
+   * first-class document to track.  Backward-compatible: existing API callers
+   * see no behavioural change beyond an extra row in invoices/bills.
+   *
+   * Lazy-required to avoid a require-time circular import
+   *   (transaction.service → invoice.service → ... → transaction.service).
+   */
+  async _mirrorInvoiceOrBill(je, userId, ipAddress) {
+    if (!je || !je.invoiceNumber) return;
+    const SALE_TYPES = [
+      TRANSACTION_TYPES.CREDIT_SALE,
+      TRANSACTION_TYPES.INVENTORY_SALE,
+    ];
+    const PURCHASE_TYPES = [
+      TRANSACTION_TYPES.CREDIT_PURCHASE,
+      TRANSACTION_TYPES.INVENTORY_PURCHASE,
+    ];
+    const isSale     = SALE_TYPES.includes(je.transactionType);
+    const isPurchase = PURCHASE_TYPES.includes(je.transactionType);
+    if (!isSale && !isPurchase) return;
+
+    // Build a minimal "user" record for audit attribution.  We don't load the
+    // full User document on every transaction to keep latency low — only id +
+    // displayName are needed by audit/state-change paths.
+    const userStub = { _id: userId, fullName: 'System', email: null };
+
+    if (isSale) {
+      const invoiceService = require('./invoice.service');
+      await invoiceService.syncFromJournalEntry(je, userStub, ipAddress);
+    } else if (isPurchase) {
+      const billService = require('./bill.service');
+      await billService.syncFromJournalEntry(je, userStub, ipAddress);
+    }
   }
 
   /**
