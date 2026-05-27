@@ -39,6 +39,14 @@ const businessSchema = new mongoose.Schema(
       uppercase: true,
       trim: true,
     },
+    // Reporting currency may differ from functional currency (e.g. USD functional, PKR reporting).
+    // Null means "same as currency" — resolved at query time, never stored redundantly.
+    reportingCurrency: {
+      type: String,
+      default: null,
+      uppercase: true,
+      trim: true,
+    },
     fiscalYearStartMonth: {
       type: Number,
       required: true,
@@ -141,12 +149,9 @@ businessSchema.statics.findAllPaginated = async function (options = {}) {
 // Pre-save Middleware
 // ===============================
 businessSchema.pre('save', function () {
-  if (this.currency) {
-    this.currency = this.currency.toUpperCase();
-  }
-  if (this.businessName) {
-    this.businessName = this.businessName.trim();
-  }
+  if (this.currency) this.currency = this.currency.toUpperCase();
+  if (this.reportingCurrency) this.reportingCurrency = this.reportingCurrency.toUpperCase();
+  if (this.businessName) this.businessName = this.businessName.trim();
 });
 
 // ===============================

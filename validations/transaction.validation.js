@@ -50,6 +50,10 @@ const createTransactionSchema = Joi.object({
   tags: Joi.array().items(Joi.string().trim()).optional(),
   attachmentUrls: Joi.array().items(Joi.string()).optional(),
 
+  // Multi-Currency (Phase 5.3)
+  currencyCode:  Joi.string().length(3).uppercase().allow(null, '').optional(),
+  exchangeRate:  Joi.number().positive().optional(),
+
   // Compound Entry Support (Optional)
   journalLines: Joi.array().items(journalLineSchema).optional(),
 }).custom((value, helpers) => {

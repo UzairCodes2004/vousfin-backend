@@ -10,6 +10,7 @@ const { ApiError } = require('../utils/ApiError');
 const { ENTITY_TYPES, TRANSACTION_TYPES, INPUT_METHODS, JOURNAL_STATUS, PAYMENT_STATUS, TRANSACTION_MODES, TRANSACTION_SOURCES } = require('../config/constants');
 const logger = require('../config/logger');
 const reportCache = require('../utils/reportCache');
+const fxService = require('./fx.service');
 // Phase 5.1: Period lock model (inline require to avoid circular deps)
 
 class TransactionService {
@@ -45,6 +46,29 @@ class TransactionService {
     const creditAccount = await accountRepository.findOneByBusinessAndId(data.businessId, data.creditAccountId);
     if (!debitAccount || !creditAccount) {
       throw new ApiError(400, 'Invalid account(s) for this business');
+    }
+
+    // 2b. FX fields — populate currencyCode / exchangeRate / baseCurrencyAmount when a
+    //     foreign currency is specified. Falls back gracefully if no rate exists.
+    let baseAmount = data.amount; // amount in base currency (PKR) used for balance updates
+    if (data.currencyCode) {
+      try {
+        const fxFields = await fxService.prepareFxFields(
+          data.amount,
+          data.currencyCode,
+          data.businessId,
+          data.transactionDate
+        );
+        data.currencyCode       = fxFields.currencyCode;
+        data.exchangeRate       = fxFields.exchangeRate;
+        data.baseCurrencyAmount = fxFields.baseCurrencyAmount;
+        // When transaction is in foreign currency, base-amount drives ledger balances
+        if (fxFields.exchangeRate !== 1) {
+          baseAmount = fxFields.baseCurrencyAmount;
+        }
+      } catch (fxErr) {
+        logger.warn(`[FX] prepareFxFields failed for transaction — continuing with raw amount. ${fxErr.message}`);
+      }
     }
 
     // 3. Auto-infer transactionType when not supplied by frontend
@@ -153,11 +177,11 @@ class TransactionService {
       // Normalize type so the entire AR lifecycle (stats, aging, settlement) works
       entryData.transactionType  = TRANSACTION_TYPES.CREDIT_SALE;
       entryData.paymentStatus    = PAYMENT_STATUS.UNPAID;
-      entryData.remainingBalance = data.amount;
+      entryData.remainingBalance = baseAmount; // base-currency amount for correct payment matching
       entryData.transactionMode  = TRANSACTION_MODES.CREDIT;
       if (data.customerId) {
         const customer = await customerRepository.findByBusinessAndId(data.businessId, data.customerId);
-        if (customer) await customerRepository.updateReceivableBalance(data.customerId, data.amount);
+        if (customer) await customerRepository.updateReceivableBalance(data.customerId, baseAmount);
       }
     }
 
@@ -167,11 +191,11 @@ class TransactionService {
       // Normalize type so the entire AP lifecycle works
       entryData.transactionType  = TRANSACTION_TYPES.CREDIT_PURCHASE;
       entryData.paymentStatus    = PAYMENT_STATUS.UNPAID;
-      entryData.remainingBalance = data.amount;
+      entryData.remainingBalance = baseAmount; // base-currency amount for correct payment matching
       entryData.transactionMode  = TRANSACTION_MODES.CREDIT;
       if (data.vendorId) {
         const vendor = await vendorRepository.findByBusinessAndId(data.businessId, data.vendorId);
-        if (vendor) await vendorRepository.updatePayableBalance(data.vendorId, data.amount);
+        if (vendor) await vendorRepository.updatePayableBalance(data.vendorId, baseAmount);
       }
     }
 
@@ -249,14 +273,15 @@ class TransactionService {
 
     // 9. Update running account balances
     if (data.journalLines && data.journalLines.length > 0) {
-      // Multi-line mode: update each line
+      // Multi-line mode: update each line (journal line amounts are always in base currency)
       for (const line of data.journalLines) {
         await this._updateAccountBalance(line.accountId, line.amount, line.type);
       }
     } else {
-      // Standard 1:1 mode
-      await this._updateAccountBalance(data.debitAccountId, data.amount, 'debit');
-      await this._updateAccountBalance(data.creditAccountId, data.amount, 'credit');
+      // Standard 1:1 mode — use baseAmount so foreign-currency transactions post the
+      // correct PKR equivalent to the ledger (not the raw foreign-currency figure)
+      await this._updateAccountBalance(data.debitAccountId,  baseAmount, 'debit');
+      await this._updateAccountBalance(data.creditAccountId, baseAmount, 'credit');
     }
 
     // 10. Audit log

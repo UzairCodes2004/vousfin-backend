@@ -139,8 +139,9 @@ module.exports = {
     { accountCode: '6170', accountName: 'Freight',                     accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
     { accountCode: '6180', accountName: 'Wages and Salaries',          accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
     { accountCode: '6190', accountName: 'Superannuation',              accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
-    { accountCode: '6200', accountName: 'Realised Currency Gains',     accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
-    { accountCode: '6210', accountName: 'Unrealised Currency Gains',   accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
+    { accountCode: '4140', accountName: 'FX Gain on Exchange',          accountType: 'Revenue',   accountSubtype: 'Revenue',                normalBalance: 'Credit', isDefault: true },
+    { accountCode: '6200', accountName: 'FX Loss on Exchange',         accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
+    { accountCode: '6210', accountName: 'Unrealised FX Gain/Loss',     accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
     { accountCode: '6220', accountName: 'Bank Currency Revaluations',  accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
     { accountCode: '6230', accountName: 'Depreciation Expense',        accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
     { accountCode: '6240', accountName: 'Interest Expense',            accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
@@ -202,6 +203,11 @@ module.exports = {
     CLOSING_ENTRY:        'Closing Entry',      // year-end close revenue/expense to retained earnings
     OPENING_BALANCE:      'Opening Balance',    // carry-forward balance at start of new fiscal year
     ADJUSTING_ENTRY:      'Adjusting Entry',    // accrual, deferral, or year-end adjustment
+
+    // ── Multi-Currency Engine (Phase 5.3 — IAS 21) ───────────────────────────
+    FX_GAIN:              'FX Gain',            // realised foreign-currency gain
+    FX_LOSS:              'FX Loss',            // realised foreign-currency loss
+    FX_REVALUATION:       'FX Revaluation',     // month-end unrealised revaluation
   },
 
   // Transaction mode abstraction (reduces type explosion)
