@@ -1145,6 +1145,43 @@ class TransactionService {
     await accountRepository.updateRunningBalance(accountId, balance - (await accountRepository.findById(accountId)).runningBalance);
     return balance;
   }
+
+  /**
+   * Refresh overdue status for AR entries — marks unpaid/partial entries as OVERDUE
+   * when dueDate has passed. Safe to run repeatedly (idempotent).
+   *
+   * @param {string} businessId
+   * @returns {Promise<{ updated: number, scanned: number }>}
+   */
+  async refreshOverdueAR(businessId) {
+    const JournalEntry = require('../models/JournalEntry.model');
+    const mongoose = require('mongoose');
+    const validId = new mongoose.Types.ObjectId(String(businessId));
+    const now = new Date();
+
+    // Find all unpaid/partial AR entries that have a dueDate in the past
+    const overdueEntries = await JournalEntry.find({
+      businessId: validId,
+      paymentStatus: { $in: [PAYMENT_STATUS.UNPAID, PAYMENT_STATUS.PARTIALLY_PAID] },
+      dueDate: { $lt: now, $ne: null },
+      remainingBalance: { $gt: 0 },
+      isArchived: { $ne: true },
+    }).select('_id').lean();
+
+    if (overdueEntries.length === 0) {
+      return { scanned: 0, updated: 0 };
+    }
+
+    const ids = overdueEntries.map(e => e._id);
+    const result = await JournalEntry.updateMany(
+      { _id: { $in: ids } },
+      { $set: { paymentStatus: PAYMENT_STATUS.OVERDUE } }
+    );
+
+    logger.info(`AR overdue refresh: ${result.modifiedCount} entries marked overdue for business ${businessId}`);
+    reportCache.invalidate(String(businessId));
+    return { scanned: overdueEntries.length, updated: result.modifiedCount };
+  }
 }
 
 module.exports = new TransactionService();

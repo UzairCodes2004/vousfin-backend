@@ -95,3 +95,21 @@ exports.getCustomerStats = async (req, res, next) => {
     next(error);
   }
 };
+
+/**
+ * GET /api/v1/customers/:id/statement
+ * Returns a full chronological customer statement with running balance.
+ * Query params: startDate, endDate (ISO date strings, optional)
+ */
+exports.getCustomerStatement = async (req, res, next) => {
+  try {
+    const opts = {
+      startDate: req.query.startDate || null,
+      endDate:   req.query.endDate   || null,
+    };
+    const statement = await customerService.getCustomerStatement(req.params.id, req.user.businessId, opts);
+    ApiResponse.success(res, statement, 'Customer statement generated');
+  } catch (error) {
+    next(error);
+  }
+};

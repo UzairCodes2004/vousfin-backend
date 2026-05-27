@@ -55,4 +55,10 @@ router.get(
   customerController.getCustomerStats
 );
 
+router.get(
+  '/:id/statement',
+  validate(customerIdParamSchema, 'params'),
+  customerController.getCustomerStatement
+);
+
 module.exports = router;

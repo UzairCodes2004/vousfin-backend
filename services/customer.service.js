@@ -270,6 +270,96 @@ class CustomerService {
     logger.info(`Customer ${customerId} active status changed to ${newStatus}`);
     return updated;
   }
+
+  /**
+   * Generate a customer statement — full chronological ledger with running balance.
+   *
+   * Returns:
+   *   - customer: profile info
+   *   - openingBalance: 0 (or from start of period)
+   *   - lines: [ { date, description, invoiceNumber, type, debit, credit, balance, paymentStatus } ]
+   *   - closingBalance: outstanding AR at end of period
+   *   - summary: { totalInvoiced, totalPaid, outstanding, overdueAmount }
+   *
+   * @param {string} customerId
+   * @param {string} businessId
+   * @param {Object} opts - { startDate?, endDate? }
+   * @returns {Promise<Object>}
+   */
+  async getCustomerStatement(customerId, businessId, opts = {}) {
+    const customer = await customerRepository.findByBusinessAndId(businessId, customerId);
+    if (!customer) throw new ApiError(404, 'Customer not found');
+
+    const { startDate, endDate } = opts;
+    const filter = { limit: 500, sortBy: 'transactionDate', sortOrder: 'asc' };
+    if (startDate) filter.startDate = startDate;
+    if (endDate)   filter.endDate   = endDate;
+
+    const txResult = await transactionRepository.findByCustomer(businessId, customerId, filter, { limit: 500, sortBy: 'transactionDate', sortOrder: 1 });
+    const entries  = Array.isArray(txResult?.data) ? txResult.data
+                   : Array.isArray(txResult)       ? txResult : [];
+
+    let runningBalance = 0;
+    const now = Date.now();
+
+    const lines = entries.map((tx) => {
+      const isSale    = [TRANSACTION_TYPES.CREDIT_SALE, TRANSACTION_TYPES.INVENTORY_SALE, TRANSACTION_TYPES.CASH_SALE, TRANSACTION_TYPES.INCOME].includes(tx.transactionType);
+      const isPayment = tx.transactionType === TRANSACTION_TYPES.PAYMENT_RECEIVED;
+      const debit  = isSale    ? tx.amount : 0;
+      const credit = isPayment ? tx.amount : 0;
+      runningBalance += debit - credit;
+
+      // Compute days overdue for this line
+      const dueRef = tx.dueDate || tx.transactionDate;
+      const daysOverdue = dueRef ? Math.max(0, Math.floor((now - new Date(dueRef).getTime()) / 86400000)) : 0;
+
+      return {
+        _id:           tx._id,
+        date:          tx.transactionDate,
+        description:   tx.description,
+        invoiceNumber: tx.invoiceNumber || tx.transactionReference || null,
+        type:          tx.transactionType,
+        debit:         Math.round(debit * 100) / 100,
+        credit:        Math.round(credit * 100) / 100,
+        balance:       Math.round(runningBalance * 100) / 100,
+        paymentStatus: tx.paymentStatus || null,
+        dueDate:       tx.dueDate || null,
+        daysOverdue:   isSale ? daysOverdue : 0,
+        remainingBalance: tx.remainingBalance || 0,
+      };
+    });
+
+    const totalInvoiced = lines.reduce((s, l) => s + l.debit,  0);
+    const totalPaid     = lines.reduce((s, l) => s + l.credit, 0);
+    const overdueAmount = lines
+      .filter((l) => l.daysOverdue > 0 && l.remainingBalance > 0)
+      .reduce((s, l) => s + l.remainingBalance, 0);
+
+    return {
+      customer: {
+        _id:          customer._id,
+        fullName:     customer.fullName,
+        businessName: customer.businessName,
+        email:        customer.email,
+        phone:        customer.phone,
+        address:      customer.address,
+        taxId:        customer.taxId,
+        paymentTerms: customer.paymentTerms,
+      },
+      period: { startDate: startDate || null, endDate: endDate || null },
+      openingBalance: 0,
+      closingBalance: Math.round(runningBalance * 100) / 100,
+      lines,
+      summary: {
+        totalInvoiced: Math.round(totalInvoiced * 100) / 100,
+        totalPaid:     Math.round(totalPaid     * 100) / 100,
+        outstanding:   Math.round((totalInvoiced - totalPaid) * 100) / 100,
+        overdueAmount: Math.round(overdueAmount * 100) / 100,
+        invoiceCount:  lines.filter((l) => l.debit > 0).length,
+        paymentCount:  lines.filter((l) => l.credit > 0).length,
+      },
+    };
+  }
 }
 
 module.exports = new CustomerService();
