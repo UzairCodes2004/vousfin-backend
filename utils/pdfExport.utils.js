@@ -1,6 +1,12 @@
 // utils/pdfExport.utils.js — Professional ERP-quality PDF generation
 const PDFDocument = require('pdfkit');
+const path        = require('path');
+const fs          = require('fs');
 const logger      = require('../config/logger');
+
+// VousFin brand logo path — silently skipped if file is absent
+const LOGO_PATH = path.join(__dirname, '../assets/vousfin-logo.png');
+const LOGO_EXISTS = fs.existsSync(LOGO_PATH);
 
 // ── Design constants ──────────────────────────────────────────────────────────
 const COLORS = {
@@ -111,12 +117,38 @@ function pageFooter(doc) {
   const safeBottom = doc.page.height - MARGIN; // 841.89 - 40 = 801.89
   const footerH = 20;
   const y = safeBottom - footerH; // ~781
+
   doc.rect(0, y, PAGE_W, footerH).fill(COLORS.headerBg);
+
+  // Disclaimer text (centred, leaves space on the right for the VousFin brand)
   doc.fillColor('#a0aec0').fontSize(7).font('Helvetica')
      .text(
        'This is a system-generated report. For accounting purposes only.',
-       MARGIN, y + 7, { width: CONTENT_W, align: 'center', lineBreak: false }
+       MARGIN, y + 7, { width: CONTENT_W - 90, align: 'center', lineBreak: false }
      );
+
+  // VousFin brand mark — bottom-right, low opacity
+  try {
+    const logoSize = 13;
+    const logoX = PAGE_W - MARGIN - logoSize - 44;
+    const textX  = logoX + logoSize + 3;
+
+    if (LOGO_EXISTS) {
+      doc.save();
+      doc.opacity(0.35);
+      doc.image(LOGO_PATH, logoX, y + 3, { width: logoSize, height: logoSize });
+      doc.restore();
+    }
+
+    // "VousFin" text beside logo, same low opacity
+    doc.save();
+    doc.opacity(0.4);
+    doc.fillColor('#e2e8f0').font('Helvetica-Bold').fontSize(7)
+       .text('VousFin', textX, y + 7, { width: 42, lineBreak: false });
+    doc.restore();
+  } catch (_) {
+    // Never let a branding error crash the PDF
+  }
 }
 
 function buildDoc() {

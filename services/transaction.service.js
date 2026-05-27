@@ -680,6 +680,19 @@ class TransactionService {
     if (original.status === JOURNAL_STATUS.REVERSED) throw new ApiError(400, 'Cannot edit a reversed transaction');
     if (original.partiallyPaidAmount > 0) throw new ApiError(400, 'Cannot edit a transaction that has payments applied against it');
 
+    // GAAP 30-day edit lock — standard accounting: posted entries become immutable
+    // after 30 days; corrections must use reversals to preserve the audit trail.
+    if (!updateData.adminOverride) {
+      const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+      const ageMs = Date.now() - new Date(original.createdAt).getTime();
+      if (ageMs > THIRTY_DAYS_MS) {
+        throw new ApiError(
+          423,
+          'Transactions older than 30 days cannot be edited. Use "Reverse" to correct accounting entries and maintain the audit trail (GAAP).'
+        );
+      }
+    }
+
     // Period Lock Check — check the ORIGINAL transaction's date period
     if (!updateData.adminOverride && original.entryType === 'normal') {
       const AccountingPeriod = require('../models/AccountingPeriod.model');
