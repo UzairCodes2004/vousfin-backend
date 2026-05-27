@@ -1,11 +1,12 @@
 // controllers/report.controller.js
-const reportService  = require('../services/report.service');
-const ApiResponse    = require('../utils/ApiResponse');
-const { ApiError }   = require('../utils/ApiError');
-const pdfExport      = require('../utils/pdfExport.utils');
-const excelExport    = require('../utils/excelExport.utils');
-const auditService   = require('../services/audit.service');
-const logger         = require('../config/logger');
+const reportService      = require('../services/report.service');
+const ApiResponse        = require('../utils/ApiResponse');
+const { ApiError }       = require('../utils/ApiError');
+const pdfExport          = require('../utils/pdfExport.utils');
+const excelExport        = require('../utils/excelExport.utils');
+const auditService       = require('../services/audit.service');
+const businessRepository = require('../repositories/business.repository');
+const logger             = require('../config/logger');
 
 // ─── Income Statement ────────────────────────────────────────────────────────
 
@@ -148,9 +149,14 @@ const getKPISummary = async (req, res, next) => {
 const exportReport = async (req, res, next) => {
   try {
     const { type, format, startDate, endDate, asOfDate } = req.query;
-    const businessId   = req.user.businessId;
-    const businessName = req.user.businessName || 'My Business';
-    const currency     = req.user.currency || 'PKR';
+    const businessId = req.user.businessId;
+
+    // Fetch the real business name and currency from the database.
+    // req.user only carries auth-essential fields from the JWT; businessName
+    // is stored on the Business document, not in the token payload.
+    const business     = await businessRepository.findById(businessId);
+    const businessName = business?.businessName || 'My Business';
+    const currency     = business?.currency     || 'PKR';
 
     let reportData, fileBuffer, filename, contentType;
 
