@@ -462,9 +462,14 @@ journalEntrySchema.index(
   { name: 'idx_ledger_credit' }
 );
 
-// 5b. Tax queries
+// 5b. Tax queries (Phase 5.4.9 — optimised for tax ledger + WHT + filing reports)
 journalEntrySchema.index({ businessId: 1, taxType: 1, transactionDate: -1 },
   { sparse: true, name: 'idx_tax_type' });
+// Compound: filters posted entries with non-null taxAmount for tax reports
+journalEntrySchema.index(
+  { businessId: 1, status: 1, taxAmount: 1, transactionDate: -1 },
+  { sparse: true, name: 'idx_tax_report', partialFilterExpression: { taxAmount: { $gt: 0 } } }
+);
 
 // 6. Description text search — replaces slow regex scan
 //    Usage: findManyWithFilters({ search: '...' })
