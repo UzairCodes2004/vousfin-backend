@@ -149,6 +149,9 @@ const createInstallmentTransaction = async (req, res, next) => {
       customerId, vendorId,
       downPayment, installmentCount, installmentFrequency, interestRate,
       firstPaymentDate, interestMethod,
+      // Optional extras passed from the form
+      transactionType, invoiceNumber, customerName, vendorName,
+      notes, paymentMethod, dueDate,
     } = req.body;
 
     const transactionData = {
@@ -158,9 +161,17 @@ const createInstallmentTransaction = async (req, res, next) => {
       amount,
       debitAccountId,
       creditAccountId,
-      customerId,
-      vendorId,
       inputMethod: 'form',
+      // Pass optional party refs / metadata so they are persisted on the journal entry
+      ...(customerId      ? { customerId }      : {}),
+      ...(vendorId        ? { vendorId }        : {}),
+      ...(transactionType ? { transactionType } : {}),
+      ...(invoiceNumber?.trim() ? { invoiceNumber: invoiceNumber.trim() } : {}),
+      ...(customerName?.trim()  ? { customerName:  customerName.trim()  } : {}),
+      ...(vendorName?.trim()    ? { vendorName:    vendorName.trim()    } : {}),
+      ...(notes?.trim()         ? { notes:         notes.trim()         } : {}),
+      ...(paymentMethod         ? { paymentMethod }                       : {}),
+      ...(dueDate               ? { dueDate }                             : {}),
     };
 
     const installmentConfig = {

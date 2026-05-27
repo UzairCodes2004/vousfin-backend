@@ -45,6 +45,8 @@ const createTransactionSchema = Joi.object({
 
   // Metadata
   transactionReference: Joi.string().max(100).allow('', null).trim().optional(),
+  invoiceNumber:        Joi.string().max(50).allow('', null).trim().optional(),   // ← ADDED: invoice/bill ref
+  paymentMethod:        Joi.string().max(50).allow('', null).trim().optional(),   // ← ADDED: cash/bank/card/cheque
   transactionCategory: Joi.string().valid(...Object.values(TRANSACTION_CATEGORIES)).allow(null).optional(),
   notes: Joi.string().max(1000).allow('', null).trim().optional(),
   tags: Joi.array().items(Joi.string().trim()).optional(),
@@ -133,25 +135,22 @@ const recordPaymentSchema = Joi.object({
 
 /**
  * Schema for creating an installment plan (structured form — POST /installment)
+ *
+ * Extends the full createTransactionSchema so every optional field the form
+ * might send (invoiceNumber, paymentMethod, taxes, customerName, notes …)
+ * is accepted without a "Validation failed" rejection.  The controller only
+ * reads the plan-specific fields it needs; everything else passes through.
  */
-const createInstallmentSchema = Joi.object({
-  // Transaction part
-  transactionDate: Joi.date().iso().required(),
-  description: Joi.string().min(3).max(500).required().trim(),
-  amount: Joi.number().positive().precision(2).required(),
-  debitAccountId: Joi.string().pattern(objectIdPattern).required(),
-  creditAccountId: Joi.string().pattern(objectIdPattern).required(),
-
-  customerId: Joi.string().pattern(objectIdPattern).allow(null).optional(),
-  vendorId: Joi.string().pattern(objectIdPattern).allow(null).optional(),
-
-  // Plan part
-  downPayment: Joi.number().min(0).precision(2).default(0),
-  installmentCount: Joi.number().integer().min(1).max(120).required(),
+const createInstallmentSchema = createTransactionSchema.keys({
+  // Installment plan fields (required)
+  installmentCount:     Joi.number().integer().min(1).max(120).required(),
   installmentFrequency: Joi.string().valid('weekly', 'biweekly', 'monthly', 'quarterly').required(),
 
-  // Interest / financing (Phase 3)
-  interestRate: Joi.number().min(0).max(100).optional(),
+  // Installment plan fields (optional)
+  downPayment:          Joi.number().min(0).precision(2).default(0),
+  interestRate:         Joi.number().min(0).max(100).optional(),
+  interestMethod:       Joi.string().valid('reducing_balance', 'flat').optional(),
+  firstPaymentDate:     Joi.date().iso().allow(null, '').optional(),
 });
 
 /**

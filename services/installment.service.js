@@ -325,6 +325,9 @@ class InstallmentService {
       transactionType:     TRANSACTION_TYPES.ASSET_PURCHASE,
       transactionMode:     TRANSACTION_MODES.INSTALLMENT,
       transactionSource:   TRANSACTION_SOURCES.INSTALLMENT_ENGINE,
+      // Skip the tax engine for compound asset-purchase journals.
+      // The 3-line DR/CR journal is pre-balanced; appending tax lines breaks balance.
+      skipTax:             true,
       // Override with new 3-line journal (replaces any 2-line NLP preview lines)
       journalLines,
       // Primary 1:1 accounts

@@ -208,6 +208,11 @@ const journalEntrySchema = new mongoose.Schema(
       trim: true,
       maxlength: 50,
     },
+    paymentMethod: {
+      type: String,
+      enum: ['cash', 'bank', 'credit_card', 'debit_card', 'cheque', 'mobile_wallet', 'online', null],
+      default: null,
+    },
     transactionCategory: {
       type: String,
       enum: [...Object.values(TRANSACTION_CATEGORIES), null],

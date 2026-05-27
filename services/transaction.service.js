@@ -110,7 +110,10 @@ class TransactionService {
     const skipTax = data.skipTax === true ||
                     data.entryType === 'closing' ||
                     data.entryType === 'opening_balance' ||
-                    data.transactionSource === 'system_generated';
+                    data.transactionSource === 'system_generated' ||
+                    // Installment engine creates compound (3-line) journals that are already
+                    // balanced.  Adding tax lines would break the DR = CR invariant.
+                    data.transactionSource === TRANSACTION_SOURCES.INSTALLMENT_ENGINE;
 
     if (!skipTax) {
       try {
@@ -241,6 +244,30 @@ class TransactionService {
       } catch (taxErr) {
         // Non-fatal: tax engine errors must never block a transaction
         logger.warn(`[Tax] Engine error — continuing without tax. ${taxErr.message}`);
+      }
+    }
+
+    // 3d. Auto-generate invoice/bill number for Sales and Purchases when not provided.
+    //     Format: INV-YYYYMM-XXXXX (sales) | BILL-YYYYMM-XXXXX (purchases)
+    //     This ensures every sale/purchase has a traceable reference for AR/AP aging.
+    const SALE_TYPES_FOR_INV = [
+      TRANSACTION_TYPES.CASH_SALE, TRANSACTION_TYPES.CREDIT_SALE,
+      TRANSACTION_TYPES.INVENTORY_SALE, TRANSACTION_TYPES.PAYMENT_RECEIVED,
+      TRANSACTION_TYPES.ADVANCE_FROM_CUSTOMER,
+    ];
+    const PURCHASE_TYPES_FOR_BILL = [
+      TRANSACTION_TYPES.CASH_PURCHASE, TRANSACTION_TYPES.CREDIT_PURCHASE,
+      TRANSACTION_TYPES.INVENTORY_PURCHASE, TRANSACTION_TYPES.PAYMENT_MADE,
+    ];
+    if (!data.invoiceNumber) {
+      const txDate = data.transactionDate ? new Date(data.transactionDate) : new Date();
+      const yyyymm = txDate.getFullYear().toString() +
+                     String(txDate.getMonth() + 1).padStart(2, '0');
+      const rand   = String(Math.floor(Math.random() * 99999) + 1).padStart(5, '0');
+      if (SALE_TYPES_FOR_INV.includes(data.transactionType)) {
+        data.invoiceNumber = `INV-${yyyymm}-${rand}`;
+      } else if (PURCHASE_TYPES_FOR_BILL.includes(data.transactionType)) {
+        data.invoiceNumber = `BILL-${yyyymm}-${rand}`;
       }
     }
 
