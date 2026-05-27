@@ -31,8 +31,9 @@ router.get('/:id/settlements', validate(transactionIdParamSchema, 'params'), tra
 
 // AR/AP Data Integrity Repair — idempotent, GAAP-compliant fix for mis-typed entries
 router.post('/repair-ar-ap',       transactionController.repairARAPTransactions);
-// AR Overdue Refresh — marks overdue AR entries where dueDate < today
+// AR/AP Overdue Refresh — marks overdue entries where dueDate < today
 router.post('/refresh-overdue-ar', transactionController.refreshOverdueAR);
+router.post('/refresh-overdue-ap', transactionController.refreshOverdueAP);
 
 // Installments (v2) — Core
 router.post('/installment', validate(createInstallmentSchema), transactionController.createInstallmentTransaction);

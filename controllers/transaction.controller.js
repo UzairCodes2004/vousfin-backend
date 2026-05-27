@@ -1032,6 +1032,24 @@ const refreshOverdueAR = async (req, res, next) => {
   }
 };
 
+/**
+ * POST /api/v1/transactions/refresh-overdue-ap
+ * Mark AP entries (Credit Purchase) as OVERDUE where dueDate has passed.
+ * Idempotent — safe to call multiple times.
+ */
+const refreshOverdueAP = async (req, res, next) => {
+  try {
+    const result = await transactionService.refreshOverdueAP(req.user.businessId);
+    ApiResponse.success(res, result,
+      result.updated > 0
+        ? `${result.updated} payable(s) marked as overdue`
+        : 'No new overdue payables found'
+    );
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   createFormTransaction,
   recordPayment,
@@ -1052,6 +1070,7 @@ module.exports = {
   getTransactionAuditHistory,
   repairARAPTransactions,
   refreshOverdueAR,
+  refreshOverdueAP,
   // ── Advanced installment lifecycle ─────────────────────────────────────
   getInstallmentPlans,
   getInstallmentPlan,

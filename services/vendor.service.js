@@ -231,6 +231,94 @@ class VendorService {
     logger.info(`Vendor ${vendorId} active status changed to ${newStatus}`);
     return updated;
   }
+
+  /**
+   * Generate a vendor statement — full chronological AP ledger with running balance.
+   *
+   * Returns:
+   *   - vendor: profile info
+   *   - lines: [ { date, description, billNumber, type, debit, credit, balance, paymentStatus } ]
+   *   - closingBalance: outstanding AP at end of period
+   *   - summary: { totalBilled, totalPaid, outstanding, overdueAmount }
+   *
+   * @param {string} vendorId
+   * @param {string} businessId
+   * @param {Object} opts - { startDate?, endDate? }
+   * @returns {Promise<Object>}
+   */
+  async getVendorStatement(vendorId, businessId, opts = {}) {
+    const vendor = await vendorRepository.findByBusinessAndId(businessId, vendorId);
+    if (!vendor) throw new ApiError(404, 'Vendor not found');
+
+    const { startDate, endDate } = opts;
+    const filter = {};
+    if (startDate) filter.startDate = startDate;
+    if (endDate)   filter.endDate   = endDate;
+
+    const txResult = await transactionRepository.findByVendor(businessId, vendorId, filter, { limit: 500, sortBy: 'transactionDate', sortOrder: 1 });
+    const entries  = Array.isArray(txResult?.data) ? txResult.data
+                   : Array.isArray(txResult)       ? txResult : [];
+
+    let runningBalance = 0;
+    const now = Date.now();
+
+    const lines = entries.map((tx) => {
+      const isBill    = [TRANSACTION_TYPES.CREDIT_PURCHASE, TRANSACTION_TYPES.INVENTORY_PURCHASE, TRANSACTION_TYPES.CASH_PURCHASE, TRANSACTION_TYPES.EXPENSE].includes(tx.transactionType);
+      const isPayment = tx.transactionType === TRANSACTION_TYPES.PAYMENT_MADE;
+      const credit = isBill    ? tx.amount : 0;   // Bills increase AP (credit)
+      const debit  = isPayment ? tx.amount : 0;   // Payments reduce AP (debit)
+      runningBalance += credit - debit;
+
+      const dueRef = tx.dueDate || tx.transactionDate;
+      const daysOverdue = dueRef ? Math.max(0, Math.floor((now - new Date(dueRef).getTime()) / 86400000)) : 0;
+
+      return {
+        _id:           tx._id,
+        date:          tx.transactionDate,
+        description:   tx.description,
+        billNumber:    tx.invoiceNumber || tx.transactionReference || null,
+        type:          tx.transactionType,
+        debit:         Math.round(debit  * 100) / 100,
+        credit:        Math.round(credit * 100) / 100,
+        balance:       Math.round(runningBalance * 100) / 100,
+        paymentStatus: tx.paymentStatus || null,
+        dueDate:       tx.dueDate || null,
+        daysOverdue:   isBill ? daysOverdue : 0,
+        remainingBalance: tx.remainingBalance || 0,
+      };
+    });
+
+    const totalBilled = lines.reduce((s, l) => s + l.credit, 0);
+    const totalPaid   = lines.reduce((s, l) => s + l.debit,  0);
+    const overdueAmount = lines
+      .filter((l) => l.daysOverdue > 0 && l.remainingBalance > 0)
+      .reduce((s, l) => s + l.remainingBalance, 0);
+
+    return {
+      vendor: {
+        _id:           vendor._id,
+        vendorName:    vendor.vendorName,
+        contactPerson: vendor.contactPerson,
+        email:         vendor.email,
+        phone:         vendor.phone,
+        address:       vendor.address,
+        taxId:         vendor.taxId,
+        paymentTerms:  vendor.paymentTerms,
+      },
+      period: { startDate: startDate || null, endDate: endDate || null },
+      openingBalance: 0,
+      closingBalance: Math.round(runningBalance * 100) / 100,
+      lines,
+      summary: {
+        totalBilled:   Math.round(totalBilled  * 100) / 100,
+        totalPaid:     Math.round(totalPaid    * 100) / 100,
+        outstanding:   Math.round((totalBilled - totalPaid) * 100) / 100,
+        overdueAmount: Math.round(overdueAmount * 100) / 100,
+        billCount:     lines.filter((l) => l.credit > 0).length,
+        paymentCount:  lines.filter((l) => l.debit  > 0).length,
+      },
+    };
+  }
 }
 
 module.exports = new VendorService();

@@ -95,3 +95,20 @@ exports.getVendorStats = async (req, res, next) => {
     next(error);
   }
 };
+
+/**
+ * GET /api/v1/vendors/:id/statement
+ * Returns full chronological vendor AP ledger with running balance.
+ */
+exports.getVendorStatement = async (req, res, next) => {
+  try {
+    const opts = {
+      startDate: req.query.startDate || null,
+      endDate:   req.query.endDate   || null,
+    };
+    const statement = await vendorService.getVendorStatement(req.params.id, req.user.businessId, opts);
+    ApiResponse.success(res, statement, 'Vendor statement generated');
+  } catch (error) {
+    next(error);
+  }
+};

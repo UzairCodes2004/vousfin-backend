@@ -55,4 +55,10 @@ router.get(
   vendorController.getVendorStats
 );
 
+router.get(
+  '/:id/statement',
+  validate(vendorIdParamSchema, 'params'),
+  vendorController.getVendorStatement
+);
+
 module.exports = router;
