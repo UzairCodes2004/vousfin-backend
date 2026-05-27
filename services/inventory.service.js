@@ -106,6 +106,70 @@ class InventoryService {
     if (!item) throw new ApiError(404, 'Inventory item not found');
     return inventoryItemRepository.update(itemId, { isActive: !item.isActive });
   }
+
+  /**
+   * Get stock movement ledger for an item — lists all transactions that
+   * reference this inventory item, showing qty-in, qty-out, and running balance.
+   *
+   * @param {string} businessId
+   * @param {string} itemId
+   * @returns {Promise<Object>}
+   */
+  async getStockLedger(businessId, itemId) {
+    const item = await inventoryItemRepository.findByBusinessAndId(businessId, itemId);
+    if (!item) throw new ApiError(404, 'Inventory item not found');
+
+    const JournalEntry = require('../models/JournalEntry.model');
+    const mongoose = require('mongoose');
+    const { TRANSACTION_TYPES } = require('../config/constants');
+
+    const entries = await JournalEntry.find({
+      businessId: new mongoose.Types.ObjectId(String(businessId)),
+      inventoryItemId: new mongoose.Types.ObjectId(String(itemId)),
+      isArchived: { $ne: true },
+    })
+      .sort({ transactionDate: 1, createdAt: 1 })
+      .select('transactionDate description transactionType inventoryQty amount')
+      .lean();
+
+    let runningQty = 0;
+    const lines = entries.map((tx) => {
+      const isIn  = tx.transactionType === TRANSACTION_TYPES.INVENTORY_PURCHASE;
+      const isOut = tx.transactionType === TRANSACTION_TYPES.INVENTORY_SALE;
+      const qtyIn  = isIn  ? (tx.inventoryQty || 0) : 0;
+      const qtyOut = isOut ? (tx.inventoryQty || 0) : 0;
+      runningQty += qtyIn - qtyOut;
+      return {
+        _id:         tx._id,
+        date:        tx.transactionDate,
+        description: tx.description,
+        type:        tx.transactionType,
+        qtyIn,
+        qtyOut,
+        balance:     runningQty,
+        amount:      tx.amount,
+      };
+    });
+
+    return {
+      item: {
+        _id:          item._id,
+        name:         item.name,
+        sku:          item.sku,
+        barcode:      item.barcode,
+        category:     item.category,
+        currentStock: item.currentStock,
+        unitCostPrice:item.unitCostPrice,
+        unit:         item.unit,
+      },
+      lines,
+      summary: {
+        totalIn:   lines.reduce((s, l) => s + l.qtyIn,  0),
+        totalOut:  lines.reduce((s, l) => s + l.qtyOut, 0),
+        currentStock: item.currentStock,
+      },
+    };
+  }
 }
 
 module.exports = new InventoryService();

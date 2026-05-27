@@ -21,5 +21,6 @@ router.route('/:id')
 
 router.patch('/:id/toggle-active', inventoryController.toggleActive);
 router.post('/:id/add-stock',      inventoryController.addStock);
+router.get('/:id/ledger',          inventoryController.getStockLedger);
 
 module.exports = router;

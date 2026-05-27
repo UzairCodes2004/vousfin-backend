@@ -73,3 +73,10 @@ exports.addStock = async (req, res, next) => {
     ApiResponse.success(res, item, `Added ${qty} units to stock`);
   } catch (e) { next(e); }
 };
+
+exports.getStockLedger = async (req, res, next) => {
+  try {
+    const ledger = await inventoryService.getStockLedger(req.user.businessId, req.params.id);
+    ApiResponse.success(res, ledger, 'Stock ledger retrieved');
+  } catch (e) { next(e); }
+};

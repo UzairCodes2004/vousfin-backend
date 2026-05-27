@@ -64,6 +64,38 @@ const inventoryItemSchema = new mongoose.Schema(
       trim: true,
       maxlength: 30,
     },
+    // Phase 5.5 Step 4 — enriched item catalog fields
+    barcode: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: 100,
+    },
+    category: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: 100,
+    },
+    /** Default tax rate applied to this item on invoices (% e.g. 17 for 17% GST) */
+    taxRate: {
+      type: Number,
+      default: null,
+      min: 0,
+      max: 100,
+    },
+    /** Preferred vendor — optionally linked to a Vendor document */
+    preferredVendorId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Vendor',
+      default: null,
+    },
+    /** Valuation method for COGS — 'weighted_average' | 'fifo' */
+    valuationMethod: {
+      type: String,
+      default: 'weighted_average',
+      enum: ['weighted_average', 'fifo'],
+    },
     isActive: {
       type: Boolean,
       default: true,
@@ -85,8 +117,14 @@ inventoryItemSchema.index({ businessId: 1, sku: 1 }, {
   unique: true,
   partialFilterExpression: { sku: { $ne: null } },
 });
+inventoryItemSchema.index({ businessId: 1, barcode: 1 }, {
+  unique: true,
+  sparse: true,
+  partialFilterExpression: { barcode: { $ne: null } },
+});
 inventoryItemSchema.index({ businessId: 1, name: 1 });
 inventoryItemSchema.index({ businessId: 1, currentStock: 1 });
+inventoryItemSchema.index({ businessId: 1, category: 1 });
 
 /**
  * Update the weighted-average unit cost when adding stock.
