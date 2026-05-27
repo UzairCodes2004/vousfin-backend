@@ -1,6 +1,9 @@
 // models/Business.model.js
 const mongoose = require('mongoose');
-const { BUSINESS_TYPES, DEFAULT_CURRENCY, FISCAL_YEAR_START_MONTH_DEFAULT } = require('../config/constants');
+const {
+  BUSINESS_TYPES, DEFAULT_CURRENCY, FISCAL_YEAR_START_MONTH_DEFAULT,
+  TAX_FILING_FREQUENCIES, SUPPORTED_COUNTRIES,
+} = require('../config/constants');
 
 /**
  * Business Schema
@@ -58,6 +61,50 @@ const businessSchema = new mongoose.Schema(
       type: String,
       default: null,
       trim: true,
+    },
+
+    // ── Phase 5.4 — Country-Aware Tax Configuration ──────────────────────────
+    /**
+     * taxConfig stores per-business tax settings.
+     * All fields are optional with safe defaults so existing businesses
+     * are completely unaffected until they explicitly enable a tax type.
+     */
+    taxConfig: {
+      // ISO 3166-1 alpha-2 country code — drives which profile is loaded
+      country: {
+        type: String,
+        default: 'PK',
+        uppercase: true,
+        trim: true,
+        enum: { values: ['PK', 'AE', 'SA', 'IN', 'US', 'GB'], message: '{VALUE} is not a supported country' },
+      },
+
+      // Tax registration identifier (NTN/STRN for PK, TRN for AE/SA, GSTIN for IN, etc.)
+      taxRegistrationNumber: { type: String, default: null, trim: true },
+
+      // Feature toggles (all off by default = zero impact on existing businesses)
+      gstEnabled:            { type: Boolean, default: false },  // Pakistan GST / India GST
+      vatEnabled:            { type: Boolean, default: false },  // UAE/SA/GB VAT
+      whtEnabled:            { type: Boolean, default: false },  // WHT / TDS
+      reverseChargeEnabled:  { type: Boolean, default: false },  // AE/SA/IN reverse charge
+
+      // Compliance flags
+      registeredForTax:      { type: Boolean, default: false },
+      taxInclusive:          { type: Boolean, default: true  },  // true = amounts entered include tax
+
+      // Filing frequency — monthly | quarterly | annual
+      filingFrequency: {
+        type: String,
+        default: 'monthly',
+        enum: ['monthly', 'quarterly', 'annual'],
+      },
+
+      // Rate overrides: { 'GST': 17, 'SRB': 13 } — overrides country profile defaults
+      customRates: {
+        type: Map,
+        of: Number,
+        default: () => new Map(),
+      },
     },
   },
   {

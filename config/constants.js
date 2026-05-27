@@ -145,6 +145,11 @@ module.exports = {
     { accountCode: '6220', accountName: 'Bank Currency Revaluations',  accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
     { accountCode: '6230', accountName: 'Depreciation Expense',        accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
     { accountCode: '6240', accountName: 'Interest Expense',            accountType: 'Expense',   accountSubtype: 'Expenses',               normalBalance: 'Debit',  isDefault: true },
+
+    // ── Tax Engine accounts (Phase 5.4) ── seeded only when business enables tax ──
+    // Codes 1170–1177 (receivable / input tax assets) and 2121–2130 (payable liabilities)
+    // are created by taxEngine.ensureTaxAccounts() at runtime; they are NOT seeded here
+    // to preserve zero impact on businesses that never enable tax.
   ],
 
   // ===============================
@@ -208,6 +213,15 @@ module.exports = {
     FX_GAIN:              'FX Gain',            // realised foreign-currency gain
     FX_LOSS:              'FX Loss',            // realised foreign-currency loss
     FX_REVALUATION:       'FX Revaluation',     // month-end unrealised revaluation
+
+    // ── Tax Engine (Phase 5.4) ─────────────────────────────────────────────
+    GST_COLLECTION:       'GST Collection',     // GST/VAT collected on sales (kept for compatibility)
+    VAT_COLLECTION:       'VAT Collection',     // VAT collected on sales (AE/SA/GB)
+    VAT_PAYMENT:          'VAT Payment',        // VAT remitted to authority
+    REVERSE_CHARGE:       'Reverse Charge',     // Buyer accounts for both input and output tax
+    WHT_DEDUCTION:        'WHT Deduction',      // Withholding tax deducted at source
+    TDS_DEDUCTION:        'TDS Deduction',      // India TDS at source
+    TAX_FILING:           'Tax Filing',         // Tax authority payment (GST/VAT filing)
   },
 
   // Transaction mode abstraction (reduces type explosion)
@@ -373,6 +387,56 @@ module.exports = {
   ANOMALY_SUPPRESS_STATUSES: ['marked_legit', 'valid', 'ignored'],
   // Statuses that count as "user reviewed" (any verdict given)
   ANOMALY_REVIEWED_STATUSES: ['marked_legit', 'confirmed_fraud', 'valid', 'confirmed_issue', 'ignored'],
+
+  // ===============================
+  // Phase 5.4 — Tax Engine Constants
+  // ===============================
+
+  /** Canonical tax type identifiers — used in DB records and journal entries */
+  TAX_TYPES: {
+    // Pakistan
+    GST:          'GST',
+    GST_INPUT:    'GST_INPUT',
+    SRB:          'SRB',
+    PRA:          'PRA',
+    KPRA:         'KPRA',
+    BRA:          'BRA',
+    WHT:          'WHT',
+    // UAE / SA / GB
+    VAT:          'VAT',
+    VAT_INPUT:    'VAT_INPUT',
+    VAT_ZERO:     'VAT_ZERO',
+    VAT_EXEMPT:   'VAT_EXEMPT',
+    VAT_REVERSE_CHARGE: 'VAT_REVERSE_CHARGE',
+    // India
+    CGST:         'CGST',
+    SGST:         'SGST',
+    IGST:         'IGST',
+    GST_5:        'GST_5',
+    GST_12:       'GST_12',
+    TDS:          'TDS',
+    // US
+    SALES_TAX:    'SALES_TAX',
+  },
+
+  /** Tax calculation modes */
+  TAX_CALCULATION_MODES: {
+    INCLUSIVE: 'inclusive',  // entered amount includes tax (default for PK)
+    EXCLUSIVE: 'exclusive',  // entered amount is before tax
+  },
+
+  /** Tax side: which leg of the transaction bears the tax */
+  TAX_SIDES: {
+    OUTPUT: 'output',  // collected from customer (sales)
+    INPUT:  'input',   // paid to vendor (purchases, recoverable)
+    BOTH:   'both',    // both sides (India CGST+SGST; RC)
+  },
+
+  /** Filing frequency options for taxConfig.filingFrequency */
+  TAX_FILING_FREQUENCIES: ['monthly', 'quarterly', 'annual'],
+
+  /** Countries with full tax engine support (ISO 3166-1 alpha-2) */
+  SUPPORTED_COUNTRIES: ['PK', 'AE', 'SA', 'IN', 'US', 'GB'],
 
   // ===============================
   // API & Pagination Constants
