@@ -20,6 +20,7 @@
 
 const JournalEntry = require('../models/JournalEntry.model');
 const { getTaxRules } = require('../utils/taxRules');
+const { validateTransactionEntry } = require('../utils/gaapValidator');
 const logger = require('../config/logger');
 const mongoose = require('mongoose');
 
@@ -39,6 +40,9 @@ class AccountantSuggestionsService {
     const businessObjId = new mongoose.Types.ObjectId(String(businessId));
     const txDate  = txData.transactionDate ? new Date(txData.transactionDate) : new Date();
     const amount  = Number(txData.amount)  || 0;
+
+    // Check 9: GAAP double-entry validation (synchronous — no DB needed)
+    this._checkGAAPBalance(txData, amount, warnings, suggestions);
 
     await Promise.allSettled([
       this._checkDuplicateInvoice(businessObjId, txData, warnings).catch(() => {}),
@@ -172,6 +176,45 @@ class AccountantSuggestionsService {
       );
     }
     return Promise.resolve();
+  }
+
+  /**
+   * Check 9: GAAP double-entry validation.
+   * Runs the gaapValidator against the proposed entry — surfaces AR/AP
+   * account-type warnings and matching-principle flags as advisory suggestions.
+   * Journal balance is always guaranteed (same DR = CR amount) for simple entries,
+   * but compound journals from the NL parser need explicit balance checking.
+   */
+  _checkGAAPBalance(txData, amount, warnings, suggestions) {
+    try {
+      const result = validateTransactionEntry({
+        transactionType:  txData.transactionType,
+        amount,
+        debitAccountId:   txData.debitAccountId,
+        creditAccountId:  txData.creditAccountId,
+        debitAccountName: txData.debitAccountName,
+        creditAccountName: txData.creditAccountName,
+        customerId:       txData.customerId,
+        customerName:     txData.customerName,
+        vendorId:         txData.vendorId,
+        vendorName:       txData.vendorName,
+        currencyCode:     txData.currencyCode,
+        exchangeRate:     txData.exchangeRate,
+        journalLines:     txData.journalLines,
+        paymentStatus:    txData.paymentStatus,
+      });
+
+      // Hard errors → block with warning
+      result.errors.forEach(e => warnings.push(`GAAP: ${e}`));
+
+      // Advisory warnings → suggestions
+      result.warnings.forEach(w => suggestions.push(w));
+
+      // GAAP flags → suggestions (informational)
+      result.gaapFlags.slice(0, 2).forEach(f => suggestions.push(f));
+    } catch (e) {
+      logger.warn(`[GAAP pre-check] Validation error (non-fatal): ${e.message}`);
+    }
   }
 }
 
