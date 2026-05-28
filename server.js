@@ -5,6 +5,7 @@ const config = require('./config');
 const logger = require('./config/logger');
 const { scheduleAnomalyScan } = require('./jobs/anomalyScan.job');
 const { scheduleFxRateSync }  = require('./jobs/fxRateSync.job');
+const { schedulePaymentReminders } = require('./jobs/paymentReminder.job');
 const { initialize: initForecastingData } = require('./services/forecasting/dataLoader');
 const { ensureLSTMRunning, stopLSTM } = require('./utils/lstmService');
 
@@ -42,6 +43,13 @@ const startServer = async () => {
       scheduleFxRateSync();
     } catch (err) {
       logger.warn(`⚠️ FX rate sync job failed to schedule (non-fatal): ${err.message}`);
+    }
+
+    // Step 3b: Schedule daily customer payment reminders (08:00 server time)
+    try {
+      schedulePaymentReminders();
+    } catch (err) {
+      logger.warn(`⚠️ Payment reminder job failed to schedule (non-fatal): ${err.message}`);
     }
 
     try {

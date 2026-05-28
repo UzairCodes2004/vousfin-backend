@@ -211,6 +211,16 @@ const invoiceSchema = new mongoose.Schema(
     creditNoteIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'CreditNote' }],
     totalCredited: { type: Number, default: 0, min: 0 },
 
+    // ── Phase 2.1: Payment reminder history (append-only) ────────────────
+    // Records which reminder cadence has already fired for this invoice so
+    // the daily cron does not double-send.  Keys mirror paymentReminder.service.
+    reminderHistory: [{
+      cadenceKey: { type: String, required: true }, // due_in_3 | due_today | overdue_7 | overdue_14 | overdue_30
+      firedAt:    { type: Date, default: Date.now },
+      channel:    { type: String, default: 'email' }, // email | whatsapp | sms
+      to:         { type: String, default: null },
+    }],
+
     // ── Dates ─────────────────────────────────────────────────────────────────
     issueDate: { type: Date, required: true, index: true },
     dueDate:   { type: Date, default: null, index: true },
