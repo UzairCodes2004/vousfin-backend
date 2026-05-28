@@ -34,4 +34,7 @@ router.post('/:id/transition', billController.transitionState);
 // Soft delete
 router.delete('/:id', billController.softDelete);
 
+// Phase 3.2 — 3-way match on demand
+router.post('/:id/match', billController.runMatch);
+
 module.exports = router;

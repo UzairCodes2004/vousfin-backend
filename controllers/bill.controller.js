@@ -130,3 +130,16 @@ exports.transitionState = async (req, res, next) => {
     ApiResponse.success(res, bill, `Bill transitioned to ${toState}`);
   } catch (err) { next(err); }
 };
+
+// Phase 3.2 — run 3-way match on demand
+exports.runMatch = async (req, res, next) => {
+  try {
+    const toleranceCfg = req.body?.toleranceCfg || {};
+    const result = await billService.runMatch(
+      req.params.id,
+      req.user.businessId,
+      toleranceCfg
+    );
+    ApiResponse.success(res, result, `3-way match result: ${result.status}`);
+  } catch (err) { next(err); }
+};

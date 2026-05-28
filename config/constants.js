@@ -681,6 +681,53 @@ module.exports = {
   },
 
   // ===============================
+  // Phase 3.2 — 3-Way Match Engine
+  // ===============================
+
+  /**
+   * Granular match statuses stored on Bill.threeWayMatchStatus.
+   *
+   *   none           — no PO/GRN linked; match cannot be run
+   *   pending        — PO/GRN linked but match not yet executed
+   *   matched        — all checks pass within tolerance (safe to pay)
+   *   partial_match  — some lines match; others have acceptable warnings
+   *   over_billed    — bill amount exceeds GRN received value beyond tolerance
+   *   under_received — goods received are less than ordered by more than tolerance
+   *   mismatch       — price or quantity variance exceeds warn threshold
+   *   blocked        — variance exceeds block threshold; payment prevented
+   *
+   * 'discrepancy' kept as legacy alias for 'mismatch'.
+   */
+  THREE_WAY_MATCH_STATUSES: {
+    NONE:            'none',
+    PENDING:         'pending',
+    MATCHED:         'matched',
+    PARTIAL_MATCH:   'partial_match',
+    OVER_BILLED:     'over_billed',
+    UNDER_RECEIVED:  'under_received',
+    MISMATCH:        'mismatch',
+    BLOCKED:         'blocked',
+    DISCREPANCY:     'discrepancy', // legacy alias — treated the same as mismatch
+  },
+
+  /**
+   * Default tolerance configuration for 3-way match.
+   * All values are percentages (0–100).
+   * Each tolerance has two thresholds:
+   *   warn  — show a warning badge but allow proceeding
+   *   block — hard-block approval/payment until resolved
+   */
+  THREE_WAY_MATCH_TOLERANCE_DEFAULTS: {
+    quantity: { warn: 5,  block: 15 },  // received qty vs ordered qty
+    price:    { warn: 3,  block: 10 },  // unit price on bill vs on PO
+    total:    { warn: 5,  block: 15 },  // bill total vs GRN total received value
+    tax:      { warn: 2,  block: 10 },  // tax amount vs expected tax from PO
+  },
+
+  /** Window (days) used for duplicate invoice detection. */
+  DUPLICATE_INVOICE_WINDOW_DAYS: 90,
+
+  // ===============================
   // API & Pagination Constants
   // ===============================
   DEFAULT_PAGE: 1,

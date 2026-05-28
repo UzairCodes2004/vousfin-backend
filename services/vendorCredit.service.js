@@ -15,6 +15,8 @@
 const mongoose = require('mongoose');
 const VendorCredit = require('../models/VendorCredit.model');
 const Bill = require('../models/Bill.model');
+const JournalEntry = require('../models/JournalEntry.model');
+const ChartOfAccount = require('../models/ChartOfAccount.model');
 const vendorRepository = require('../repositories/vendor.repository');
 const auditService = require('./audit.service');
 const { ApiError } = require('../utils/ApiError');
@@ -23,6 +25,9 @@ const {
   VENDOR_CREDIT_STATES,
   AUDIT_ACTIONS,
   ENTITY_TYPES,
+  TRANSACTION_TYPES,
+  TRANSACTION_SOURCES,
+  JOURNAL_STATUS,
 } = require('../config/constants');
 
 class VendorCreditService {
@@ -163,6 +168,13 @@ class VendorCreditService {
     bill.lastModifiedBy = user._id;
     await bill.save();
 
+    // Phase 3.2 — post vendor credit journal: DR AP, CR Vendor Credit
+    try {
+      await this.postCreditApplicationJournal(vc, bill, amount, user);
+    } catch (e) {
+      logger.warn(`[vc] journal for credit application failed: ${e.message}`);
+    }
+
     try {
       await auditService.log({
         businessId:      vc.businessId,
@@ -178,6 +190,75 @@ class VendorCreditService {
       logger.warn(`[vc] audit applyToBill failed: ${e.message}`);
     }
     return vc;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 3.2 — Vendor Credit Application Journal
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Post the journal entry when a vendor credit is applied to a bill.
+   *
+   * Entry:
+   *   DR  Accounts Payable   (2100)  — reduces AP balance (we owe less)
+   *   CR  Vendor Credit      (4180 Discount Received, or a dedicated account)
+   *
+   * If the Accounts Payable account or a suitable CR account is not found the
+   * journal is skipped (non-fatal — it only affects the ledger view).
+   *
+   * @param {Object} vc     — VendorCredit document
+   * @param {Object} bill   — Bill document (already updated)
+   * @param {number} amount — Applied amount
+   * @param {Object} user
+   */
+  async postCreditApplicationJournal(vc, bill, amount, user) {
+    const r2 = (v) => Math.round((Number(v) || 0) * 100) / 100;
+    const businessId = vc.businessId;
+
+    const apAccount = await ChartOfAccount.findOne({
+      businessId,
+      accountCode: '2100',
+    }).lean();
+    if (!apAccount) {
+      logger.warn('[vc] credit journal skipped — AP account (2100) not found');
+      return;
+    }
+
+    // CR side: "Discount Received" (4180) or "Other Income" (4100) as fallback
+    const crAccount = await ChartOfAccount.findOne({
+      businessId,
+      accountCode: { $in: ['4180', '4100', '4000'] },
+    }).lean();
+    if (!crAccount) {
+      logger.warn('[vc] credit journal skipped — no suitable credit account found');
+      return;
+    }
+    if (apAccount._id.toString() === crAccount._id.toString()) return;
+
+    const appliedAmount = r2(amount);
+    if (appliedAmount <= 0) return;
+
+    try {
+      await JournalEntry.create({
+        businessId,
+        transactionDate:  new Date(),
+        description:      `Vendor Credit Applied — ${vc.creditNumber} → Bill ${bill.billNumber}`,
+        transactionType:  TRANSACTION_TYPES.PAYMENT_MADE,
+        amount:           appliedAmount,
+        debitAccountId:   apAccount._id,   // DR Accounts Payable
+        creditAccountId:  crAccount._id,   // CR Vendor Credit / Discount Received
+        status:           JOURNAL_STATUS.POSTED,
+        transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+        invoiceNumber:    bill.billNumber,
+        vendorId:         vc.vendorId || null,
+        currencyCode:     vc.currencyCode || 'PKR',
+        exchangeRate:     vc.exchangeRate || 1,
+        createdBy:        user._id,
+        lastModifiedBy:   user._id,
+      });
+    } catch (e) {
+      logger.error(`[vc] credit application journal failed: ${e.message}`);
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────

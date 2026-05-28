@@ -9,8 +9,11 @@
 //
 const mongoose = require('mongoose');
 const Bill = require('../models/Bill.model');
+const JournalEntry = require('../models/JournalEntry.model');
+const ChartOfAccount = require('../models/ChartOfAccount.model');
 const vendorRepository = require('../repositories/vendor.repository');
 const auditService = require('./audit.service');
+const billMatchingService = require('./billMatching.service');
 const { ApiError } = require('../utils/ApiError');
 const logger = require('../config/logger');
 const {
@@ -19,6 +22,9 @@ const {
   AUDIT_ACTIONS,
   ENTITY_TYPES,
   DEFAULT_APPROVAL_THRESHOLD,
+  TRANSACTION_TYPES,
+  TRANSACTION_SOURCES,
+  JOURNAL_STATUS,
 } = require('../config/constants');
 
 class BillService {
@@ -186,7 +192,21 @@ class BillService {
     bill.approvalStatus = APPROVAL_STATUS.APPROVED;
     bill.approvedBy = user._id;
     bill.approvedAt = new Date();
-    return this._applyStateChange(bill, BILL_STATES.APPROVED, user, { reason: note, ipAddress });
+    const approved = await this._applyStateChange(bill, BILL_STATES.APPROVED, user, { reason: note, ipAddress });
+
+    // Phase 3.2 — auto-run 3-way match and post AP liability journal on approval
+    try {
+      await billMatchingService.runFullMatch(id, bill.businessId.toString());
+    } catch (e) {
+      logger.warn(`[bill] 3-way match failed on approval for ${bill.billNumber}: ${e.message}`);
+    }
+    try {
+      await this.postApLiabilityJournal(approved, user, ipAddress);
+    } catch (e) {
+      logger.warn(`[bill] AP journal failed on approval for ${bill.billNumber}: ${e.message}`);
+    }
+
+    return approved;
   }
 
   async reject(id, user, note, ipAddress) {
@@ -279,6 +299,166 @@ class BillService {
     bill.paidAmount = bill.totalAmount;
     bill.remainingBalance = 0;
     return this._applyStateChange(bill, BILL_STATES.PAID, user, { ipAddress });
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Phase 3.2 — 3-Way Match
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Run the 3-way match engine for a bill and persist the result.
+   * Safe to call multiple times (idempotent — updates matchResult in-place).
+   *
+   * @param {string} id          — Bill _id
+   * @param {string} businessId
+   * @param {Object} toleranceCfg — optional tolerance overrides
+   * @returns {Promise<{ status, matchResult, bill }>}
+   */
+  async runMatch(id, businessId, toleranceCfg = {}) {
+    if (!mongoose.Types.ObjectId.isValid(id)) throw new ApiError(400, 'Invalid bill id');
+    return billMatchingService.runFullMatch(id, businessId, toleranceCfg);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Phase 3.2 — AP Liability Journal
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Post the Accounts-Payable liability journal entry when a bill is approved.
+   *
+   * Accounting entry:
+   *   DR  Purchases / Inventory / Expense  (primary expense account from line items)
+   *   CR  Accounts Payable                 (code 2100)
+   *
+   * If the bill has a taxAmount, a second entry is created:
+   *   DR  Input Tax Receivable             (code 1170 — created by tax engine if enabled)
+   *   CR  Accounts Payable
+   *
+   * Both entries are tagged transactionSource:'system_generated' so they
+   * appear separately from manual journals in the audit trail.
+   *
+   * @param {Object} bill       — Mongoose Bill document (already saved, approved state)
+   * @param {Object} user
+   * @param {string} ipAddress
+   * @returns {Promise<Object|null>}  The primary JournalEntry, or null if skipped
+   */
+  async postApLiabilityJournal(bill, user, ipAddress) {
+    // Skip if a JE was already created (idempotent guard)
+    if (bill.apLiabilityJournalId || bill.linkedJournalEntryId) {
+      logger.debug(`[bill] skipping AP journal for ${bill.billNumber} — JE already exists`);
+      return null;
+    }
+
+    const r2 = (v) => Math.round((Number(v) || 0) * 100) / 100;
+    const businessId = bill.businessId;
+
+    // ── Find Accounts Payable account (code 2100) ────────────────────────────
+    const apAccount = await ChartOfAccount.findOne({
+      businessId,
+      accountCode: '2100',
+    }).lean();
+
+    if (!apAccount) {
+      logger.warn(`[bill] AP journal skipped for ${bill.billNumber} — Accounts Payable account (2100) not found`);
+      return null;
+    }
+
+    // ── Find the primary debit account ───────────────────────────────────────
+    // Priority: first accountId on a line item → purchases account (5100) → fallback
+    let debitAccountId = null;
+
+    if (bill.lineItems && bill.lineItems.length > 0) {
+      const firstWithAccount = bill.lineItems.find((li) => li.accountId);
+      if (firstWithAccount) debitAccountId = firstWithAccount.accountId;
+    }
+
+    if (!debitAccountId) {
+      // Try standard purchases account (5100 — Purchases / Cost of Goods Sold)
+      const purchasesAcc = await ChartOfAccount.findOne({
+        businessId,
+        accountCode: { $in: ['5100', '5000', '6100'] },
+      }).lean();
+      if (purchasesAcc) debitAccountId = purchasesAcc._id;
+    }
+
+    if (!debitAccountId) {
+      logger.warn(`[bill] AP journal skipped for ${bill.billNumber} — no debit account found`);
+      return null;
+    }
+
+    // Ensure debit ≠ credit
+    if (debitAccountId.toString() === apAccount._id.toString()) {
+      logger.warn(`[bill] AP journal skipped — debit and credit are the same account`);
+      return null;
+    }
+
+    const netAmount = r2(bill.amount || (bill.totalAmount - (bill.taxAmount || 0)));
+
+    // ── Primary JE: DR Expense / Inventory, CR Accounts Payable ─────────────
+    let primaryJe = null;
+    try {
+      primaryJe = await JournalEntry.create({
+        businessId,
+        transactionDate:  bill.issueDate,
+        description:      `AP Liability — ${bill.billNumber}${bill.vendorSnapshot?.vendorName ? ' (' + bill.vendorSnapshot.vendorName + ')' : ''}`,
+        transactionType:  TRANSACTION_TYPES.CREDIT_PURCHASE,
+        amount:           netAmount > 0 ? netAmount : r2(bill.totalAmount),
+        debitAccountId:   debitAccountId,
+        creditAccountId:  apAccount._id,
+        status:           JOURNAL_STATUS.POSTED,
+        transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+        invoiceNumber:    bill.billNumber,
+        vendorId:         bill.vendorId || null,
+        currencyCode:     bill.currencyCode || 'PKR',
+        exchangeRate:     bill.exchangeRate || 1,
+        createdBy:        user._id,
+        lastModifiedBy:   user._id,
+      });
+    } catch (e) {
+      logger.error(`[bill] failed to create AP liability JE for ${bill.billNumber}: ${e.message}`);
+      return null;
+    }
+
+    // ── Update bill with the journal reference ────────────────────────────────
+    bill.apLiabilityJournalId = primaryJe._id;
+    // Also set linkedJournalEntryId if not already set
+    if (!bill.linkedJournalEntryId) bill.linkedJournalEntryId = primaryJe._id;
+    await bill.save();
+
+    // ── Tax JE: DR Input Tax Receivable, CR Accounts Payable ─────────────────
+    const taxAmount = r2(bill.taxAmount || 0);
+    if (taxAmount > 0) {
+      const inputTaxAcc = await ChartOfAccount.findOne({
+        businessId,
+        accountCode: { $in: ['1170', '1171', '1172'] },
+      }).lean();
+
+      if (inputTaxAcc && inputTaxAcc._id.toString() !== apAccount._id.toString()) {
+        try {
+          await JournalEntry.create({
+            businessId,
+            transactionDate:  bill.issueDate,
+            description:      `AP Input Tax — ${bill.billNumber}`,
+            transactionType:  TRANSACTION_TYPES.CREDIT_PURCHASE,
+            amount:           taxAmount,
+            debitAccountId:   inputTaxAcc._id,
+            creditAccountId:  apAccount._id,
+            status:           JOURNAL_STATUS.POSTED,
+            transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+            invoiceNumber:    bill.billNumber,
+            vendorId:         bill.vendorId || null,
+            currencyCode:     bill.currencyCode || 'PKR',
+            exchangeRate:     bill.exchangeRate || 1,
+            createdBy:        user._id,
+            lastModifiedBy:   user._id,
+          });
+        } catch (e) {
+          logger.warn(`[bill] tax JE failed for ${bill.billNumber}: ${e.message}`);
+        }
+      }
+    }
+
+    return primaryJe;
   }
 
   async transitionState(id, toState, user, { reason = null, ipAddress = null } = {}) {

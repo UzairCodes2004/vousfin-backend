@@ -141,15 +141,48 @@ const billSchema = new mongoose.Schema(
     // One or more GRNs whose received lines this bill covers (partial deliveries)
     linkedGrnIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'GoodsReceipt' }],
 
-    // 3-way match result: auto-computed when both PO and GRN are linked
-    //   none         — no PO/GRN linked, cannot perform match
-    //   pending      — PO/GRN linked but match hasn't been run yet
-    //   matched      — bill amounts align with PO + GRN within tolerance
-    //   discrepancy  — amounts differ; manual review required before approval
+    // 3-way match result: auto-computed when both PO and GRN are linked.
+    // Phase 3.2 extended enum — 'discrepancy' kept as legacy alias.
     threeWayMatchStatus: {
       type: String,
-      enum: ['none', 'pending', 'matched', 'discrepancy'],
+      enum: [
+        'none', 'pending', 'matched', 'partial_match',
+        'over_billed', 'under_received', 'mismatch', 'blocked',
+        'discrepancy', // legacy
+      ],
       default: 'none',
+      index: true,
+    },
+
+    // Phase 3.2 — Structured match result stored after running the engine
+    matchResult: {
+      ranAt:            { type: Date, default: null },
+      toleranceConfig:  { type: mongoose.Schema.Types.Mixed, default: null },
+      poMatch: {
+        status:         { type: String, default: null },
+        lineVariances:  { type: [mongoose.Schema.Types.Mixed], default: [] },
+        overallStatus:  { type: String, default: null },
+      },
+      grnMatch: {
+        status:         { type: String, default: null },
+        totalBilled:    { type: Number, default: null },
+        totalReceived:  { type: Number, default: null },
+        variance:       { type: Number, default: null },
+        variancePct:    { type: Number, default: null },
+      },
+      duplicateCheck: {
+        isDuplicate:    { type: Boolean, default: false },
+        conflictingBillId: { type: mongoose.Schema.Types.ObjectId, ref: 'Bill', default: null },
+        conflictingBillNumber: { type: String, default: null },
+      },
+      summary:          { type: String, default: null },
+    },
+
+    // Phase 3.2 — AP liability journal entry auto-created on bill approval
+    apLiabilityJournalId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'JournalEntry',
+      default: null,
       index: true,
     },
 
