@@ -40,7 +40,9 @@ const customerFiltersSchema = Joi.object({
   search: Joi.string().max(100).allow('', null).optional(),
   isActive: Joi.boolean().optional(),
   page: Joi.number().integer().min(1).default(1),
-  limit: Joi.number().integer().min(1).max(100).default(25),
+  // Cap at 500 so the editor dropdowns (which fetch limit=200 to populate
+  // selects without forcing pagination) work without 400 ValidationErrors.
+  limit: Joi.number().integer().min(1).max(500).default(25),
   sortBy: Joi.string().valid('fullName', 'currentReceivableBalance', 'createdAt').default('fullName'),
   sortOrder: Joi.number().valid(1, -1).default(1),
 });

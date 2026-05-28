@@ -53,7 +53,8 @@ const vendorFiltersSchema = Joi.object({
   search: Joi.string().max(100).allow('', null).optional(),
   isActive: Joi.boolean().optional(),
   page: Joi.number().integer().min(1).default(1),
-  limit: Joi.number().integer().min(1).max(100).default(25),
+  // Cap at 500 so editor dropdowns (limit=200) work without 400 errors.
+  limit: Joi.number().integer().min(1).max(500).default(25),
   sortBy: Joi.string().valid('vendorName', 'currentPayableBalance', 'createdAt').default('vendorName'),
   sortOrder: Joi.number().valid(1, -1).default(1),
 });
