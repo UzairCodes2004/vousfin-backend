@@ -18,6 +18,9 @@ router.get('/',  billController.list);
 router.get('/:id',          billController.getById);
 router.get('/:id/timeline', billController.getTimeline);
 
+// Phase 2: Update draft
+router.put('/:id', billController.updateDraft);
+
 // Approval workflow
 router.post('/:id/submit',  billController.submitForApproval);
 router.post('/:id/approve', billController.approve);

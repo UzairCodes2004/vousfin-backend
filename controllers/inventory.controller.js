@@ -64,13 +64,22 @@ exports.getInventoryValuation = async (req, res, next) => {
 
 exports.addStock = async (req, res, next) => {
   try {
-    const { qty, costPerUnit } = req.body;
+    const { qty, costPerUnit, paymentMode, sourceAccountId, vendorId, notes, transactionDate } = req.body;
     if (!qty || qty <= 0) return next({ status: 400, message: 'qty must be positive' });
-    const item = await inventoryService.addStock(
+    const result = await inventoryService.addStock(
       req.user.businessId, req.params.id,
-      Number(qty), Number(costPerUnit || 0)
+      Number(qty), Number(costPerUnit || 0),
+      {
+        paymentMode,
+        sourceAccountId,
+        vendorId,
+        notes,
+        transactionDate,
+        userId:    req.user.id,
+        ipAddress: req.ip,
+      }
     );
-    ApiResponse.success(res, item, `Added ${qty} units to stock`);
+    ApiResponse.success(res, result, `Added ${qty} units to stock`);
   } catch (e) { next(e); }
 };
 

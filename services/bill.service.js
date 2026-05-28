@@ -85,15 +85,20 @@ class BillService {
   // ───────────────────────────────────────────────────────────────────────────
 
   async createDraft(data, user, ipAddress) {
-    if (!data.businessId || !data.amount || !data.billNumber || !data.issueDate) {
-      throw new ApiError(400, 'createDraft requires: businessId, billNumber, amount, issueDate');
+    const hasLines = Array.isArray(data.lineItems) && data.lineItems.length > 0;
+    if (!data.businessId || !data.billNumber || !data.issueDate) {
+      throw new ApiError(400, 'createDraft requires: businessId, billNumber, issueDate');
     }
-    if (data.amount <= 0) {
-      throw new ApiError(400, 'Bill amount must be greater than zero');
+    if (!hasLines && (!data.amount || data.amount <= 0)) {
+      throw new ApiError(400, 'Bill amount must be greater than zero (or provide lineItems)');
     }
 
     const snap = await this._vendorSnapshot(data.businessId, data.vendorId);
-    const approvalRequired = this._requiresApproval(data.amount, data.businessConfig);
+
+    const estimateAmount = data.amount || (hasLines
+      ? data.lineItems.reduce((s, li) => s + (li.quantity || 0) * (li.unitPrice || 0), 0)
+      : 0);
+    const approvalRequired = this._requiresApproval(estimateAmount, data.businessConfig);
 
     const bill = new Bill({
       businessId:           data.businessId,
@@ -102,10 +107,20 @@ class BillService {
       linkedJournalEntryId: data.linkedJournalEntryId || null,
       vendorId:             data.vendorId || null,
       vendorSnapshot:       Object.keys(snap).length ? snap : data.vendorSnapshot || {},
-      amount:               data.amount,
+
+      lineItems:            hasLines ? data.lineItems : [],
+      amount:               hasLines ? 0.01 : data.amount,
       taxAmount:            data.taxAmount || 0,
       whtAmount:            data.whtAmount || 0,
       currencyCode:         data.currencyCode || 'PKR',
+
+      invoiceDiscountType:  data.invoiceDiscountType || null,
+      invoiceDiscountValue: data.invoiceDiscountValue || 0,
+      shippingCharges:      data.shippingCharges || 0,
+      roundingAdjustment:   data.roundingAdjustment || 0,
+      exchangeRate:         data.exchangeRate || 1,
+      attachments:          data.attachments || [],
+
       issueDate:            data.issueDate,
       dueDate:              data.dueDate || null,
       state:                BILL_STATES.DRAFT,
@@ -207,6 +222,56 @@ class BillService {
   async cancel(id, user, reason, ipAddress) {
     const bill = await this._loadOrThrow(id);
     return this._applyStateChange(bill, BILL_STATES.CANCELLED, user, { reason, ipAddress });
+  }
+
+  /**
+   * Phase 2 — update a draft bill (only drafts can be edited).
+   */
+  async updateDraft(id, data, user, ipAddress) {
+    const bill = await this._loadOrThrow(id);
+    if (bill.state !== BILL_STATES.DRAFT) {
+      throw new ApiError(409, 'Only draft bills can be edited');
+    }
+    const editable = [
+      'billNumber', 'vendorReferenceNumber', 'vendorId', 'lineItems', 'amount', 'taxAmount',
+      'whtAmount', 'currencyCode', 'invoiceDiscountType', 'invoiceDiscountValue',
+      'shippingCharges', 'roundingAdjustment', 'issueDate', 'dueDate',
+      'description', 'notes', 'tags', 'attachments',
+    ];
+    for (const field of editable) {
+      if (data[field] !== undefined) {
+        const before = bill[field];
+        bill[field] = data[field];
+        if (!['lineItems', 'attachments', 'tags'].includes(field)) {
+          bill.recordFieldChange(field, before, data[field], user._id);
+        }
+      }
+    }
+    if (data.vendorId && String(data.vendorId) !== String(bill.vendorId)) {
+      bill.vendorSnapshot = await this._vendorSnapshot(bill.businessId, data.vendorId);
+    }
+    const hasLines = bill.lineItems && bill.lineItems.length > 0;
+    const estimateAmount = hasLines
+      ? bill.lineItems.reduce((s, li) => s + (li.quantity || 0) * (li.unitPrice || 0), 0)
+      : bill.amount;
+    bill.approvalRequired = this._requiresApproval(estimateAmount, data.businessConfig);
+    bill.approvalStatus = bill.approvalRequired ? APPROVAL_STATUS.PENDING : APPROVAL_STATUS.NOT_REQUIRED;
+    bill.lastModifiedBy = user._id;
+    await bill.save();
+    try {
+      await auditService.log({
+        businessId:      bill.businessId,
+        entityType:      ENTITY_TYPES.BILL,
+        entityId:        bill._id,
+        action:          AUDIT_ACTIONS.EDITED,
+        performedBy:     user._id,
+        performedByName: user.fullName || user.email || 'Unknown',
+        ipAddress,
+      });
+    } catch (e) {
+      logger.warn(`[bill] audit log (updateDraft) failed: ${e.message}`);
+    }
+    return bill;
   }
 
   async markPaid(id, user, ipAddress) {

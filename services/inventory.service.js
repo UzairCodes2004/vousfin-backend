@@ -46,32 +46,164 @@ class InventoryService {
 
   /**
    * Add stock to an item (weighted-average cost update).
-   * Called when recording an Inventory Purchase.
-   * @returns {Promise<Object>} Updated item
+   *
+   * Optionally posts an Inventory Purchase journal entry so the books reflect
+   * how the stock was funded (cash, bank, payables, loan, etc.).
+   *
+   * @param {string} businessId
+   * @param {string} itemId
+   * @param {number} qty
+   * @param {number} costPerUnit
+   * @param {Object} [opts]
+   * @param {string} [opts.paymentMode]      'cash' | 'bank' | 'credit' (AP) | 'loan'
+   * @param {string} [opts.sourceAccountId]  Cash/Bank/Loan account to credit (required for cash/bank/loan)
+   * @param {string} [opts.vendorId]         Vendor for AP posting (required for credit mode)
+   * @param {string} [opts.userId]           Acting user id (for journal createdBy)
+   * @param {string} [opts.ipAddress]
+   * @param {Date}   [opts.transactionDate]  defaults to now
+   * @param {string} [opts.notes]
+   * @returns {Promise<{ item: Object, journalEntry: Object | null }>}
    */
-  async addStock(businessId, itemId, qty, costPerUnit) {
-    const item = await inventoryItemRepository.model.findOne({
-      _id: itemId, businessId,
-    });
+  async addStock(businessId, itemId, qty, costPerUnit, opts = {}) {
+    const item = await inventoryItemRepository.model.findOne({ _id: itemId, businessId });
     if (!item) throw new ApiError(404, 'Inventory item not found');
+
+    let journalEntry = null;
+
+    // ── Post an Inventory Purchase journal entry if paymentMode is provided ──
+    if (opts.paymentMode) {
+      const ChartOfAccount = require('../models/ChartOfAccount.model');
+      const { TRANSACTION_TYPES, TRANSACTION_MODES, INPUT_METHODS } = require('../config/constants');
+
+      // Resolve the Inventory account (debit side)
+      const inventoryAcct = await ChartOfAccount.findOne({
+        businessId,
+        accountName: { $regex: /^inventory$/i },
+      }).lean();
+      if (!inventoryAcct) {
+        throw new ApiError(400, 'Inventory account missing from chart of accounts — cannot post journal entry');
+      }
+
+      // Resolve the credit-side account based on paymentMode
+      let creditAccountId = opts.sourceAccountId;
+      let transactionMode = TRANSACTION_MODES.CASH;
+      let vendorId = null;
+
+      if (opts.paymentMode === 'credit') {
+        // AP — credit the Accounts Payable account, set vendor reference
+        const apAcct = await ChartOfAccount.findOne({
+          businessId,
+          accountName: { $regex: /accounts payable/i },
+        }).lean();
+        if (!apAcct) throw new ApiError(400, 'Accounts Payable account not found');
+        creditAccountId = apAcct._id;
+        transactionMode = TRANSACTION_MODES.CREDIT;
+        vendorId = opts.vendorId || item.preferredVendorId || null;
+        if (!vendorId) throw new ApiError(400, 'vendorId required for credit purchase');
+      } else if (!creditAccountId) {
+        throw new ApiError(400, `sourceAccountId required for paymentMode="${opts.paymentMode}"`);
+      }
+
+      const totalCost = Math.round(qty * costPerUnit * 100) / 100;
+      const transactionService = require('./transaction.service');
+
+      const jeData = {
+        businessId,
+        transactionDate: opts.transactionDate || new Date(),
+        description: `Stock purchase: ${qty} ${item.unit || 'units'} of ${item.name}`,
+        transactionType: TRANSACTION_TYPES.INVENTORY_PURCHASE,
+        amount: totalCost,
+        debitAccountId: inventoryAcct._id,
+        creditAccountId,
+        transactionMode,
+        vendorId,
+        inventoryItemId: item._id,
+        inventoryQty: qty,
+        inputMethod: INPUT_METHODS.FORM,
+        notes: opts.notes || null,
+      };
+
+      // transaction.service handles auditing, AR/AP balance tracking, etc.
+      // It expects (data, userId, ipAddress)
+      journalEntry = await transactionService.createTransaction(
+        jeData,
+        opts.userId || null,
+        opts.ipAddress || null
+      );
+      // The journal entry post path may or may not call addStock itself; check
+      // current implementation — if it already adds stock, skip the manual call.
+      // Otherwise we add stock here.
+      // The current transaction.service does NOT call addStock for INVENTORY_PURCHASE,
+      // so we still need to do it manually below.
+    }
+
     await item.addStock(qty, costPerUnit);
     logger.info(`Stock added: ${qty} units of "${item.name}" (new stock: ${item.currentStock})`);
-    return item;
+    return { item, journalEntry };
   }
 
   /**
    * Reduce stock and return COGS amount.
    * Called by transaction.service when recording an Inventory Sale.
+   *
+   * Side effect: if stock crosses the reorder threshold AFTER this reduction,
+   * fire an automated reorder email to the item's preferredVendorId.
+   *
    * @returns {{ cogsAmount: number, unitCostUsed: number, updatedStock: number }}
    */
   async reduceStock(businessId, itemId, qty) {
-    const item = await inventoryItemRepository.model.findOne({
-      _id: itemId, businessId,
-    });
+    const item = await inventoryItemRepository.model.findOne({ _id: itemId, businessId });
     if (!item) throw new ApiError(404, 'Inventory item not found');
+
+    const stockBefore = item.currentStock;
     const { cogsAmount, unitCostUsed } = await item.reduceStock(qty);
     logger.info(`Stock reduced: ${qty} units of "${item.name}" → COGS ${cogsAmount}, remaining ${item.currentStock}`);
+
+    // Reorder trigger: only fire when we just crossed the threshold (not on every sale)
+    const justCrossed = stockBefore > item.reorderLevel && item.currentStock <= item.reorderLevel;
+    if (justCrossed && item.reorderLevel > 0) {
+      // Fire-and-forget — never block the sale on email
+      this._fireReorderEmail(item, businessId).catch(err =>
+        logger.error(`[reorder] Hook failed: ${err.message}`)
+      );
+    }
+
     return { cogsAmount, unitCostUsed, updatedStock: item.currentStock, itemName: item.name };
+  }
+
+  /**
+   * Internal — resolve vendor + business details and dispatch the reorder email.
+   * Lazy-requires to avoid circular deps and keep email infra optional.
+   */
+  async _fireReorderEmail(item, businessId) {
+    if (!item.preferredVendorId) {
+      logger.info(`[reorder] No preferredVendorId set for "${item.name}" — skipping email`);
+      return;
+    }
+    const Vendor = require('../models/Vendor.model');
+    const Business = require('../models/Business.model');
+    const { sendReorderRequestEmail } = require('../utils/email.utils');
+
+    const [vendor, business] = await Promise.all([
+      Vendor.findById(item.preferredVendorId).lean(),
+      Business.findById(businessId).select('businessName email').lean(),
+    ]);
+    if (!vendor) {
+      logger.warn(`[reorder] Vendor ${item.preferredVendorId} not found for item "${item.name}"`);
+      return;
+    }
+    await sendReorderRequestEmail({
+      to:            vendor.email,
+      vendorName:    vendor.businessName || vendor.fullName,
+      itemName:      item.name,
+      sku:           item.sku,
+      currentStock:  item.currentStock,
+      reorderLevel:  item.reorderLevel,
+      reorderQty:    item.reorderQty,
+      unit:          item.unit,
+      businessName:  business?.businessName || 'vousFin Business',
+      businessEmail: business?.email,
+    });
   }
 
   async getLowStockAlerts(businessId) {

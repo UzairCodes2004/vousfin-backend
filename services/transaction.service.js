@@ -380,11 +380,23 @@ class TransactionService {
       }
     }
 
-    // 7. Inventory Sale — auto-generate COGS journal lines
-    // When caller provides inventoryItemId + inventoryQty, reduce stock and append
-    // DR Cost of Goods Sold / CR Inventory lines to the compound entry.
+    // 7. Inventory-touching sale — auto-generate COGS journal lines
+    //
+    // When caller provides inventoryItemId + inventoryQty, reduce stock and
+    // append DR Cost of Goods Sold / CR Inventory lines to the compound entry.
+    //
+    // PHASE 2.1 fix — previously only INVENTORY_SALE triggered this. Users
+    // commonly record a sale as CASH_SALE / CREDIT_SALE / INCOME with an
+    // inventory item attached — those must also decrement stock and post COGS,
+    // otherwise the inventory drifts away from the ledger.
+    const SALE_TYPES_TRIGGERING_COGS = new Set([
+      TRANSACTION_TYPES.INVENTORY_SALE,
+      TRANSACTION_TYPES.CASH_SALE,
+      TRANSACTION_TYPES.CREDIT_SALE,
+      TRANSACTION_TYPES.INCOME,
+    ]);
     if (
-      entryData.transactionType === TRANSACTION_TYPES.INVENTORY_SALE &&
+      SALE_TYPES_TRIGGERING_COGS.has(entryData.transactionType) &&
       data.inventoryItemId &&
       data.inventoryQty > 0
     ) {
@@ -414,8 +426,10 @@ class TransactionService {
 
       if (cogsAcct && inventoryAcct) {
         const cogsAmount = Math.round(data.inventoryQty * item.unitCostPrice * 100) / 100;
-        // Reduce stock
-        await item.reduceStock(data.inventoryQty);
+        // Reduce stock via inventoryService so reorder-email side-effect fires
+        // when the item crosses its reorder threshold.
+        const inventoryService = require('./inventory.service');
+        await inventoryService.reduceStock(data.businessId, item._id, data.inventoryQty);
 
         // Build compound journal lines if not already provided
         if (!entryData.journalLines || entryData.journalLines.length === 0) {

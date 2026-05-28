@@ -25,6 +25,19 @@ exports.createDraft = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
+// Phase 2: Update draft
+exports.updateDraft = async (req, res, next) => {
+  try {
+    const bill = await billService.updateDraft(
+      req.params.id,
+      { ...req.body, businessId: req.user.businessId },
+      actor(req),
+      req.ip
+    );
+    ApiResponse.success(res, bill, 'Bill draft updated');
+  } catch (err) { next(err); }
+};
+
 exports.list = async (req, res, next) => {
   try {
     const filters = {
