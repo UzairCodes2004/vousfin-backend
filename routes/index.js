@@ -23,6 +23,10 @@ const creditNoteRoutes    = require('./v1/creditNote.routes');    // Phase 2 —
 const purchaseOrderRoutes = require('./v1/purchaseOrder.routes'); // Phase 3.1 — Procurement
 const goodsReceiptRoutes  = require('./v1/goodsReceipt.routes');  // Phase 3.1 — Procurement
 const vendorCreditRoutes  = require('./v1/vendorCredit.routes');  // Phase 3.1 — Procurement
+const billDocumentRoutes  = require('./v1/billDocument.routes');  // Phase 3.3 — Document Management
+const billScheduleRoutes  = require('./v1/billSchedule.routes');  // Phase 3.3 — Scheduling
+const vendorRiskRoutes    = require('./v1/vendorRisk.routes');    // Phase 3.3 — Risk Engine
+const expenseAllocationRoutes = require('./v1/expenseAllocation.routes'); // Phase 3.3 — Allocation
 
 // Mount v1 routes under /api/v1
 router.use('/auth', authRoutes);
@@ -45,6 +49,10 @@ router.use('/credit-notes',    creditNoteRoutes);    // Phase 2 — Credit/Debit
 router.use('/purchase-orders', purchaseOrderRoutes); // Phase 3.1 — Procurement
 router.use('/goods-receipts',  goodsReceiptRoutes);  // Phase 3.1 — Procurement
 router.use('/vendor-credits',  vendorCreditRoutes);  // Phase 3.1 — Procurement
+router.use('/bill-documents',   billDocumentRoutes);       // Phase 3.3 — Document Management
+router.use('/bill-schedules',   billScheduleRoutes);       // Phase 3.3 — Scheduling
+router.use('/vendor-risk',      vendorRiskRoutes);         // Phase 3.3 — Risk Engine
+router.use('/expense-allocation', expenseAllocationRoutes);// Phase 3.3 — Allocation
 
 // Health check endpoint (versioned)
 router.get('/health', (req, res) => {

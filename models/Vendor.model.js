@@ -73,6 +73,12 @@ const vendorSchema = new mongoose.Schema(
       default: true,
     },
 
+    // ── Phase 3.3 — Vendor Risk Engine ───────────────────────────────────────
+    riskScore:    { type: Number, default: null, min: 0, max: 100 },
+    riskLevel:    { type: String, enum: ['low', 'medium', 'high', 'critical', null], default: null },
+    riskUpdatedAt:{ type: Date, default: null },
+    riskFactors:  { type: mongoose.Schema.Types.Mixed, default: null },
+
     // ── Phase 5.4.4 — WHT Profile ────────────────────────────────────────────
     /**
      * Withholding Tax profile for this vendor.

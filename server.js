@@ -52,6 +52,36 @@ const startServer = async () => {
       logger.warn(`⚠️ Payment reminder job failed to schedule (non-fatal): ${err.message}`);
     }
 
+    // Step 3c: Schedule AP automation jobs (Phase 3.3)
+    try {
+      const cron = require('node-cron');
+      const billSchedulerService = require('./services/billScheduler.service');
+
+      // Daily at 06:00 — generate bills from recurring schedules
+      cron.schedule('0 6 * * *', async () => {
+        try {
+          const ids = await billSchedulerService.generateDueBills();
+          if (ids.length) logger.info(`[cron] Generated ${ids.length} recurring bills`);
+        } catch (err) {
+          logger.error(`[cron] generateDueBills error: ${err.message}`);
+        }
+      });
+
+      // Daily at 07:00 — update bill reminder states
+      cron.schedule('0 7 * * *', async () => {
+        try {
+          const r = await billSchedulerService.updateReminderStates();
+          logger.info(`[cron] Reminder states updated: ${r.updated}/${r.total}`);
+        } catch (err) {
+          logger.error(`[cron] updateReminderStates error: ${err.message}`);
+        }
+      });
+
+      logger.info('⏰ AP automation jobs scheduled (recurring bills + reminders)');
+    } catch (err) {
+      logger.warn(`⚠️ AP automation jobs failed to schedule (non-fatal): ${err.message}`);
+    }
+
     try {
       initForecastingData();
       logger.info('✅ ML forecasting data loaded');

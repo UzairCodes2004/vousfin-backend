@@ -754,6 +754,98 @@ module.exports = {
   EMAIL_VERIFICATION_TOKEN_EXPIRY_HOURS: 24,
 
   // ===============================
+  // Phase 3.3 — Vendor Portal & AP Automation
+  // ===============================
+
+  /** Document types stored in BillDocument */
+  DOCUMENT_TYPES: {
+    PDF_INVOICE:    'pdf_invoice',
+    ATTACHMENT:     'attachment',
+    RECEIPT:        'receipt',
+    CONTRACT:       'contract',
+    PURCHASE_ORDER: 'purchase_order',
+    GOODS_RECEIPT:  'goods_receipt',
+    OTHER:          'other',
+  },
+
+  /** Document processing states (OCR pipeline) */
+  DOCUMENT_STATES: {
+    PENDING:     'pending',    // just uploaded, awaiting OCR
+    PROCESSING:  'processing', // OCR in progress
+    AVAILABLE:   'available',  // OCR done / ready
+    FAILED:      'failed',     // OCR failed, raw file still accessible
+  },
+
+  /** Bill reminder states — driven by dueDate proximity */
+  REMINDER_STATES: {
+    UPCOMING:         'upcoming',          // due in 1–7 days
+    DUE_TODAY:        'due_today',         // due today
+    OVERDUE:          'overdue',           // 1–30 days past due
+    CRITICAL_OVERDUE: 'critical_overdue',  // >30 days past due
+  },
+
+  /** Recurrence patterns for scheduled/recurring bills */
+  RECURRENCE_PATTERNS: {
+    WEEKLY:    'weekly',
+    BIWEEKLY:  'biweekly',
+    MONTHLY:   'monthly',
+    QUARTERLY: 'quarterly',
+    ANNUAL:    'annual',
+  },
+
+  /** Vendor risk levels */
+  VENDOR_RISK_LEVELS: {
+    LOW:      'low',      // score 0–25
+    MEDIUM:   'medium',   // score 26–50
+    HIGH:     'high',     // score 51–75
+    CRITICAL: 'critical', // score 76–100
+  },
+
+  /** Risk factor keys */
+  VENDOR_RISK_FACTORS: {
+    LATE_PAYMENT:      'late_payment',      // bills frequently paid late
+    DISPUTE_FREQUENCY: 'dispute_frequency', // many bills disputed
+    DUPLICATE_BILLING: 'duplicate_billing', // duplicate invoices detected
+    PRICE_ANOMALY:     'price_anomaly',     // unit prices vary abnormally
+    OVER_BILLING:      'over_billing',      // 3-way match blocked repeatedly
+  },
+
+  /** Cost-centre/dimension types for expense allocation */
+  COST_CENTER_TYPES: {
+    DEPARTMENT:  'department',
+    BRANCH:      'branch',
+    PROJECT:     'project',
+    COST_CENTER: 'cost_center',
+  },
+
+  /** Bill aging brackets (days past due) */
+  BILL_AGING_BRACKETS: {
+    CURRENT:   'current',   // not yet due
+    DAYS_1_30:  '1_30',    // 1–30 days overdue
+    DAYS_31_60: '31_60',   // 31–60 days overdue
+    DAYS_61_90: '61_90',   // 61–90 days overdue
+    DAYS_90_PLUS: '90_plus', // >90 days overdue
+  },
+
+  /** AP Kanban workflow stages */
+  AP_WORKFLOW_STAGES: {
+    INBOX:            'inbox',            // new / draft bills
+    UNDER_REVIEW:     'under_review',     // submitted, being checked
+    PENDING_APPROVAL: 'pending_approval', // awaiting approver
+    APPROVED:         'approved',         // approved, ready to pay
+    SCHEDULED:        'scheduled',        // payment date set
+    PAID:             'paid',             // fully paid
+    BLOCKED:          'blocked',          // match/duplicate issue
+  },
+
+  /** Allocation methods for expense splitting */
+  ALLOCATION_METHODS: {
+    EQUAL:      'equal',      // split equally across all lines
+    PERCENTAGE: 'percentage', // each line has explicit %
+    AMOUNT:     'amount',     // each line has explicit amount
+  },
+
+  // ===============================
   // HTTP Status Codes (optional)
   // ===============================
   HTTP_STATUS: {

@@ -276,6 +276,26 @@ const billSchema = new mongoose.Schema(
     notes:       { type: String, default: null, maxlength: 1000, trim: true },
     tags:        [{ type: String, trim: true }],
     metadata:    { type: mongoose.Schema.Types.Mixed, default: {} },
+
+    // ── Phase 3.3 — Document Management ──────────────────────────────────────
+    documentIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'BillDocument' }],
+
+    // ── Phase 3.3 — Bill Scheduling / Recurring ───────────────────────────────
+    isRecurring: { type: Boolean, default: false, index: true },
+    scheduleId:  { type: mongoose.Schema.Types.ObjectId, ref: 'BillSchedule', default: null, index: true },
+
+    // ── Phase 3.3 — Reminder State ────────────────────────────────────────────
+    reminderState: {
+      type: String,
+      enum: ['upcoming', 'due_today', 'overdue', 'critical_overdue', null],
+      default: null,
+      index: true,
+    },
+    reminderSentAt: { type: Date, default: null },
+
+    // ── Phase 3.3 — Expense Allocation ────────────────────────────────────────
+    // allocationId is set once an allocation record is created for this bill
+    allocationId: { type: mongoose.Schema.Types.ObjectId, ref: 'BillAllocation', default: null },
   },
   {
     timestamps: true,
