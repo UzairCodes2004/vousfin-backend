@@ -123,6 +123,63 @@ class AccountRepository extends BaseRepository {
   }
 
   /**
+   * Sync missing default accounts for an existing business.
+   *
+   * Compares the business's current accounts against DEFAULT_ACCOUNTS using
+   * accountCode as the canonical key.  Inserts any defaults that are absent
+   * without touching existing accounts (additive-only, never overwrites).
+   *
+   * Called automatically when GET /business/accounts is served so every
+   * business is silently kept up-to-date whenever DEFAULT_ACCOUNTS is expanded.
+   *
+   * @param {string} businessId
+   * @returns {Promise<{ inserted: number }>}
+   */
+  async syncMissingDefaults(businessId) {
+    const validBusinessId = sanitizeAndValidateId(businessId);
+
+    // Fetch only accountCode to minimise data transfer
+    const existing = await this.model
+      .find({ businessId: validBusinessId }, { accountCode: 1 })
+      .lean();
+
+    const existingCodes = new Set(
+      existing.map((a) => a.accountCode).filter(Boolean)
+    );
+
+    const missing = DEFAULT_ACCOUNTS.filter(
+      (acc) => acc.accountCode && !existingCodes.has(acc.accountCode)
+    );
+
+    if (missing.length === 0) return { inserted: 0 };
+
+    const toInsert = missing.map((acc) => ({
+      ...acc,
+      businessId: validBusinessId,
+      runningBalance: 0,
+    }));
+
+    try {
+      const result = await this.model.insertMany(toInsert, { ordered: false });
+      logger.info(
+        `Synced ${result.length} missing default accounts for business ${validBusinessId}`
+      );
+      return { inserted: result.length };
+    } catch (error) {
+      // E11000 duplicate key — another request beat us to it; safe to ignore
+      if (error.code === 11000 || error.name === 'BulkWriteError') {
+        const inserted = error.result?.nInserted ?? 0;
+        logger.info(
+          `Sync partial (race): ${inserted} accounts inserted for business ${validBusinessId}`
+        );
+        return { inserted };
+      }
+      logger.error('syncMissingDefaults failed:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Get total running balance for all accounts of a given type (e.g., total Assets).
    * Used in Balance Sheet generation.
    * @param {string} businessId

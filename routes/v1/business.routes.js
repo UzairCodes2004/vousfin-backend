@@ -21,6 +21,8 @@ router.put('/', validate(updateBusinessSchema), businessController.updateBusines
 
 // Chart of accounts routes (business must exist)
 router.get('/accounts', validate(listAccountsQuerySchema, 'query'), businessController.getAccounts);
+// Sync route MUST be defined before /:accountId to avoid path conflict
+router.post('/accounts/sync', businessController.syncAccounts);
 router.post('/accounts', validate(addCustomAccountSchema), businessController.addCustomAccount);
 router.put('/accounts/:accountId', validate(updateAccountSchema), businessController.updateAccount);
 

@@ -26,10 +26,45 @@ module.exports = {
   // Business Constants
   // ===============================
   BUSINESS_TYPES: [
+    // ── Legal Entity Types (original — kept for backward compatibility) ────────
     'Sole Proprietorship',
     'Partnership',
     'Private Limited',
     'Freelancer',
+    // ── Legal Entity Types (expanded) ─────────────────────────────────────────
+    'Private Limited Company',
+    'Public Limited Company',
+    'Non-Profit / NGO',
+    'Cooperative Society',
+    'Branch Office',
+    'Freelancer / Self-Employed',
+    // ── Technology & Digital ──────────────────────────────────────────────────
+    'IT Services / Software Development',
+    'SaaS / Software Product',
+    'Digital Agency / Marketing',
+    'E-commerce / Online Retail',
+    // ── Trade & Commerce ──────────────────────────────────────────────────────
+    'Retail Store',
+    'Wholesale / Distribution',
+    'Import & Export',
+    // ── Professional Services ─────────────────────────────────────────────────
+    'Consulting / Advisory',
+    'Accounting / Audit Firm',
+    'Law Firm / Legal Services',
+    'Healthcare / Medical Practice',
+    'Education & Training',
+    // ── Production & Industry ─────────────────────────────────────────────────
+    'Manufacturing',
+    'Construction / Contracting',
+    'Agriculture / Farming',
+    // ── Hospitality & Food ────────────────────────────────────────────────────
+    'Restaurant / Food Service',
+    'Hotel & Hospitality',
+    // ── Other ─────────────────────────────────────────────────────────────────
+    'Logistics & Transportation',
+    'Real Estate',
+    'Media & Entertainment',
+    'Other',
   ],
 
   DEFAULT_CURRENCY: 'PKR',

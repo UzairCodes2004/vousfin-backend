@@ -71,6 +71,10 @@ const updateBusiness = async (req, res, next) => {
  *     dropdown opens don't re-fetch.
  * If a business eventually exceeds ~500 accounts, add client-side search
  * filtering rather than server-side pagination.
+ *
+ * AUTO-SYNC: Every call transparently syncs any DEFAULT_ACCOUNTS entries
+ * that are missing from this business (additive-only). This keeps all
+ * businesses consistent when DEFAULT_ACCOUNTS is expanded over time.
  */
 const getAccounts = async (req, res, next) => {
   try {
@@ -79,11 +83,43 @@ const getAccounts = async (req, res, next) => {
     if (!business) {
       throw new ApiError(404, 'Business profile not found');
     }
+
+    // Silently backfill any default accounts introduced after this business
+    // was created. Fire-and-forget: if sync fails, accounts are still returned.
+    accountRepository.syncMissingDefaults(business._id).catch(() => {});
+
     const { accountType } = req.query;
     // findByBusiness returns ALL accounts sorted by accountType → accountName.
     // No pagination — the full CoA is required for transaction form dropdowns.
     const accounts = await accountRepository.findByBusiness(business._id, accountType || null);
     ApiResponse.success(res, accounts, 'Chart of accounts retrieved');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Explicitly sync missing default accounts for the current business.
+ * POST /api/v1/business/accounts/sync
+ *
+ * Returns the number of accounts that were added.  Safe to call repeatedly;
+ * subsequent calls after a full sync will always return { inserted: 0 }.
+ */
+const syncAccounts = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const business = await businessService.getBusinessByUserId(userId);
+    if (!business) {
+      throw new ApiError(404, 'Business profile not found');
+    }
+    const result = await accountRepository.syncMissingDefaults(business._id);
+    ApiResponse.success(
+      res,
+      result,
+      result.inserted > 0
+        ? `Synced ${result.inserted} missing default accounts`
+        : 'Chart of accounts is already up to date'
+    );
   } catch (error) {
     next(error);
   }
@@ -158,6 +194,7 @@ module.exports = {
   getBusiness,
   updateBusiness,
   getAccounts,
+  syncAccounts,
   addCustomAccount,
   updateAccount,
 };
