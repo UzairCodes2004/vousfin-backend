@@ -1,6 +1,7 @@
 // services/audit.service.js
 const auditLogRepository = require('../repositories/auditLog.repository');
 const userRepository = require('../repositories/user.repository');
+const { businessEvents } = require('./businessEventEngine.service'); // ERP Step 9 — unified trail
 const { ApiError } = require('../utils/ApiError');
 const { AUDIT_ACTIONS, ENTITY_TYPES, USER_STATUS } = require('../config/constants');
 const logger = require('../config/logger');
@@ -212,6 +213,78 @@ class AuditService {
    */
   async getExportLogs(businessId, startDate, endDate) {
     return auditLogRepository.getExportLogs(businessId, startDate, endDate);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // ERP Step 9 — Cross-module unified activity timeline
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * One chronological feed that stitches together two sources of truth:
+   *   1. Durable AuditLog entries — the persisted who-did-what record of state
+   *      changes, creates, edits, deletes across EVERY module.
+   *   2. The live business-event history — the cross-module signal flow emitted
+   *      by the event engine (inventory moves, AR/AP balance changes, valuation
+   *      shifts, goods received, …) that may not each have a dedicated audit row.
+   *
+   * Both are normalized to a common shape and merged newest-first, optionally
+   * scoped to a single entity. Business-isolated throughout. (Rule 10)
+   *
+   * @param {string} businessId
+   * @param {Object} [opts]
+   * @param {string} [opts.entityType]  filter to one entity type
+   * @param {string} [opts.entityId]    filter to one entity (requires entityType for audit rows)
+   * @param {number} [opts.limit=50]
+   * @returns {Promise<{ items: Array, auditCount: number, eventCount: number }>}
+   */
+  async getActivityTimeline(businessId, { entityType, entityId, limit = 50 } = {}) {
+    const cap = Math.min(Math.max(Number(limit) || 50, 1), 200);
+
+    // 1. Durable audit log (entity-scoped when an entity is given)
+    const logsRes = entityType && entityId
+      ? await auditLogRepository.getForEntity(entityType, entityId, { page: 1, limit: cap })
+      : await auditLogRepository.getByBusiness(businessId, {}, { page: 1, limit: cap });
+
+    const auditItems = (logsRes.data || []).map((l) => ({
+      source:     'audit',
+      timestamp:  l.timestamp,
+      action:     l.action,
+      entityType: l.entityType,
+      entityId:   l.entityId != null ? String(l.entityId) : null,
+      actorName:  l.performedByName || l.performedBy?.fullName || 'System',
+      summary:    this._summarizeAudit(l),
+    }));
+
+    // 2. Live event history (in-memory ring buffer, business-scoped)
+    let eventRows = businessEvents.getHistory(businessId, cap);
+    if (entityType) eventRows = eventRows.filter((e) => e.entityType === entityType);
+    if (entityId)   eventRows = eventRows.filter((e) => String(e.entityId) === String(entityId));
+
+    const eventItems = eventRows.map((e) => ({
+      source:     'event',
+      timestamp:  e.occurredAt,
+      action:     e.eventName,
+      entityType: e.entityType || null,
+      entityId:   e.entityId != null ? String(e.entityId) : null,
+      actorName:  'system',
+      summary:    String(e.eventName || '').replace(/[._]/g, ' '),
+    }));
+
+    // 3. Merge → newest-first → cap
+    const items = [...auditItems, ...eventItems]
+      .filter((x) => x.timestamp)
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+      .slice(0, cap);
+
+    return { items, auditCount: auditItems.length, eventCount: eventItems.length };
+  }
+
+  /** Build a short human summary for an audit-log row. @private */
+  _summarizeAudit(l) {
+    const verb = String(l.action || 'changed').replace(/_/g, ' ');
+    const noun = String(l.entityType || 'record').replace(/_/g, ' ');
+    const toState = l.afterState?.state;
+    return toState ? `${verb} ${noun} → ${toState}` : `${verb} ${noun}`;
   }
 }
 

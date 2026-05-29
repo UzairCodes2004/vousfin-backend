@@ -28,6 +28,7 @@ const billScheduleRoutes  = require('./v1/billSchedule.routes');  // Phase 3.3 �
 const vendorRiskRoutes    = require('./v1/vendorRisk.routes');    // Phase 3.3 — Risk Engine
 const expenseAllocationRoutes = require('./v1/expenseAllocation.routes'); // Phase 3.3 — Allocation
 const procurementAnalyticsRoutes = require('./v1/procurementAnalytics.routes'); // Phase 3.4 — Analytics
+const auditRoutes = require('./v1/audit.routes'); // ERP Step 9 — unified audit trail
 
 // Mount v1 routes under /api/v1
 router.use('/auth', authRoutes);
@@ -55,6 +56,7 @@ router.use('/bill-schedules',   billScheduleRoutes);       // Phase 3.3 — Sche
 router.use('/vendor-risk',      vendorRiskRoutes);         // Phase 3.3 — Risk Engine
 router.use('/expense-allocation',    expenseAllocationRoutes);    // Phase 3.3 — Allocation
 router.use('/procurement-analytics', procurementAnalyticsRoutes); // Phase 3.4 — Analytics
+router.use('/audit',                 auditRoutes);                // ERP Step 9 — unified audit trail
 
 // Health check endpoint (versioned)
 router.get('/health', (req, res) => {
