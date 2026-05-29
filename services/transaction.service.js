@@ -12,6 +12,7 @@ const logger = require('../config/logger');
 const reportCache = require('../utils/reportCache');
 const fxService    = require('./fx.service');
 const taxEngine    = require('./taxEngine.service');   // Phase 5.4
+const { businessEvents, EVENTS } = require('./businessEventEngine.service'); // ERP refactor Step 2
 // Phase 5.1: Period lock model (inline require to avoid circular deps)
 
 class TransactionService {
@@ -517,6 +518,26 @@ class TransactionService {
     }
 
     logger.info(`Transaction created: ${transaction._id} by user ${userId}`);
+
+    // ── ERP refactor Step 2 — publish to the central event engine ───────────
+    // Fire-and-forget: subscribers (Steps 3–9: inventory valuation, AR/AP aging,
+    // dashboard/analytics cache warming, unified audit, forecasting feed) react
+    // downstream. Handler errors are isolated by the engine and can NEVER roll
+    // back or unbalance the ledger entry created above.
+    businessEvents.emit(EVENTS.TRANSACTION_CREATED, {
+      businessId:      data.businessId,
+      userId,
+      entityType:      'journal_entry',
+      entityId:        transaction._id,
+      transactionType: transaction.transactionType,
+      amount:          transaction.amount,
+      inventoryItemId: data.inventoryItemId || null,
+      inventoryQty:    data.inventoryQty || null,
+      customerId:      transaction.customerId || null,
+      vendorId:        transaction.vendorId || null,
+      after:           transaction.toObject ? transaction.toObject() : transaction,
+    });
+
     return transaction;
   }
 
