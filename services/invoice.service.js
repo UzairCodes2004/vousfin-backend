@@ -25,9 +25,13 @@
 
 const mongoose = require('mongoose');
 const Invoice = require('../models/Invoice.model');
+const ChartOfAccount = require('../models/ChartOfAccount.model');
 const customerRepository = require('../repositories/customer.repository');
 const auditService = require('./audit.service');
 const fxService = require('./fx.service');
+const partyBalanceService = require('./partyBalance.service');     // ERP Step 4 — centralized AR balance
+const { postBalancedJournal } = require('./ledgerPosting.service'); // ERP Step 4 — JE + running-balance sync
+const { businessEvents, EVENTS } = require('./businessEventEngine.service'); // ERP Step 4 — event broadcasts
 const { ApiError } = require('../utils/ApiError');
 const logger = require('../config/logger');
 const {
@@ -36,6 +40,9 @@ const {
   AUDIT_ACTIONS,
   ENTITY_TYPES,
   DEFAULT_APPROVAL_THRESHOLD,
+  TRANSACTION_TYPES,
+  TRANSACTION_SOURCES,
+  JOURNAL_STATUS,
 } = require('../config/constants');
 
 class InvoiceService {
@@ -310,7 +317,29 @@ class InvoiceService {
     invoice.approvalStatus = APPROVAL_STATUS.APPROVED;
     invoice.approvedBy = user._id;
     invoice.approvedAt = new Date();
-    return this._applyStateChange(invoice, INVOICE_STATES.APPROVED, user, { reason: note, ipAddress });
+    const approved = await this._applyStateChange(invoice, INVOICE_STATES.APPROVED, user, { reason: note, ipAddress });
+
+    // ── ERP Step 4: recognize AR in the ledger + on the customer balance ─────
+    // Previously approve() posted NO ledger entry (despite the header comment) and
+    // never moved the customer's receivable — so an approved invoice-first invoice
+    // was invisible to the GL and to AR aging. postArJournal closes that gap.
+    try {
+      await this.postArJournal(approved, user, ipAddress);
+    } catch (e) {
+      logger.warn(`[invoice] AR journal failed on approval for ${invoice.invoiceNumber}: ${e.message}`);
+    }
+
+    businessEvents.emit(EVENTS.INVOICE_APPROVED, {
+      businessId:    invoice.businessId.toString(),
+      userId:        user._id,
+      entityType:    ENTITY_TYPES.INVOICE,
+      entityId:      invoice._id,
+      invoiceNumber: invoice.invoiceNumber,
+      customerId:    invoice.customerId || null,
+      amount:        invoice.totalAmount,
+    });
+
+    return approved;
   }
 
   async reject(id, user, note, ipAddress) {
@@ -362,9 +391,42 @@ class InvoiceService {
 
   async markPaid(id, user, ipAddress) {
     const invoice = await this._loadOrThrow(id);
+    const outstanding = Math.round(
+      ((invoice.remainingBalance != null ? invoice.remainingBalance : invoice.totalAmount) || 0) * 100
+    ) / 100;
+
     invoice.paidAmount = invoice.totalAmount;
     invoice.remainingBalance = 0;
-    return this._applyStateChange(invoice, INVOICE_STATES.PAID, user, { ipAddress });
+    const paid = await this._applyStateChange(invoice, INVOICE_STATES.PAID, user, { ipAddress });
+
+    // ── ERP Step 4: settle the AR + customer balance ─────────────────────────
+    // Only for invoices that recognized their OWN AR (invoice-first flow,
+    // identified by arJournalId). Transaction-first invoices (synced from a
+    // journal entry) are settled via transaction.service, which owns that
+    // balance lifecycle — skipping them prevents a double-decrement. (Rules 4, 5)
+    if (invoice.arJournalId && invoice.customerId && outstanding > 0) {
+      try {
+        await this._postInvoiceSettlementJournal(invoice, outstanding, user);
+        await partyBalanceService.adjustReceivable(invoice.businessId, invoice.customerId, -outstanding, {
+          userId: user._id, reason: 'invoice_paid', entityType: ENTITY_TYPES.INVOICE, entityId: invoice._id,
+        });
+      } catch (e) {
+        logger.warn(`[invoice] settlement posting failed for ${invoice.invoiceNumber}: ${e.message}`);
+      }
+    }
+
+    // Broadcast regardless so downstream caches refresh on any payment path.
+    businessEvents.emit(EVENTS.INVOICE_PAID, {
+      businessId:    invoice.businessId.toString(),
+      userId:        user._id,
+      entityType:    ENTITY_TYPES.INVOICE,
+      entityId:      invoice._id,
+      invoiceNumber: invoice.invoiceNumber,
+      customerId:    invoice.customerId || null,
+      amount:        invoice.totalAmount,
+    });
+
+    return paid;
   }
 
   /** Generic state transition entry point (used by tests + admin tooling). */
@@ -394,6 +456,189 @@ class InvoiceService {
       logger.warn(`[invoice] audit logDelete failed: ${e.message}`);
     }
     return invoice;
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // ERP Step 4 — AR Recognition + Settlement Journals
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Post the Accounts-Receivable recognition journal when an invoice is approved.
+   *
+   * Accounting entry:
+   *   DR  Accounts Receivable  (1110)
+   *   CR  Sales / Revenue      (line-item account → 4110 → 4150/4120 fallback)
+   *
+   * If the invoice has output tax, a second entry is created:
+   *   DR  Accounts Receivable     (1110)
+   *   CR  GST / Output Tax Payable (2120)
+   *
+   * Both are tagged system_generated and posted via ledgerPosting so the
+   * Chart-of-Accounts running balances stay correct (GAAP trial balance). The
+   * customer's currentReceivableBalance is then incremented by exactly the
+   * amount debited to the AR control account — keeping "AR control == Σ customer
+   * balances" — and CUSTOMER_BALANCE_CHANGED is broadcast.
+   *
+   * Idempotent: skips if arJournalId or linkedJournalEntryId already set, so the
+   * transaction-first dual-write path (which sets linkedJournalEntryId) is never
+   * double-posted.
+   *
+   * @returns {Promise<Object|null>}  the primary JournalEntry, or null if skipped
+   */
+  async postArJournal(invoice, user, ipAddress) {
+    if (invoice.arJournalId || invoice.linkedJournalEntryId) {
+      logger.debug(`[invoice] skipping AR journal for ${invoice.invoiceNumber} — JE already exists`);
+      return null;
+    }
+
+    const r2 = (v) => Math.round((Number(v) || 0) * 100) / 100;
+    const businessId = invoice.businessId;
+
+    // ── AR control account (1110) ────────────────────────────────────────────
+    const arAccount = await ChartOfAccount.findOne({ businessId, accountCode: '1110' }).lean();
+    if (!arAccount) {
+      logger.warn(`[invoice] AR journal skipped for ${invoice.invoiceNumber} — Accounts Receivable (1110) not found`);
+      return null;
+    }
+
+    // ── Revenue (credit) account: line-item account → Sales (4110) → fallbacks ──
+    let revenueAccountId = null;
+    if (invoice.lineItems && invoice.lineItems.length > 0) {
+      const firstWithAccount = invoice.lineItems.find((li) => li.accountId);
+      if (firstWithAccount) revenueAccountId = firstWithAccount.accountId;
+    }
+    if (!revenueAccountId) {
+      const revenueAcc = await ChartOfAccount.findOne({
+        businessId,
+        accountCode: { $in: ['4110', '4150', '4120', '4100'] },
+      }).lean();
+      if (revenueAcc) revenueAccountId = revenueAcc._id;
+    }
+    if (!revenueAccountId) {
+      logger.warn(`[invoice] AR journal skipped for ${invoice.invoiceNumber} — no revenue account found`);
+      return null;
+    }
+    if (revenueAccountId.toString() === arAccount._id.toString()) {
+      logger.warn(`[invoice] AR journal skipped — debit and credit are the same account`);
+      return null;
+    }
+
+    const netAmount = r2(invoice.amount || (invoice.totalAmount - (invoice.taxAmount || 0)));
+    const primaryAmount = netAmount > 0 ? netAmount : r2(invoice.totalAmount);
+
+    // Running tally of what we debit to the AR control account — the customer's
+    // receivable is incremented by exactly this at the end. (Rule 5)
+    let arDebited = 0;
+    let primaryJe = null;
+    try {
+      primaryJe = await postBalancedJournal({
+        businessId,
+        transactionDate:   invoice.issueDate,
+        description:       `AR Recognition — ${invoice.invoiceNumber}${invoice.customerSnapshot?.fullName ? ' (' + invoice.customerSnapshot.fullName + ')' : ''}`,
+        transactionType:   TRANSACTION_TYPES.CREDIT_SALE,
+        amount:            primaryAmount,
+        debitAccountId:    arAccount._id,
+        creditAccountId:   revenueAccountId,
+        status:            JOURNAL_STATUS.POSTED,
+        transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+        invoiceNumber:     invoice.invoiceNumber,
+        customerId:        invoice.customerId || null,
+        currencyCode:      invoice.currencyCode || 'PKR',
+        exchangeRate:      invoice.exchangeRate || 1,
+        createdBy:         user._id,
+        lastModifiedBy:    user._id,
+      });
+      arDebited = r2(arDebited + primaryAmount);
+    } catch (e) {
+      logger.error(`[invoice] failed to create AR recognition JE for ${invoice.invoiceNumber}: ${e.message}`);
+      return null;
+    }
+
+    invoice.arJournalId = primaryJe._id;
+    if (!invoice.linkedJournalEntryId) invoice.linkedJournalEntryId = primaryJe._id;
+    await invoice.save();
+
+    // ── Output-tax JE: DR Accounts Receivable, CR GST/Output Tax Payable ─────
+    const taxAmount = r2(invoice.taxAmount || 0);
+    if (taxAmount > 0) {
+      const outputTaxAcc = await ChartOfAccount.findOne({
+        businessId,
+        accountCode: { $in: ['2120', '2125'] }, // GST Payable → WHT Payable fallback
+      }).lean();
+      if (outputTaxAcc && outputTaxAcc._id.toString() !== arAccount._id.toString()) {
+        try {
+          await postBalancedJournal({
+            businessId,
+            transactionDate:   invoice.issueDate,
+            description:       `AR Output Tax — ${invoice.invoiceNumber}`,
+            transactionType:   TRANSACTION_TYPES.CREDIT_SALE,
+            amount:            taxAmount,
+            debitAccountId:    arAccount._id,
+            creditAccountId:   outputTaxAcc._id,
+            status:            JOURNAL_STATUS.POSTED,
+            transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+            invoiceNumber:     invoice.invoiceNumber,
+            customerId:        invoice.customerId || null,
+            currencyCode:      invoice.currencyCode || 'PKR',
+            exchangeRate:      invoice.exchangeRate || 1,
+            createdBy:         user._id,
+            lastModifiedBy:    user._id,
+          });
+          arDebited = r2(arDebited + taxAmount);
+        } catch (e) {
+          logger.warn(`[invoice] output-tax JE failed for ${invoice.invoiceNumber}: ${e.message}`);
+        }
+      }
+    }
+
+    // ── Mirror the AR debit onto the customer's receivable balance ───────────
+    if (invoice.customerId && arDebited > 0) {
+      await partyBalanceService.adjustReceivable(businessId, invoice.customerId, arDebited, {
+        userId: user._id, reason: 'invoice_approved', entityType: ENTITY_TYPES.INVOICE, entityId: invoice._id,
+      });
+    }
+
+    return primaryJe;
+  }
+
+  /**
+   * ERP Step 4 — post the cash-settlement journal for an invoice payment.
+   *   DR  Cash / Bank (1010…)        — money arrives
+   *   CR  Accounts Receivable (1110) — clears the receivable
+   * Balanced + running-balance-synced via ledgerPosting. Returns null (logged)
+   * if the AR or a cash/bank account can't be resolved, rather than throwing.
+   * @private
+   */
+  async _postInvoiceSettlementJournal(invoice, amount, user) {
+    const businessId = invoice.businessId;
+    const arAccount = await ChartOfAccount.findOne({ businessId, accountCode: '1110' }).lean();
+    const cashAccount = await ChartOfAccount.findOne({
+      businessId,
+      accountCode: { $in: ['1010', '1020', '1040', '1030'] }, // Cash at Bank → on Hand → Savings → Petty
+    }).lean();
+    if (!arAccount || !cashAccount) {
+      logger.warn(`[invoice] settlement JE skipped for ${invoice.invoiceNumber} — AR (1110) or cash account missing`);
+      return null;
+    }
+    if (arAccount._id.toString() === cashAccount._id.toString()) return null;
+
+    return postBalancedJournal({
+      businessId,
+      transactionDate:   new Date(),
+      description:       `Invoice Payment — ${invoice.invoiceNumber}${invoice.customerSnapshot?.fullName ? ' (' + invoice.customerSnapshot.fullName + ')' : ''}`,
+      transactionType:   TRANSACTION_TYPES.PAYMENT_RECEIVED,
+      amount,
+      debitAccountId:    cashAccount._id,
+      creditAccountId:   arAccount._id,
+      status:            JOURNAL_STATUS.POSTED,
+      transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+      invoiceNumber:     invoice.invoiceNumber,
+      customerId:        invoice.customerId || null,
+      currencyCode:      invoice.currencyCode || 'PKR',
+      exchangeRate:      invoice.exchangeRate || 1,
+      createdBy:         user._id,
+      lastModifiedBy:    user._id,
+    });
   }
 
   // ───────────────────────────────────────────────────────────────────────────

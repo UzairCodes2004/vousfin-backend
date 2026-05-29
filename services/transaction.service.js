@@ -13,6 +13,7 @@ const reportCache = require('../utils/reportCache');
 const fxService    = require('./fx.service');
 const taxEngine    = require('./taxEngine.service');   // Phase 5.4
 const { businessEvents, EVENTS } = require('./businessEventEngine.service'); // ERP refactor Step 2
+const partyBalanceService = require('./partyBalance.service'); // ERP refactor Step 4 — centralized AR/AP balance engine
 // Phase 5.1: Period lock model (inline require to avoid circular deps)
 
 class TransactionService {
@@ -363,7 +364,11 @@ class TransactionService {
       entryData.transactionMode  = TRANSACTION_MODES.CREDIT;
       if (data.customerId) {
         const customer = await customerRepository.findByBusinessAndId(data.businessId, data.customerId);
-        if (customer) await customerRepository.updateReceivableBalance(data.customerId, baseAmount);
+        if (customer) {
+          await partyBalanceService.adjustReceivable(data.businessId, data.customerId, baseAmount, {
+            userId, reason: 'credit_sale', entityType: ENTITY_TYPES.JOURNAL_ENTRY,
+          });
+        }
       }
     }
 
@@ -377,7 +382,11 @@ class TransactionService {
       entryData.transactionMode  = TRANSACTION_MODES.CREDIT;
       if (data.vendorId) {
         const vendor = await vendorRepository.findByBusinessAndId(data.businessId, data.vendorId);
-        if (vendor) await vendorRepository.updatePayableBalance(data.vendorId, baseAmount);
+        if (vendor) {
+          await partyBalanceService.adjustPayable(data.businessId, data.vendorId, baseAmount, {
+            userId, reason: 'credit_purchase', entityType: ENTITY_TYPES.JOURNAL_ENTRY,
+          });
+        }
       }
     }
 
@@ -711,11 +720,15 @@ class TransactionService {
 
     await transactionRepository.updateTransaction(parent._id, businessId, parentUpdate);
 
-    // 6. Update Customer/Vendor balances
+    // 6. Update Customer/Vendor balances (centralized — emits *_BALANCE_CHANGED)
     if (isReceivable && parent.customerId) {
-      await customerRepository.updateReceivableBalance(parent.customerId._id, -paymentData.amount);
+      await partyBalanceService.adjustReceivable(businessId, parent.customerId._id, -paymentData.amount, {
+        userId, reason: 'payment_received', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: childTx._id,
+      });
     } else if (!isReceivable && parent.vendorId) {
-      await vendorRepository.updatePayableBalance(parent.vendorId._id, -paymentData.amount);
+      await partyBalanceService.adjustPayable(businessId, parent.vendorId._id, -paymentData.amount, {
+        userId, reason: 'payment_made', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: childTx._id,
+      });
     }
 
     return childTx;
@@ -1018,11 +1031,15 @@ class TransactionService {
       await this._updateAccountBalance(reversal.creditAccountId, original.amount, 'credit');
     }
 
-    // 6. Roll back customer / vendor AR/AP balances
+    // 6. Roll back customer / vendor AR/AP balances (centralized — emits *_BALANCE_CHANGED)
     if (original.transactionType === TRANSACTION_TYPES.CREDIT_SALE && original.customerId) {
-      await customerRepository.updateReceivableBalance(original.customerId._id, -original.amount);
+      await partyBalanceService.adjustReceivable(businessId, original.customerId._id, -original.amount, {
+        userId, reason: 'reversal', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: original._id,
+      });
     } else if (original.transactionType === TRANSACTION_TYPES.CREDIT_PURCHASE && original.vendorId) {
-      await vendorRepository.updatePayableBalance(original.vendorId._id, -original.amount);
+      await partyBalanceService.adjustPayable(businessId, original.vendorId._id, -original.amount, {
+        userId, reason: 'reversal', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: original._id,
+      });
     }
 
     // 7. Mark original REVERSED; store forward reference to the reversal
@@ -1128,11 +1145,15 @@ class TransactionService {
     await this._updateAccountBalance(reversal.debitAccountId, original.amount, 'debit');
     await this._updateAccountBalance(reversal.creditAccountId, original.amount, 'credit');
 
-    // Revert Customer/Vendor Balances
+    // Revert Customer/Vendor Balances (centralized — emits *_BALANCE_CHANGED)
     if (original.transactionType === TRANSACTION_TYPES.CREDIT_SALE && original.customerId) {
-        await customerRepository.updateReceivableBalance(original.customerId._id, -original.amount);
+        await partyBalanceService.adjustReceivable(businessId, original.customerId._id, -original.amount, {
+          userId, reason: 'transaction_deleted', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: original._id,
+        });
     } else if (original.transactionType === TRANSACTION_TYPES.CREDIT_PURCHASE && original.vendorId) {
-        await vendorRepository.updatePayableBalance(original.vendorId._id, -original.amount);
+        await partyBalanceService.adjustPayable(businessId, original.vendorId._id, -original.amount, {
+          userId, reason: 'transaction_deleted', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: original._id,
+        });
     }
 
     // Mark original as reversed
@@ -1298,10 +1319,12 @@ class TransactionService {
           transactionMode:  TRANSACTION_MODES.CREDIT,
         });
 
-        // Update customer running balance if linked
+        // Update customer running balance if linked (centralized — emits *_BALANCE_CHANGED)
         if (tx.customerId) {
           try {
-            await customerRepository.updateReceivableBalance(tx.customerId, tx.amount);
+            await partyBalanceService.adjustReceivable(businessId, tx.customerId, tx.amount, {
+              reason: 'arap_repair', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: tx._id,
+            });
           } catch (_) { /* customer may have been deleted */ }
         }
         arFixed++;
@@ -1328,7 +1351,9 @@ class TransactionService {
 
         if (tx.vendorId) {
           try {
-            await vendorRepository.updatePayableBalance(tx.vendorId, tx.amount);
+            await partyBalanceService.adjustPayable(businessId, tx.vendorId, tx.amount, {
+              reason: 'arap_repair', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: tx._id,
+            });
           } catch (_) { /* vendor may have been deleted */ }
         }
         apFixed++;

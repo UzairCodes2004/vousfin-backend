@@ -15,9 +15,10 @@
 const mongoose = require('mongoose');
 const VendorCredit = require('../models/VendorCredit.model');
 const Bill = require('../models/Bill.model');
-const JournalEntry = require('../models/JournalEntry.model');
 const ChartOfAccount = require('../models/ChartOfAccount.model');
 const vendorRepository = require('../repositories/vendor.repository');
+const partyBalanceService = require('./partyBalance.service');     // ERP Step 4 — centralized AP balance
+const { postBalancedJournal } = require('./ledgerPosting.service'); // ERP Step 4 — JE + running-balance sync
 const auditService = require('./audit.service');
 const { ApiError } = require('../utils/ApiError');
 const logger = require('../config/logger');
@@ -200,8 +201,11 @@ class VendorCreditService {
    * Post the journal entry when a vendor credit is applied to a bill.
    *
    * Entry:
-   *   DR  Accounts Payable   (2100)  — reduces AP balance (we owe less)
+   *   DR  Accounts Payable   (2110)  — reduces AP balance (we owe less)
    *   CR  Vendor Credit      (4180 Discount Received, or a dedicated account)
+   *
+   * ERP Step 4: the vendor's currentPayableBalance is decremented by the same
+   * applied amount (we owe the vendor less), broadcasting VENDOR_BALANCE_CHANGED.
    *
    * If the Accounts Payable account or a suitable CR account is not found the
    * journal is skipped (non-fatal — it only affects the ledger view).
@@ -217,10 +221,10 @@ class VendorCreditService {
 
     const apAccount = await ChartOfAccount.findOne({
       businessId,
-      accountCode: '2100',
+      accountCode: '2110',
     }).lean();
     if (!apAccount) {
-      logger.warn('[vc] credit journal skipped — AP account (2100) not found');
+      logger.warn('[vc] credit journal skipped — AP account (2110) not found');
       return;
     }
 
@@ -239,7 +243,7 @@ class VendorCreditService {
     if (appliedAmount <= 0) return;
 
     try {
-      await JournalEntry.create({
+      await postBalancedJournal({
         businessId,
         transactionDate:  new Date(),
         description:      `Vendor Credit Applied — ${vc.creditNumber} → Bill ${bill.billNumber}`,
@@ -256,6 +260,14 @@ class VendorCreditService {
         createdBy:        user._id,
         lastModifiedBy:   user._id,
       });
+
+      // ERP Step 4: applying a credit reduces what we owe the vendor — mirror it
+      // onto the vendor's payable balance (DR AP) and broadcast the change.
+      if (vc.vendorId) {
+        await partyBalanceService.adjustPayable(businessId, vc.vendorId, -appliedAmount, {
+          userId: user._id, reason: 'vendor_credit_applied', entityType: ENTITY_TYPES.BILL, entityId: bill._id,
+        });
+      }
     } catch (e) {
       logger.error(`[vc] credit application journal failed: ${e.message}`);
     }

@@ -9,11 +9,13 @@
 //
 const mongoose = require('mongoose');
 const Bill = require('../models/Bill.model');
-const JournalEntry = require('../models/JournalEntry.model');
 const ChartOfAccount = require('../models/ChartOfAccount.model');
 const vendorRepository = require('../repositories/vendor.repository');
 const auditService = require('./audit.service');
 const billMatchingService = require('./billMatching.service');
+const partyBalanceService = require('./partyBalance.service');     // ERP Step 4 — centralized AP balance
+const { postBalancedJournal } = require('./ledgerPosting.service'); // ERP Step 4 — JE + running-balance sync
+const { businessEvents, EVENTS } = require('./businessEventEngine.service'); // ERP Step 4 — event broadcasts
 const { ApiError } = require('../utils/ApiError');
 const logger = require('../config/logger');
 const {
@@ -206,6 +208,17 @@ class BillService {
       logger.warn(`[bill] AP journal failed on approval for ${bill.billNumber}: ${e.message}`);
     }
 
+    // ERP Step 4 — broadcast so dashboard / forecasting / AP-aging subscribers refresh.
+    businessEvents.emit(EVENTS.BILL_APPROVED, {
+      businessId: bill.businessId.toString(),
+      userId:     user._id,
+      entityType: ENTITY_TYPES.BILL,
+      entityId:   bill._id,
+      billNumber: bill.billNumber,
+      vendorId:   bill.vendorId || null,
+      amount:     bill.totalAmount,
+    });
+
     return approved;
   }
 
@@ -296,9 +309,86 @@ class BillService {
 
   async markPaid(id, user, ipAddress) {
     const bill = await this._loadOrThrow(id);
+    const outstanding = Math.round(
+      ((bill.remainingBalance != null ? bill.remainingBalance : bill.totalAmount) || 0) * 100
+    ) / 100;
+
     bill.paidAmount = bill.totalAmount;
     bill.remainingBalance = 0;
-    return this._applyStateChange(bill, BILL_STATES.PAID, user, { ipAddress });
+    const paid = await this._applyStateChange(bill, BILL_STATES.PAID, user, { ipAddress });
+
+    // ── ERP Step 4: settle the AP liability + vendor balance ─────────────────
+    // Only for bills that recognized their OWN AP (bill-first flow, identified by
+    // apLiabilityJournalId). Transaction-first bills (synced from a journal entry)
+    // are settled via transaction.service, which owns that balance lifecycle —
+    // skipping them here prevents a double-decrement. (Rules 4, 5)
+    if (bill.apLiabilityJournalId && bill.vendorId && outstanding > 0) {
+      try {
+        await this._postBillSettlementJournal(bill, outstanding, user);
+        await partyBalanceService.adjustPayable(bill.businessId, bill.vendorId, -outstanding, {
+          userId: user._id, reason: 'bill_paid', entityType: ENTITY_TYPES.BILL, entityId: bill._id,
+        });
+      } catch (e) {
+        logger.warn(`[bill] settlement posting failed for ${bill.billNumber}: ${e.message}`);
+      }
+    }
+
+    // Broadcast regardless so downstream caches refresh on any payment path.
+    businessEvents.emit(EVENTS.BILL_PAID, {
+      businessId: bill.businessId.toString(),
+      userId:     user._id,
+      entityType: ENTITY_TYPES.BILL,
+      entityId:   bill._id,
+      billNumber: bill.billNumber,
+      vendorId:   bill.vendorId || null,
+      amount:     bill.totalAmount,
+    });
+
+    return paid;
+  }
+
+  /**
+   * ERP Step 4 — post the cash-settlement journal for a bill payment.
+   *   DR  Accounts Payable (2110)  — clears the liability
+   *   CR  Cash / Bank (1010…)      — money leaves the business
+   * Balanced + running-balance-synced via ledgerPosting. Returns null (logged)
+   * if the AP or a cash/bank account can't be resolved, rather than throwing.
+   * @private
+   */
+  async _postBillSettlementJournal(bill, amount, user) {
+    const businessId = bill.businessId;
+    const apAccount = await ChartOfAccount.findOne({ businessId, accountCode: '2110' }).lean();
+    const cashAccount = await ChartOfAccount.findOne({
+      businessId,
+      accountCode: { $in: ['1010', '1020', '1040', '1030'] }, // Cash at Bank → on Hand → Savings → Petty
+    }).lean();
+
+    if (!apAccount || !cashAccount) {
+      logger.warn(`[bill] settlement JE skipped for ${bill.billNumber} — AP (2110) or cash account missing`);
+      return null;
+    }
+    if (apAccount._id.toString() === cashAccount._id.toString()) {
+      logger.warn(`[bill] settlement JE skipped for ${bill.billNumber} — AP and cash are the same account`);
+      return null;
+    }
+
+    return postBalancedJournal({
+      businessId,
+      transactionDate:   new Date(),
+      description:       `Bill Payment — ${bill.billNumber}${bill.vendorSnapshot?.vendorName ? ' (' + bill.vendorSnapshot.vendorName + ')' : ''}`,
+      transactionType:   TRANSACTION_TYPES.PAYMENT_MADE,
+      amount,
+      debitAccountId:    apAccount._id,
+      creditAccountId:   cashAccount._id,
+      status:            JOURNAL_STATUS.POSTED,
+      transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+      invoiceNumber:     bill.billNumber,
+      vendorId:          bill.vendorId || null,
+      currencyCode:      bill.currencyCode || 'PKR',
+      exchangeRate:      bill.exchangeRate || 1,
+      createdBy:         user._id,
+      lastModifiedBy:    user._id,
+    });
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -328,14 +418,21 @@ class BillService {
    *
    * Accounting entry:
    *   DR  Purchases / Inventory / Expense  (primary expense account from line items)
-   *   CR  Accounts Payable                 (code 2100)
+   *   CR  Accounts Payable                 (code 2110)
    *
    * If the bill has a taxAmount, a second entry is created:
    *   DR  Input Tax Receivable             (code 1170 — created by tax engine if enabled)
    *   CR  Accounts Payable
    *
    * Both entries are tagged transactionSource:'system_generated' so they
-   * appear separately from manual journals in the audit trail.
+   * appear separately from manual journals in the audit trail. Posting goes
+   * through ledgerPosting.postBalancedJournal so the Chart-of-Accounts running
+   * balances move in lock-step (GAAP trial-balance integrity).
+   *
+   * ERP Step 4: after the AP control account is credited, the vendor's
+   * currentPayableBalance is incremented by the SAME amount through
+   * partyBalanceService — keeping "AP control == Σ vendor balances" — and a
+   * BILL_APPROVED-adjacent VENDOR_BALANCE_CHANGED event is broadcast.
    *
    * @param {Object} bill       — Mongoose Bill document (already saved, approved state)
    * @param {Object} user
@@ -352,14 +449,14 @@ class BillService {
     const r2 = (v) => Math.round((Number(v) || 0) * 100) / 100;
     const businessId = bill.businessId;
 
-    // ── Find Accounts Payable account (code 2100) ────────────────────────────
+    // ── Find Accounts Payable account (code 2110) ────────────────────────────
     const apAccount = await ChartOfAccount.findOne({
       businessId,
-      accountCode: '2100',
+      accountCode: '2110',
     }).lean();
 
     if (!apAccount) {
-      logger.warn(`[bill] AP journal skipped for ${bill.billNumber} — Accounts Payable account (2100) not found`);
+      logger.warn(`[bill] AP journal skipped for ${bill.billNumber} — Accounts Payable account (2110) not found`);
       return null;
     }
 
@@ -393,16 +490,22 @@ class BillService {
     }
 
     const netAmount = r2(bill.amount || (bill.totalAmount - (bill.taxAmount || 0)));
+    const primaryAmount = netAmount > 0 ? netAmount : r2(bill.totalAmount);
+
+    // Running tally of what we actually credit to the AP control account — the
+    // vendor's payable balance is incremented by exactly this at the end so the
+    // GL control account and Σ(vendor balances) stay equal. (Rule 5)
+    let apCredited = 0;
 
     // ── Primary JE: DR Expense / Inventory, CR Accounts Payable ─────────────
     let primaryJe = null;
     try {
-      primaryJe = await JournalEntry.create({
+      primaryJe = await postBalancedJournal({
         businessId,
         transactionDate:  bill.issueDate,
         description:      `AP Liability — ${bill.billNumber}${bill.vendorSnapshot?.vendorName ? ' (' + bill.vendorSnapshot.vendorName + ')' : ''}`,
         transactionType:  TRANSACTION_TYPES.CREDIT_PURCHASE,
-        amount:           netAmount > 0 ? netAmount : r2(bill.totalAmount),
+        amount:           primaryAmount,
         debitAccountId:   debitAccountId,
         creditAccountId:  apAccount._id,
         status:           JOURNAL_STATUS.POSTED,
@@ -414,6 +517,7 @@ class BillService {
         createdBy:        user._id,
         lastModifiedBy:   user._id,
       });
+      apCredited = r2(apCredited + primaryAmount);
     } catch (e) {
       logger.error(`[bill] failed to create AP liability JE for ${bill.billNumber}: ${e.message}`);
       return null;
@@ -435,7 +539,7 @@ class BillService {
 
       if (inputTaxAcc && inputTaxAcc._id.toString() !== apAccount._id.toString()) {
         try {
-          await JournalEntry.create({
+          await postBalancedJournal({
             businessId,
             transactionDate:  bill.issueDate,
             description:      `AP Input Tax — ${bill.billNumber}`,
@@ -452,10 +556,21 @@ class BillService {
             createdBy:        user._id,
             lastModifiedBy:   user._id,
           });
+          apCredited = r2(apCredited + taxAmount);
         } catch (e) {
           logger.warn(`[bill] tax JE failed for ${bill.billNumber}: ${e.message}`);
         }
       }
+    }
+
+    // ── ERP Step 4: mirror the AP credit onto the vendor's payable balance ───
+    // Routed through the centralized engine so a VENDOR_BALANCE_CHANGED event is
+    // broadcast (dashboard / forecasting / aging subscribers). Fire-and-forget
+    // event; the balance write itself is awaited. (Rules 5, 9, 10)
+    if (bill.vendorId && apCredited > 0) {
+      await partyBalanceService.adjustPayable(businessId, bill.vendorId, apCredited, {
+        userId: user._id, reason: 'bill_approved', entityType: ENTITY_TYPES.BILL, entityId: bill._id,
+      });
     }
 
     return primaryJe;

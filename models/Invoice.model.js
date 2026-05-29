@@ -144,6 +144,17 @@ const invoiceSchema = new mongoose.Schema(
       index: true,
     },
 
+    // ERP Step 4 — the AR-recognition journal posted on approval (DR Accounts
+    // Receivable / CR Sales + output tax). Mirrors Bill.apLiabilityJournalId.
+    // Its presence marks an invoice-first flow that owns its own AR balance
+    // lifecycle (recognition on approve, settlement on markPaid).
+    arJournalId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'JournalEntry',
+      default: null,
+      index: true,
+    },
+
     // ── Customer side (AR) ────────────────────────────────────────────────────
     customerId: {
       type: mongoose.Schema.Types.ObjectId,
