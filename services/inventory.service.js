@@ -2,6 +2,7 @@
 const inventoryItemRepository = require('../repositories/inventoryItem.repository');
 const { ApiError } = require('../utils/ApiError');
 const logger = require('../config/logger');
+const { businessEvents, EVENTS } = require('./businessEventEngine.service'); // ERP refactor Step 3
 
 class InventoryService {
   async createItem(businessId, data) {
@@ -121,6 +122,10 @@ class InventoryService {
         inventoryQty: qty,
         inputMethod: INPUT_METHODS.FORM,
         notes: opts.notes || null,
+        // ERP refactor Step 3: this service owns the physical stock increment
+        // (via applyPurchaseStock below). Tell transaction.service NOT to mirror
+        // the stock change again, otherwise the purchase would be counted twice.
+        skipInventorySync: true,
       };
 
       // transaction.service handles auditing, AR/AP balance tracking, etc.
@@ -130,16 +135,65 @@ class InventoryService {
         opts.userId || null,
         opts.ipAddress || null
       );
-      // The journal entry post path may or may not call addStock itself; check
-      // current implementation — if it already adds stock, skip the manual call.
-      // Otherwise we add stock here.
-      // The current transaction.service does NOT call addStock for INVENTORY_PURCHASE,
-      // so we still need to do it manually below.
     }
 
-    await item.addStock(qty, costPerUnit);
+    // Single source of truth for the physical stock increment + event emission.
+    const { item: updatedItem } = await this.applyPurchaseStock(
+      businessId, itemId, qty, costPerUnit, { userId: opts.userId, vendorId: opts.vendorId }
+    );
+    return { item: updatedItem, journalEntry };
+  }
+
+  /**
+   * Apply a purchase-side stock increment WITHOUT posting any journal entry.
+   *
+   * This is the single, journal-free entry point that physically increases
+   * stock (weighted-average cost) and broadcasts inventory events. The funding
+   * journal (Inventory ⇄ Cash/Bank/AP) is always owned by the caller — either
+   * `addStock` (UI flow) or `transaction.service.createTransaction` (generic
+   * transaction flow). Keeping the increment journal-free guarantees we never
+   * touch double-entry balancing here.
+   *
+   * @param {string} businessId
+   * @param {string} itemId
+   * @param {number} qty            units received (> 0)
+   * @param {number} costPerUnit    landed unit cost; falls back to item.unitCostPrice
+   * @param {Object} [opts]
+   * @param {string} [opts.userId]
+   * @param {string} [opts.vendorId]
+   * @returns {Promise<{ item: Object }>}
+   */
+  async applyPurchaseStock(businessId, itemId, qty, costPerUnit, opts = {}) {
+    if (!businessId) throw new ApiError(400, 'Business ID is required');
+    if (!(Number(qty) > 0)) throw new ApiError(400, 'Quantity must be a positive number');
+
+    const item = await inventoryItemRepository.model.findOne({ _id: itemId, businessId });
+    if (!item) throw new ApiError(404, 'Inventory item not found');
+
+    const valuationBefore = Math.round(item.currentStock * item.unitCostPrice * 100) / 100;
+    const cost = Number(costPerUnit) > 0 ? Number(costPerUnit) : item.unitCostPrice;
+
+    await item.addStock(qty, cost);
     logger.info(`Stock added: ${qty} units of "${item.name}" (new stock: ${item.currentStock})`);
-    return { item, journalEntry };
+
+    const valuationAfter = Math.round(item.currentStock * item.unitCostPrice * 100) / 100;
+
+    // Fire-and-forget — inventory events must never block (or break) the purchase.
+    businessEvents.emit(EVENTS.INVENTORY_RECEIVED, {
+      businessId, userId: opts.userId || null,
+      entityType: 'inventory_item', entityId: item._id,
+      itemName: item.name, sku: item.sku,
+      qty: Number(qty), costPerUnit: cost,
+      newStock: item.currentStock, vendorId: opts.vendorId || item.preferredVendorId || null,
+    });
+    businessEvents.emit(EVENTS.INVENTORY_VALUATION_CHANGED, {
+      businessId, userId: opts.userId || null,
+      entityType: 'inventory_item', entityId: item._id,
+      itemName: item.name, valuationBefore, valuationAfter,
+      delta: Math.round((valuationAfter - valuationBefore) * 100) / 100,
+    });
+
+    return { item };
   }
 
   /**
@@ -156,12 +210,36 @@ class InventoryService {
     if (!item) throw new ApiError(404, 'Inventory item not found');
 
     const stockBefore = item.currentStock;
+    const valuationBefore = Math.round(stockBefore * item.unitCostPrice * 100) / 100;
     const { cogsAmount, unitCostUsed } = await item.reduceStock(qty);
     logger.info(`Stock reduced: ${qty} units of "${item.name}" → COGS ${cogsAmount}, remaining ${item.currentStock}`);
+
+    const valuationAfter = Math.round(item.currentStock * item.unitCostPrice * 100) / 100;
+
+    // ERP refactor Step 3 — broadcast the stock reduction + valuation change.
+    // Fire-and-forget: inventory events must never block (or break) the sale.
+    businessEvents.emit(EVENTS.INVENTORY_REDUCED, {
+      businessId, entityType: 'inventory_item', entityId: item._id,
+      itemName: item.name, sku: item.sku,
+      qty: Number(qty), cogsAmount, unitCostUsed,
+      newStock: item.currentStock,
+    });
+    businessEvents.emit(EVENTS.INVENTORY_VALUATION_CHANGED, {
+      businessId, entityType: 'inventory_item', entityId: item._id,
+      itemName: item.name, valuationBefore, valuationAfter,
+      delta: Math.round((valuationAfter - valuationBefore) * 100) / 100,
+    });
 
     // Reorder trigger: only fire when we just crossed the threshold (not on every sale)
     const justCrossed = stockBefore > item.reorderLevel && item.currentStock <= item.reorderLevel;
     if (justCrossed && item.reorderLevel > 0) {
+      // Broadcast the low-stock event for any subscriber (dashboard, forecasting…).
+      businessEvents.emit(EVENTS.LOW_STOCK_REACHED, {
+        businessId, entityType: 'inventory_item', entityId: item._id,
+        itemName: item.name, sku: item.sku,
+        currentStock: item.currentStock, reorderLevel: item.reorderLevel,
+        reorderQty: item.reorderQty, vendorId: item.preferredVendorId || null,
+      });
       // Fire-and-forget — never block the sale on email
       this._fireReorderEmail(item, businessId).catch(err =>
         logger.error(`[reorder] Hook failed: ${err.message}`)
@@ -264,10 +342,25 @@ class InventoryService {
       .select('transactionDate description transactionType inventoryQty amount')
       .lean();
 
+    // ERP refactor Step 3 — any purchase-type entry increases stock; any
+    // sale-type entry decreases it. The previous code only matched the two
+    // "Inventory *" types and silently under-counted Cash/Credit movements.
+    const PURCHASE_TYPES = new Set([
+      TRANSACTION_TYPES.INVENTORY_PURCHASE,
+      TRANSACTION_TYPES.CASH_PURCHASE,
+      TRANSACTION_TYPES.CREDIT_PURCHASE,
+    ]);
+    const SALE_TYPES = new Set([
+      TRANSACTION_TYPES.INVENTORY_SALE,
+      TRANSACTION_TYPES.CASH_SALE,
+      TRANSACTION_TYPES.CREDIT_SALE,
+      TRANSACTION_TYPES.INCOME,
+    ]);
+
     let runningQty = 0;
     const lines = entries.map((tx) => {
-      const isIn  = tx.transactionType === TRANSACTION_TYPES.INVENTORY_PURCHASE;
-      const isOut = tx.transactionType === TRANSACTION_TYPES.INVENTORY_SALE;
+      const isIn  = PURCHASE_TYPES.has(tx.transactionType);
+      const isOut = SALE_TYPES.has(tx.transactionType);
       const qtyIn  = isIn  ? (tx.inventoryQty || 0) : 0;
       const qtyOut = isOut ? (tx.inventoryQty || 0) : 0;
       runningQty += qtyIn - qtyOut;

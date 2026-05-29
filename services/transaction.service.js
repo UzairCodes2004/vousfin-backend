@@ -452,6 +452,42 @@ class TransactionService {
       }
     }
 
+    // 7a. Inventory-touching purchase — auto-increment stock (ERP refactor Step 3)
+    //
+    // The mirror image of the COGS sale block above. Previously, recording an
+    // Inventory/Cash/Credit Purchase with an inventory item attached posted the
+    // funding journal (Inventory ⇄ Cash/Bank/AP) but NEVER increased the physical
+    // stock — inventory silently drifted below the ledger. We now route the
+    // increment through inventoryService.applyPurchaseStock so weighted-average
+    // cost, valuation and inventory events stay consistent.
+    //
+    // NOTE: applyPurchaseStock posts NO journal lines (the funding journal is
+    // this very transaction), so double-entry balancing is untouched. Callers
+    // that already incremented stock themselves (e.g. inventoryService.addStock)
+    // pass `skipInventorySync: true` to avoid double-counting.
+    const PURCHASE_TYPES_TRIGGERING_STOCK = new Set([
+      TRANSACTION_TYPES.INVENTORY_PURCHASE,
+      TRANSACTION_TYPES.CASH_PURCHASE,
+      TRANSACTION_TYPES.CREDIT_PURCHASE,
+    ]);
+    if (
+      !data.skipInventorySync &&
+      PURCHASE_TYPES_TRIGGERING_STOCK.has(entryData.transactionType) &&
+      data.inventoryItemId &&
+      data.inventoryQty > 0
+    ) {
+      const costPerUnit = Number(data.unitCostPrice) > 0
+        ? Number(data.unitCostPrice)
+        : Math.round((entryData.amount / data.inventoryQty) * 100) / 100;
+      const inventoryService = require('./inventory.service');
+      await inventoryService.applyPurchaseStock(
+        data.businessId, data.inventoryItemId, data.inventoryQty, costPerUnit, { userId }
+      );
+      entryData.inventoryItemId = data.inventoryItemId;
+      entryData.inventoryQty    = data.inventoryQty;
+      logger.info(`Stock auto-incremented: qty ${data.inventoryQty} @ ${costPerUnit} for item ${data.inventoryItemId}`);
+    }
+
     // 7b. Merge tax journal lines + validate balance
     if (pendingTaxLines.length > 0) {
       // Ensure a baseline journalLines array exists before appending tax lines

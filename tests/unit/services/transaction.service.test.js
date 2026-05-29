@@ -4,11 +4,21 @@
 jest.mock('../../../repositories/transaction.repository');
 jest.mock('../../../repositories/account.repository');
 jest.mock('../../../services/audit.service');
+// ERP refactor Step 3 — stub inventory.service so the purchase-side stock mirror
+// (section "7a" of createTransaction) can be asserted without touching a DB.
+jest.mock('../../../services/inventory.service');
+// Phase 5.1 added an accounting-period lock check that queries a real Mongoose
+// model with the businessId. In unit tests there is no DB and the fixtures use a
+// non-ObjectId businessId, so stub the period lookup to "no covering period".
+jest.mock('../../../models/AccountingPeriod.model', () => ({
+  findCoveringPeriod: jest.fn().mockResolvedValue(null),
+}));
 
 const transactionService = require('../../../services/transaction.service');
 const transactionRepository = require('../../../repositories/transaction.repository');
 const accountRepository = require('../../../repositories/account.repository');
 const auditService = require('../../../services/audit.service');
+const inventoryService = require('../../../services/inventory.service');
 const { ApiError } = require('../../../utils/ApiError');
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -180,5 +190,49 @@ describe('TransactionService.createBulkTransactions()', () => {
     const result = await transactionService.createBulkTransactions(entries, 'user1', '127.0.0.1');
     expect(result.successful).toBe(2);
     expect(result.failed).toHaveLength(0);
+  });
+});
+
+// ── Inventory purchase-side stock mirror (ERP refactor Step 3) ───────────────────
+describe('TransactionService.createTransaction() — inventory purchase mirror', () => {
+  const PURCHASE_DATA = {
+    ...VALID_DATA,
+    transactionType: 'Inventory Purchase',
+    amount: 500,
+    inventoryItemId: 'item001',
+    inventoryQty: 5,
+    skipTax: true, // bypass the tax engine for a focused assertion
+  };
+
+  test('auto-increments stock via inventoryService.applyPurchaseStock', async () => {
+    await transactionService.createTransaction(PURCHASE_DATA, 'user1', '127.0.0.1');
+    expect(inventoryService.applyPurchaseStock).toHaveBeenCalledTimes(1);
+    // amount 500 / qty 5 = 100 inferred cost per unit
+    expect(inventoryService.applyPurchaseStock).toHaveBeenCalledWith(
+      'biz001', 'item001', 5, 100, { userId: 'user1' }
+    );
+  });
+
+  test('uses explicit unitCostPrice when provided (not the inferred average)', async () => {
+    await transactionService.createTransaction(
+      { ...PURCHASE_DATA, unitCostPrice: 90 }, 'user1', '127.0.0.1'
+    );
+    expect(inventoryService.applyPurchaseStock).toHaveBeenCalledWith(
+      'biz001', 'item001', 5, 90, { userId: 'user1' }
+    );
+  });
+
+  test('skips the mirror when skipInventorySync is set (caller already incremented)', async () => {
+    await transactionService.createTransaction(
+      { ...PURCHASE_DATA, skipInventorySync: true }, 'user1', '127.0.0.1'
+    );
+    expect(inventoryService.applyPurchaseStock).not.toHaveBeenCalled();
+  });
+
+  test('does NOT mirror stock for a non-purchase transaction type', async () => {
+    await transactionService.createTransaction(
+      { ...PURCHASE_DATA, transactionType: 'Expense' }, 'user1', '127.0.0.1'
+    );
+    expect(inventoryService.applyPurchaseStock).not.toHaveBeenCalled();
   });
 });
