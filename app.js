@@ -11,8 +11,13 @@ const { sanitizeRequest } = require('./middleware/sanitize.middleware');
 const errorMiddleware = require('./middleware/error.middleware');
 const passport = require('./config/passport');
 const apiRoutes = require('./routes');
+const eventSubscribers = require('./services/eventSubscribers.service'); // ERP Step 7
 
 const app = express();
+
+// ERP Step 7 — wire the business-event subscribers (analytics cache-sync, …).
+// Idempotent: safe whether the app is started by server.js or imported by tests.
+eventSubscribers.registerAll();
 
 // Security & standard middleware
 app.use(helmet());
