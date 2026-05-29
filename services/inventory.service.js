@@ -163,6 +163,35 @@ class InventoryService {
    * @param {string} [opts.vendorId]
    * @returns {Promise<{ item: Object }>}
    */
+  /**
+   * Resolve the COGS and Inventory control accounts for a business — the same
+   * pair transaction.service uses when posting a sale's COGS. Centralized here
+   * (ERP Step 5) so the procurement/invoice document flows recognize COGS
+   * against the identical accounts without duplicating the lookup. (Rule 8)
+   *
+   * @returns {Promise<{ cogsAccountId: (ObjectId|null), inventoryAccountId: (ObjectId|null) }>}
+   */
+  async resolveCostAccounts(businessId) {
+    const ChartOfAccount = require('../models/ChartOfAccount.model');
+    const [cogsAcct, inventoryAcct] = await Promise.all([
+      ChartOfAccount.findOne({
+        businessId,
+        $or: [
+          { accountName: { $regex: /cost of goods/i } },
+          { accountSubtype: 'Direct Cost' },
+        ],
+      }).lean(),
+      ChartOfAccount.findOne({
+        businessId,
+        accountName: { $regex: /^inventory$/i },
+      }).lean(),
+    ]);
+    return {
+      cogsAccountId:      cogsAcct ? cogsAcct._id : null,
+      inventoryAccountId: inventoryAcct ? inventoryAcct._id : null,
+    };
+  }
+
   async applyPurchaseStock(businessId, itemId, qty, costPerUnit, opts = {}) {
     if (!businessId) throw new ApiError(400, 'Business ID is required');
     if (!(Number(qty) > 0)) throw new ApiError(400, 'Quantity must be a positive number');

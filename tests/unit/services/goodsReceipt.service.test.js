@@ -6,6 +6,11 @@ jest.mock('../../../services/audit.service');
 jest.mock('../../../services/purchaseOrder.service', () => ({
   recordGrnReceipt: jest.fn().mockResolvedValue({}),
 }));
+// ERP Step 5 — stub the inventory engine so we can assert receive→stock wiring.
+jest.mock('../../../services/inventory.service', () => ({
+  applyPurchaseStock: jest.fn().mockResolvedValue({ item: {} }),
+  resolveCostAccounts: jest.fn(),
+}));
 
 jest.mock('../../../models/PurchaseOrder.model', () => {
   const mongoose = require('mongoose');
@@ -77,6 +82,8 @@ const PurchaseOrder = require('../../../models/PurchaseOrder.model');
 const grnService    = require('../../../services/goodsReceipt.service');
 const auditService  = require('../../../services/audit.service');
 const poService     = require('../../../services/purchaseOrder.service');
+const inventoryService = require('../../../services/inventory.service');
+const { businessEvents, EVENTS } = require('../../../services/businessEventEngine.service');
 
 const USER = { _id: 'u1', fullName: 'Bob Warehouse', email: 'bob@x', role: 'warehouse' };
 const BIZ  = 'biz1';
@@ -205,6 +212,74 @@ describe('grnService.cancel()', () => {
     grn.state = 'reconciled';
     await grn.save();
     await expect(grnService.cancel(grn._id, USER, 'test')).rejects.toMatchObject({ statusCode: 409 });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ERP Step 5 — receive → inventory stock-in
+// ─────────────────────────────────────────────────────────────────────────────
+describe('grnService.confirm() — inventory stock-in (ERP Step 5)', () => {
+  const mongoose = require('mongoose');
+  const ITEM_1 = new mongoose.Types.ObjectId();
+
+  let emitSpy;
+  beforeEach(() => {
+    emitSpy = jest.spyOn(businessEvents, 'emit').mockReturnValue('evt');
+  });
+  afterEach(() => emitSpy.mockRestore());
+
+  async function makeDraftGRN(receivedItems) {
+    return grnService.createDraft(
+      { businessId: BIZ, purchaseOrderId: PO_ID, receivedDate: new Date(), receivedItems },
+      USER
+    );
+  }
+
+  test('adds ACCEPTED qty (received − rejected) to inventory at landed unit cost', async () => {
+    const grn = await makeDraftGRN([
+      { poLineItemId: LINE_1, inventoryItemId: ITEM_1, name: 'Widget',
+        quantityOrdered: 10, quantityReceived: 10, quantityRejected: 2, unitCost: 500 },
+    ]);
+    await grnService.confirm(grn._id, USER, '127.0.0.1');
+
+    expect(inventoryService.applyPurchaseStock).toHaveBeenCalledTimes(1);
+    expect(inventoryService.applyPurchaseStock).toHaveBeenCalledWith(
+      BIZ, ITEM_1, 8 /* 10 − 2 */, 500,
+      expect.objectContaining({ userId: USER._id })
+    );
+  });
+
+  test('broadcasts GOODS_RECEIVED and sets inventoryApplied', async () => {
+    const grn = await makeDraftGRN([
+      { poLineItemId: LINE_1, inventoryItemId: ITEM_1, name: 'Widget',
+        quantityOrdered: 10, quantityReceived: 10, unitCost: 500 },
+    ]);
+    const confirmed = await grnService.confirm(grn._id, USER);
+
+    expect(confirmed.inventoryApplied).toBe(true);
+    const names = emitSpy.mock.calls.map((c) => c[0]);
+    expect(names).toContain(EVENTS.GOODS_RECEIVED);
+  });
+
+  test('skips lines without an inventoryItemId (services / untracked customs)', async () => {
+    const grn = await makeDraftGRN([
+      { poLineItemId: LINE_1, name: 'Consulting', quantityOrdered: 10, quantityReceived: 10, unitCost: 500 },
+    ]);
+    await grnService.confirm(grn._id, USER);
+    expect(inventoryService.applyPurchaseStock).not.toHaveBeenCalled();
+  });
+
+  test('does not double-apply stock when already applied (idempotent)', async () => {
+    const grn = await makeDraftGRN([
+      { poLineItemId: LINE_1, inventoryItemId: ITEM_1, name: 'Widget',
+        quantityOrdered: 10, quantityReceived: 10, unitCost: 500 },
+    ]);
+    await grnService.confirm(grn._id, USER);
+    expect(inventoryService.applyPurchaseStock).toHaveBeenCalledTimes(1);
+
+    // Simulate a re-run of the private stock-in on the already-applied GRN.
+    await grnService._applyReceivedStock(grn, USER);
+    expect(inventoryService.applyPurchaseStock).toHaveBeenCalledTimes(1); // unchanged
   });
 });
 

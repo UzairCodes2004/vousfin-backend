@@ -130,6 +130,12 @@ const goodsReceiptSchema = new mongoose.Schema(
     hasDiscrepancies:  { type: Boolean, default: false, index: true },
     isFullyReceived:   { type: Boolean, default: false, index: true },
 
+    // ERP Step 5 — set once the received goods have been added to inventory
+    // (weighted-average cost). Guards against double-incrementing stock if the
+    // confirm path is ever re-run. See goodsReceipt.service._applyReceivedStock.
+    inventoryApplied:   { type: Boolean, default: false },
+    inventoryAppliedAt: { type: Date, default: null },
+
     // ── Metadata ──────────────────────────────────────────────────────────────
     notes:          { type: String, default: null, maxlength: 1000, trim: true },
     createdBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },

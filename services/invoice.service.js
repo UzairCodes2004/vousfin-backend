@@ -598,7 +598,79 @@ class InvoiceService {
       });
     }
 
+    // ── ERP Step 5: recognize COGS + reduce inventory for product line items ──
+    // Matching principle — COGS is recognized in the same step as the revenue.
+    // Best-effort: a stock/COGS hiccup must never roll back AR recognition.
+    try {
+      await this._applyCogsForInvoice(invoice, user);
+    } catch (e) {
+      logger.warn(`[invoice] COGS recognition failed for ${invoice.invoiceNumber}: ${e.message}`);
+    }
+
     return primaryJe;
+  }
+
+  /**
+   * ERP Step 5 — reduce inventory and post the COGS journal for an invoice's
+   * product line items (invoice-first flow only — the transaction-first path
+   * already does this in transaction.service, and its synced invoice carries a
+   * linkedJournalEntryId that short-circuits postArJournal before we get here).
+   *
+   *   DR  Cost of Goods Sold
+   *   CR  Inventory
+   *
+   * Stock is reduced per line via inventoryService.reduceStock (which emits
+   * INVENTORY_REDUCED / VALUATION_CHANGED / LOW_STOCK and fires reorder email),
+   * then one consolidated COGS journal is posted at weighted-average cost.
+   * @private
+   */
+  async _applyCogsForInvoice(invoice, user) {
+    const inventoryService = require('./inventory.service'); // lazy — avoid cycle
+    const r2 = (v) => Math.round((Number(v) || 0) * 100) / 100;
+
+    const productLines = (invoice.lineItems || []).filter(
+      (li) => li.inventoryItemId && Number(li.quantity) > 0
+    );
+    if (productLines.length === 0) return null;
+
+    let totalCogs = 0;
+    for (const li of productLines) {
+      try {
+        const { cogsAmount } = await inventoryService.reduceStock(
+          invoice.businessId, li.inventoryItemId, Number(li.quantity)
+        );
+        totalCogs = r2(totalCogs + (cogsAmount || 0));
+      } catch (e) {
+        logger.warn(`[invoice] stock reduction failed for item ${li.inventoryItemId} on ${invoice.invoiceNumber}: ${e.message}`);
+      }
+    }
+    if (totalCogs <= 0) return null;
+
+    const { cogsAccountId, inventoryAccountId } = await inventoryService.resolveCostAccounts(invoice.businessId);
+    if (!cogsAccountId || !inventoryAccountId) {
+      logger.warn(`[invoice] COGS journal skipped for ${invoice.invoiceNumber} — COGS/Inventory account not found (stock already reduced)`);
+      return totalCogs;
+    }
+
+    await postBalancedJournal({
+      businessId:        invoice.businessId,
+      transactionDate:   invoice.issueDate,
+      description:       `COGS — ${invoice.invoiceNumber}`,
+      transactionType:   TRANSACTION_TYPES.EXPENSE,
+      amount:            totalCogs,
+      debitAccountId:    cogsAccountId,        // DR Cost of Goods Sold
+      creditAccountId:   inventoryAccountId,   // CR Inventory
+      status:            JOURNAL_STATUS.POSTED,
+      transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+      invoiceNumber:     invoice.invoiceNumber,
+      customerId:        invoice.customerId || null,
+      currencyCode:      invoice.currencyCode || 'PKR',
+      exchangeRate:      invoice.exchangeRate || 1,
+      createdBy:         user._id,
+      lastModifiedBy:    user._id,
+    });
+    logger.info(`[invoice] ${invoice.invoiceNumber}: recognized COGS ${totalCogs} for ${productLines.length} line(s)`);
+    return totalCogs;
   }
 
   /**

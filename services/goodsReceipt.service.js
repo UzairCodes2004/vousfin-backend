@@ -14,6 +14,8 @@ const mongoose = require('mongoose');
 const GoodsReceipt = require('../models/GoodsReceipt.model');
 const PurchaseOrder = require('../models/PurchaseOrder.model');
 const purchaseOrderService = require('./purchaseOrder.service');
+const inventoryService = require('./inventory.service');                       // ERP Step 5 — receive → stock
+const { businessEvents, EVENTS } = require('./businessEventEngine.service');   // ERP Step 5 — GOODS_RECEIVED
 const auditService = require('./audit.service');
 const { ApiError } = require('../utils/ApiError');
 const logger = require('../config/logger');
@@ -256,12 +258,87 @@ class GoodsReceiptService {
       logger.warn(`[grn] failed to update PO quantities: ${e.message}`);
     }
 
+    // ── ERP Step 5: physically receive goods into inventory ──────────────────
+    // Receiving is the single inventory-increment point of the procurement flow
+    // (the later Bill only posts the AP liability). Best-effort — a stock-sync
+    // failure must never block confirming the receipt.
+    try {
+      await this._applyReceivedStock(grn, user);
+    } catch (e) {
+      logger.warn(`[grn] inventory stock-in failed for ${grn.grnNumber}: ${e.message}`);
+    }
+
     return this._applyStateChange(grn, targetState, user, {
       reason: targetState === GRN_STATES.DISCREPANCY_REPORTED
         ? `${grn.discrepancies.length} discrepancies detected`
         : 'All items received as ordered',
       ipAddress,
     });
+  }
+
+  /**
+   * ERP Step 5 — add received goods to inventory at their landed unit cost.
+   *
+   * For each received line that references a tracked InventoryItem, increment
+   * stock by the ACCEPTED quantity (received − rejected) via
+   * inventoryService.applyPurchaseStock (weighted-average cost; no journal — the
+   * Bill posts the AP/Inventory journal). Lines without an inventoryItemId
+   * (services, untracked customs) are skipped. Idempotent via grn.inventoryApplied.
+   *
+   * Broadcasts GOODS_RECEIVED once with a per-item summary so procurement
+   * analytics, dashboards and forecasting can react.
+   * @private
+   */
+  async _applyReceivedStock(grn, user) {
+    if (grn.inventoryApplied) {
+      logger.debug(`[grn] stock already applied for ${grn.grnNumber} — skipping`);
+      return;
+    }
+
+    const applied = [];
+    for (const ri of (grn.receivedItems || [])) {
+      if (!ri.inventoryItemId) continue;                 // untracked line — skip
+      const acceptedQty = Math.max(0, Number(ri.quantityReceived || 0) - Number(ri.quantityRejected || 0));
+      if (acceptedQty <= 0) continue;
+
+      try {
+        await inventoryService.applyPurchaseStock(
+          grn.businessId,
+          ri.inventoryItemId,
+          acceptedQty,
+          Number(ri.unitCost) || 0,
+          { userId: user._id, vendorId: grn.vendorId || null },
+        );
+        applied.push({
+          inventoryItemId: ri.inventoryItemId,
+          name: ri.name,
+          qty: acceptedQty,
+          unitCost: Number(ri.unitCost) || 0,
+        });
+      } catch (e) {
+        // One bad line shouldn't abort the rest of the receipt.
+        logger.warn(`[grn] stock-in failed for item ${ri.inventoryItemId} on ${grn.grnNumber}: ${e.message}`);
+      }
+    }
+
+    grn.inventoryApplied   = true;
+    grn.inventoryAppliedAt = new Date();
+    await grn.save();
+
+    if (applied.length > 0) {
+      businessEvents.emit(EVENTS.GOODS_RECEIVED, {
+        businessId:      grn.businessId.toString(),
+        userId:          user._id,
+        entityType:      ENTITY_TYPES.GOODS_RECEIPT,
+        entityId:        grn._id,
+        grnNumber:       grn.grnNumber,
+        purchaseOrderId: grn.purchaseOrderId || null,
+        vendorId:        grn.vendorId || null,
+        items:           applied,
+        lineCount:       applied.length,
+      });
+      logger.info(`[grn] ${grn.grnNumber}: received ${applied.length} item(s) into inventory`);
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
