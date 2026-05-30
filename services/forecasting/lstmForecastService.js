@@ -24,6 +24,9 @@
 const JournalEntry  = require('../../models/JournalEntry.model');
 const mongoose      = require('mongoose');
 const { JOURNAL_STATUS } = require('../../config/constants');
+const config        = require('../../config');                 // F3 — registry flag
+const forecastStore = require('./forecastStore.service');      // F3 — persist + baseline gate
+const classical     = require('./classical');                  // F3 — backtestable model under test
 
 /* ── Python LSTM microservice config ── */
 const LSTM_API_URL          = process.env.LSTM_API_URL  || 'http://localhost:8000';
@@ -864,6 +867,15 @@ async function generateLSTMForecast(businessId, target = 'Revenue', horizonMonth
             lstmResult.scenarios   = scenarios;
             lstmResult.anomalyRisk = anomalyRisk;
             lstmResult.dataSufficiency = { months: recentEntries.length, tier: 'rich', isInsufficient: false, message: 'Bi-LSTM trained on live transactions.' };
+            // F3 — persist the served run for audit + ex-post accuracy (fire-and-forget).
+            if (config.FORECAST_REGISTRY_ENABLED) {
+              forecastStore.recordForecast(businessId, {
+                target, granularity: 'monthly', horizon: horizonMonths, series: [],
+                modelType: lstmResult.modelType, predicted: lstmResult.predicted,
+                lower: lstmResult.lower, upper: lstmResult.upper,
+                periodLabels: lstmResult.labels, dataSource: lstmResult.dataSource,
+              }).catch(() => {});
+            }
             _cacheSet(cacheKey, lstmResult);
             return lstmResult;
           }
@@ -1013,6 +1025,20 @@ async function generateLSTMForecast(businessId, target = 'Revenue', horizonMonth
     currency,
     generatedAt:     new Date().toISOString(),
   };
+
+  // F3 — backtest the classical model vs seasonal-naive, register the version,
+  // persist the served run, and apply the baseline gate. Fire-and-forget: the
+  // registry is pure governance and can never block or break a forecast.
+  if (config.FORECAST_REGISTRY_ENABLED) {
+    const seasonPeriod = tier === 'rich' ? 3 : tier === 'adequate' ? 2 : 1;
+    forecastStore.recordForecast(businessId, {
+      target, granularity: 'monthly', horizon: horizonMonths, series: rawSeries, period: seasonPeriod,
+      forecastFn: (tr, h) => classical.holtWintersForecaster(tr, h, { period: seasonPeriod }),
+      modelType, predicted, lower, upper, periodLabels: forecastLabels, dataSource,
+    }).then((verdict) => {
+      if (verdict) { result.baselineGate = verdict; }
+    }).catch(() => {});
+  }
 
   _cacheSet(cacheKey, result);
   return result;

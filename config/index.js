@@ -63,4 +63,9 @@ module.exports = {
   /** Treat Invoice/Bill as the authoritative AR/AP source of truth and the
    *  JournalEntry as its immutable projection. Default on (post M1–M8). */
   AR_AP_AUTHORITATIVE: process.env.AR_AP_AUTHORITATIVE !== 'false',
+
+  // ── Forecast Platform F3 — registry / persistence / baseline gate ───────────
+  /** Persist every forecast to ForecastRun, register model versions, and apply
+   *  the seasonal-naive baseline gate. Default on; set 'false' to disable. */
+  FORECAST_REGISTRY_ENABLED: process.env.FORECAST_REGISTRY_ENABLED !== 'false',
 };

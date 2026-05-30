@@ -52,6 +52,13 @@ const startServer = async () => {
       logger.warn(`⚠️ Payment reminder job failed to schedule (non-fatal): ${err.message}`);
     }
 
+    // Forecast Platform F3: capture realized forecast accuracy daily (09:00)
+    try {
+      require('./jobs/forecastAccuracy.job').scheduleForecastAccuracy();
+    } catch (err) {
+      logger.warn(`⚠️ Forecast accuracy job failed to schedule (non-fatal): ${err.message}`);
+    }
+
     // Step 3c: Schedule AP automation jobs (Phase 3.3)
     try {
       const cron = require('node-cron');
