@@ -300,10 +300,21 @@ const billSchema = new mongoose.Schema(
   {
     timestamps: true,
     toJSON: {
+      virtuals: true,
       transform: (doc, ret) => { delete ret.__v; return ret; },
     },
+    toObject: { virtuals: true },
   }
 );
+
+// ── AR/AP M3 — canonical unified status (derived, never stored) ──────────────
+const { deriveUnifiedStatus } = require('../utils/unifiedStatus');
+billSchema.virtual('unifiedStatus').get(function () {
+  return deriveUnifiedStatus({
+    state: this.state, paidAmount: this.paidAmount,
+    remainingBalance: this.remainingBalance, totalAmount: this.totalAmount,
+  });
+});
 
 // ── Indexes ───────────────────────────────────────────────────────────────────
 billSchema.index({ businessId: 1, billNumber: 1 }, { unique: true, sparse: true });

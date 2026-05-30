@@ -468,6 +468,10 @@ module.exports = {
     CANCELLED:         'cancelled',
     DISPUTED:          'disputed',
     WRITTEN_OFF:       'written_off',
+    // AR/AP M3 — promote to real enum members (were referenced by the transition
+    // map but missing from the enum). `voided` = GL-correct void (M5).
+    REJECTED:          'rejected',
+    VOIDED:            'voided',
   },
 
   /**
@@ -476,17 +480,18 @@ module.exports = {
    * invoice may legally move to next.  Used by service-layer guards.
    */
   INVOICE_TRANSITIONS: {
-    draft:             ['pending_approval', 'approved', 'cancelled'],
-    pending_approval:  ['approved', 'rejected', 'draft', 'cancelled'],
-    approved:          ['sent', 'partially_paid', 'paid', 'cancelled', 'disputed', 'overdue'],
-    sent:              ['partially_paid', 'paid', 'overdue', 'disputed', 'cancelled'],
-    partially_paid:    ['paid', 'overdue', 'disputed', 'written_off'],
+    draft:             ['pending_approval', 'approved', 'cancelled', 'rejected', 'voided'],
+    pending_approval:  ['approved', 'rejected', 'draft', 'cancelled', 'voided'],
+    approved:          ['sent', 'partially_paid', 'paid', 'cancelled', 'disputed', 'overdue', 'voided'],
+    sent:              ['partially_paid', 'paid', 'overdue', 'disputed', 'cancelled', 'voided'],
+    partially_paid:    ['paid', 'overdue', 'disputed', 'written_off', 'voided'],
     paid:              [], // terminal
-    overdue:           ['partially_paid', 'paid', 'disputed', 'written_off', 'cancelled'],
+    overdue:           ['partially_paid', 'paid', 'disputed', 'written_off', 'cancelled', 'voided'],
     cancelled:         [], // terminal
-    disputed:          ['approved', 'sent', 'partially_paid', 'paid', 'written_off', 'cancelled'],
+    disputed:          ['approved', 'sent', 'partially_paid', 'paid', 'written_off', 'cancelled', 'voided'],
     written_off:       [], // terminal
-    rejected:          ['draft', 'cancelled'],
+    rejected:          ['draft', 'cancelled', 'voided'],
+    voided:            [], // terminal (GL-correct void — M5)
   },
 
   // ===============================
@@ -504,18 +509,22 @@ module.exports = {
     PAID:                'paid',
     OVERDUE:             'overdue',
     CANCELLED:           'cancelled',
+    // AR/AP M3 — real enum members (rejected was referenced but missing).
+    REJECTED:            'rejected',
+    VOIDED:              'voided',
   },
 
   BILL_TRANSITIONS: {
-    draft:               ['awaiting_approval', 'approved', 'cancelled'],
-    awaiting_approval:   ['approved', 'rejected', 'draft', 'cancelled'],
-    approved:            ['scheduled', 'partially_paid', 'paid', 'cancelled', 'overdue'],
-    scheduled:           ['partially_paid', 'paid', 'overdue', 'cancelled'],
-    partially_paid:      ['paid', 'overdue', 'cancelled'],
+    draft:               ['awaiting_approval', 'approved', 'cancelled', 'rejected', 'voided'],
+    awaiting_approval:   ['approved', 'rejected', 'draft', 'cancelled', 'voided'],
+    approved:            ['scheduled', 'partially_paid', 'paid', 'cancelled', 'overdue', 'voided'],
+    scheduled:           ['partially_paid', 'paid', 'overdue', 'cancelled', 'voided'],
+    partially_paid:      ['paid', 'overdue', 'cancelled', 'voided'],
     paid:                [], // terminal
-    overdue:             ['partially_paid', 'paid', 'cancelled'],
+    overdue:             ['partially_paid', 'paid', 'cancelled', 'voided'],
     cancelled:           [], // terminal
-    rejected:            ['draft', 'cancelled'],
+    rejected:            ['draft', 'cancelled', 'voided'],
+    voided:              [], // terminal (GL-correct void — M5)
   },
 
   /**
