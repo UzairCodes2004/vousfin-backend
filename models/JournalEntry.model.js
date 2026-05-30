@@ -223,6 +223,17 @@ const journalEntrySchema = new mongoose.Schema(
       enum: Object.values(TRANSACTION_SOURCES),
       default: TRANSACTION_SOURCES.MANUAL,
     },
+
+    // ── AR/AP Refactor M9 — dual-write retirement ─────────────────────────────
+    // Marks this entry as the immutable GL PROJECTION of an authoritative
+    // Invoice/Bill document. The document owns the lifecycle; this entry is
+    // generated/reconciled from it and is never the master for AR/AP money.
+    isProjection: { type: Boolean, default: false, index: true },
+    projectionOf: {
+      documentType: { type: String, enum: ['invoice', 'bill', null], default: null },
+      documentId:   { type: mongoose.Schema.Types.ObjectId, default: null },
+    },
+
     notes: {
       type: String,
       default: null,

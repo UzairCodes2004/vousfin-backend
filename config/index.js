@@ -55,4 +55,12 @@ module.exports = {
   SKIP_EMAIL_VERIFICATION:
     process.env.SKIP_EMAIL_VERIFICATION === 'true' ||
     (process.env.NODE_ENV || 'development') !== 'production',
+
+  // ── AR/AP Refactor M9 — event sourcing / dual-write retirement ──────────────
+  /** Persist every domain event to the durable EventLog collection (system of
+   *  record for replay/rebuild). Default on; set 'false' to disable the writer. */
+  EVENT_LOG_ENABLED: process.env.EVENT_LOG_ENABLED !== 'false',
+  /** Treat Invoice/Bill as the authoritative AR/AP source of truth and the
+   *  JournalEntry as its immutable projection. Default on (post M1–M8). */
+  AR_AP_AUTHORITATIVE: process.env.AR_AP_AUTHORITATIVE !== 'false',
 };

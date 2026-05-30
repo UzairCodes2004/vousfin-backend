@@ -434,6 +434,9 @@ module.exports = {
     DUNNING_ESCALATED:   'Dunning Escalated',
     STATEMENT_GENERATED: 'Statement Generated',
     DISCOUNT_APPLIED:    'Early Payment Discount Applied',
+    // ── AR/AP Refactor M9 — event sourcing / projection integrity ─────────────
+    EVENT_REPLAYED:      'Event Replayed',
+    PROJECTION_REBUILT:  'Projection Rebuilt',
   },
 
   ENTITY_TYPES: {
@@ -458,6 +461,8 @@ module.exports = {
     PAYMENT:           'payment',
     // ── AR/AP Refactor M8: recurring invoice schedule ────────────────────────
     INVOICE_SCHEDULE:  'invoiceSchedule',
+    // ── AR/AP Refactor M9: durable event log ──────────────────────────────────
+    EVENT_LOG:         'eventLog',
   },
 
   // ===============================

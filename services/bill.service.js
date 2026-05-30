@@ -606,6 +606,9 @@ class BillService {
         exchangeRate:     bill.exchangeRate || 1,
         createdBy:        user._id,
         lastModifiedBy:   user._id,
+        // M9 — this entry is the immutable projection of the authoritative bill.
+        isProjection:     true,
+        projectionOf:     { documentType: 'bill', documentId: bill._id },
       });
       apCredited = r2(apCredited + primaryAmount);
     } catch (e) {

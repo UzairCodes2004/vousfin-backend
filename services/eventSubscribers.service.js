@@ -30,7 +30,7 @@
 
 'use strict';
 
-const { businessEvents, EVENTS } = require('./businessEventEngine.service');
+const { businessEvents, EVENTS, WILDCARD } = require('./businessEventEngine.service');
 const reportCache = require('../utils/reportCache');
 const logger = require('../config/logger');
 
@@ -123,9 +123,20 @@ function registerAll() {
     );
   }, { name: 'ar-ap-document-reconcile' });
 
+  // ── AR/AP refactor M9 — durable event log writer (system of record) ───────
+  // A wildcard observer persists EVERY domain event to the EventLog collection
+  // so events survive restarts and can be replayed to rebuild projections.
+  // Fire-and-forget + error-isolated; skips replayed events (__replay) so a
+  // replay never re-persists. Lazy-require avoids a load-time cycle.
+  businessEvents.on(WILDCARD, async (evt) => {
+    if (!evt || evt.__replay) return;
+    const eventLog = require('./eventLog.service');
+    await eventLog.record(evt, { handlerErrors: 0 });
+  }, { name: 'durable-event-log-writer' });
+
   logger.info(
     `[eventSubscribers] analytics cache-sync on ${CACHE_INVALIDATING_EVENTS.length} event types ` +
-    `+ AR/AP document reconciliation on payment.recorded`
+    `+ AR/AP document reconciliation on payment.recorded + durable event-log writer`
   );
   return true;
 }

@@ -643,6 +643,9 @@ class InvoiceService {
         exchangeRate:      invoice.exchangeRate || 1,
         createdBy:         user._id,
         lastModifiedBy:    user._id,
+        // M9 — this entry is the immutable projection of the authoritative invoice.
+        isProjection:      true,
+        projectionOf:      { documentType: 'invoice', documentId: invoice._id },
       });
       arDebited = r2(arDebited + primaryAmount);
     } catch (e) {
