@@ -139,6 +139,21 @@ exports.applyCreditMemo = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
+// M8 — early-payment discount
+exports.previewEarlyPaymentDiscount = async (req, res, next) => {
+  try {
+    const preview = await invoiceService.previewEarlyPaymentDiscount(req.params.id);
+    ApiResponse.success(res, preview, 'Early-payment discount preview');
+  } catch (err) { next(err); }
+};
+
+exports.applyEarlyPaymentDiscount = async (req, res, next) => {
+  try {
+    const invoice = await invoiceService.applyEarlyPaymentDiscount(req.params.id, actor(req), req.ip);
+    ApiResponse.success(res, invoice, 'Early-payment discount applied');
+  } catch (err) { next(err); }
+};
+
 // M6 — multi-level approval actions
 exports.reassignApproval = async (req, res, next) => {
   try {

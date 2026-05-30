@@ -9,5 +9,6 @@ router.use(authMiddleware, requireBusiness);
 
 router.get('/aging',          ctrl.aging);          // ?type=receivable|payable → buckets + party aging + reconciliation
 router.get('/reconciliation', ctrl.reconciliation); // ?type=receivable|payable
+router.get('/statement',      ctrl.customerStatement); // M8 — ?customerId=&from=&to=
 
 module.exports = router;

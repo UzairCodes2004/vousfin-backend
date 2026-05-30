@@ -31,6 +31,8 @@ const procurementAnalyticsRoutes = require('./v1/procurementAnalytics.routes'); 
 const auditRoutes = require('./v1/audit.routes'); // ERP Step 9 — unified audit trail
 const paymentRoutes = require('./v1/payment.routes'); // AR/AP M2 — first-class Payment entity
 const arApReportRoutes = require('./v1/arApReport.routes'); // AR/AP M7 — unified aging read model
+const invoiceScheduleRoutes = require('./v1/invoiceSchedule.routes'); // AR/AP M8 — recurring invoices
+const dunningRoutes = require('./v1/dunning.routes'); // AR/AP M8 — dunning / collections
 
 // Mount v1 routes under /api/v1
 router.use('/auth', authRoutes);
@@ -61,6 +63,8 @@ router.use('/procurement-analytics', procurementAnalyticsRoutes); // Phase 3.4 �
 router.use('/audit',                 auditRoutes);                // ERP Step 9 — unified audit trail
 router.use('/payments',              paymentRoutes);              // AR/AP M2 — first-class Payment entity
 router.use('/ar-ap',                 arApReportRoutes);           // AR/AP M7 — unified aging read model
+router.use('/invoice-schedules',     invoiceScheduleRoutes);      // AR/AP M8 — recurring invoices
+router.use('/dunning',               dunningRoutes);              // AR/AP M8 — dunning / collections
 
 // Health check endpoint (versioned)
 router.get('/health', (req, res) => {

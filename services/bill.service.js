@@ -18,6 +18,7 @@ const { postBalancedJournal } = require('./ledgerPosting.service'); // ERP Step 
 const { businessEvents, EVENTS } = require('./businessEventEngine.service'); // ERP Step 4 — event broadcasts
 const { ApiError } = require('../utils/ApiError');
 const { validateDocumentData, assertNoDuplicateNumber, assertPartyExists } = require('../utils/arApValidation'); // M4
+const paymentTermsUtil = require('../utils/paymentTerms'); // M8 — structured payment terms
 const logger = require('../config/logger');
 const {
   BILL_STATES,
@@ -103,6 +104,15 @@ class BillService {
 
     const snap = await this._vendorSnapshot(data.businessId, data.vendorId);
 
+    // ── M8 — structured payment terms drive dueDate + early-pay discount ──────
+    let termsSnapshot;
+    let derivedDueDate = data.dueDate || null;
+    if (data.paymentTermsCode || data.paymentTerms) {
+      termsSnapshot = paymentTermsUtil.buildSnapshot(data.paymentTermsCode || data.paymentTerms);
+      termsSnapshot.discountDeadline = paymentTermsUtil.computeDiscountDeadline(data.issueDate, termsSnapshot);
+      if (!derivedDueDate) derivedDueDate = paymentTermsUtil.computeDueDate(data.issueDate, termsSnapshot);
+    }
+
     const estimateAmount = data.amount || (hasLines
       ? data.lineItems.reduce((s, li) => s + (li.quantity || 0) * (li.unitPrice || 0), 0)
       : 0);
@@ -130,7 +140,8 @@ class BillService {
       attachments:          data.attachments || [],
 
       issueDate:            data.issueDate,
-      dueDate:              data.dueDate || null,
+      dueDate:              derivedDueDate,
+      paymentTerms:         termsSnapshot || undefined,
       state:                BILL_STATES.DRAFT,
       approvalRequired,
       approvalStatus:       approvalRequired ? APPROVAL_STATUS.PENDING : APPROVAL_STATUS.NOT_REQUIRED,
@@ -307,6 +318,18 @@ class BillService {
     const bill = await this._loadOrThrow(id);
     const arApVoidCredit = require('./arApVoidCredit.service');
     return arApVoidCredit.applyCreditMemo('bill', bill, amount, reason, user, ipAddress);
+  }
+
+  /** M8 — preview the early-payment discount currently available on this bill. */
+  async previewEarlyPaymentDiscount(id) {
+    const bill = await this._loadOrThrow(id);
+    return require('./earlyPaymentDiscount.service').preview('bill', bill);
+  }
+
+  /** M8 — realize the early-payment discount taken (DR AP / CR Discount Received). */
+  async applyEarlyPaymentDiscount(id, user, ipAddress) {
+    const bill = await this._loadOrThrow(id);
+    return require('./earlyPaymentDiscount.service').apply('bill', bill, user, ipAddress, {});
   }
 
   /**

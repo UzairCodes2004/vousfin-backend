@@ -242,6 +242,18 @@ const billSchema = new mongoose.Schema(
     dueDate:          { type: Date, default: null, index: true },
     scheduledPayDate: { type: Date, default: null }, // when AP plans to pay this bill
 
+    // ── AR/AP M8 — structured payment terms (drives dueDate + early-pay discount)
+    paymentTerms: {
+      code:                { type: String, default: null },
+      label:               { type: String, default: null },
+      netDays:             { type: Number, default: null, min: 0 },
+      discountPct:         { type: Number, default: 0, min: 0 },
+      discountDays:        { type: Number, default: 0, min: 0 },
+      discountDeadline:    { type: Date,   default: null },
+      discountTakenAt:     { type: Date,   default: null },
+      discountTakenAmount: { type: Number, default: 0, min: 0 },
+    },
+
     state: {
       type: String,
       enum: Object.values(BILL_STATES),

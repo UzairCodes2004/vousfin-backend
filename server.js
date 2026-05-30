@@ -77,9 +77,33 @@ const startServer = async () => {
         }
       });
 
-      logger.info('⏰ AP automation jobs scheduled (recurring bills + reminders)');
+      // ── AR/AP M8 — recurring invoices + dunning ──────────────────────────
+      const invoiceSchedulerService = require('./services/invoiceScheduler.service');
+      const dunningService = require('./services/dunning.service');
+
+      // Daily at 06:00 — generate invoices from recurring schedules
+      cron.schedule('0 6 * * *', async () => {
+        try {
+          const ids = await invoiceSchedulerService.generateDueInvoices();
+          if (ids.length) logger.info(`[cron] Generated ${ids.length} recurring invoices`);
+        } catch (err) {
+          logger.error(`[cron] generateDueInvoices error: ${err.message}`);
+        }
+      });
+
+      // Daily at 08:00 — advance the dunning / collections ladder
+      cron.schedule('0 8 * * *', async () => {
+        try {
+          const r = await dunningService.runEscalation();
+          logger.info(`[cron] Dunning escalation: ${r.escalated}/${r.scanned} invoices escalated`);
+        } catch (err) {
+          logger.error(`[cron] dunning runEscalation error: ${err.message}`);
+        }
+      });
+
+      logger.info('⏰ AR/AP automation jobs scheduled (recurring bills + invoices + reminders + dunning)');
     } catch (err) {
-      logger.warn(`⚠️ AP automation jobs failed to schedule (non-fatal): ${err.message}`);
+      logger.warn(`⚠️ AR/AP automation jobs failed to schedule (non-fatal): ${err.message}`);
     }
 
     try {

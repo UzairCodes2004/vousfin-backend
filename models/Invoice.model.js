@@ -230,6 +230,37 @@ const invoiceSchema = new mongoose.Schema(
     // Payment terms text shown on PDF
     paymentTermsText: { type: String, default: null, maxlength: 500, trim: true },
 
+    // ── AR/AP M8 — structured payment terms (drives dueDate + early-pay discount)
+    // Immutable snapshot of the PAYMENT_TERMS entry at creation, so historic
+    // documents are unaffected by later edits to the terms table.
+    paymentTerms: {
+      code:             { type: String, default: null },
+      label:            { type: String, default: null },
+      netDays:          { type: Number, default: null, min: 0 },
+      discountPct:      { type: Number, default: 0, min: 0 },
+      discountDays:     { type: Number, default: 0, min: 0 },
+      discountDeadline: { type: Date,   default: null },
+      // Set once an early-payment discount is realized against this document.
+      discountTakenAt:     { type: Date,   default: null },
+      discountTakenAmount: { type: Number, default: 0, min: 0 },
+    },
+
+    // ── AR/AP M8 — recurring schedule linkage ─────────────────────────────────
+    isRecurring:         { type: Boolean, default: false, index: true },
+    recurringScheduleId: { type: mongoose.Schema.Types.ObjectId, ref: 'InvoiceSchedule', default: null, index: true },
+
+    // ── AR/AP M8 — dunning / collections ladder ───────────────────────────────
+    dunningLevel: { type: Number, default: 0, min: 0, max: 5, index: true }, // 0=none … 5=collections
+    dunningHistory: [{
+      level:      { type: Number, required: true },
+      levelKey:   { type: String, default: null },
+      label:      { type: String, default: null },
+      daysOverdue:{ type: Number, default: null },
+      escalatedAt:{ type: Date,   default: Date.now },
+      channel:    { type: String, default: 'system' }, // system | email
+      note:       { type: String, default: null },
+    }],
+
     // ── Phase 2: Credit Note reference ───────────────────────────────────
     creditNoteIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'CreditNote' }],
     totalCredited: { type: Number, default: 0, min: 0 },

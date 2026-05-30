@@ -34,6 +34,7 @@ const { postBalancedJournal } = require('./ledgerPosting.service'); // ERP Step 
 const { businessEvents, EVENTS } = require('./businessEventEngine.service'); // ERP Step 4 — event broadcasts
 const { ApiError } = require('../utils/ApiError');
 const { validateDocumentData, assertNoDuplicateNumber, assertPartyExists } = require('../utils/arApValidation'); // M4
+const paymentTermsUtil = require('../utils/paymentTerms'); // M8 — structured payment terms
 const logger = require('../config/logger');
 const {
   INVOICE_STATES,
@@ -130,6 +131,17 @@ class InvoiceService {
 
     const snap = await this._customerSnapshot(data.businessId, data.customerId);
 
+    // ── M8 — structured payment terms drive dueDate + discount window ─────────
+    // Backward-compatible: only engages when paymentTermsCode/paymentTerms is
+    // supplied; an explicit data.dueDate always wins over the derived one.
+    let termsSnapshot;
+    let derivedDueDate = data.dueDate || null;
+    if (data.paymentTermsCode || data.paymentTerms) {
+      termsSnapshot = paymentTermsUtil.buildSnapshot(data.paymentTermsCode || data.paymentTerms);
+      termsSnapshot.discountDeadline = paymentTermsUtil.computeDiscountDeadline(data.issueDate, termsSnapshot);
+      if (!derivedDueDate) derivedDueDate = paymentTermsUtil.computeDueDate(data.issueDate, termsSnapshot);
+    }
+
     // Multi-currency: resolve FX rate if foreign currency
     let fxFields = {};
     const txnCurrency = (data.currencyCode || 'PKR').toUpperCase();
@@ -183,7 +195,10 @@ class InvoiceService {
       attachments:       data.attachments || [],
 
       issueDate:         data.issueDate,
-      dueDate:           data.dueDate || null,
+      dueDate:           derivedDueDate,
+      paymentTerms:      termsSnapshot || undefined,
+      isRecurring:       data.isRecurring || false,
+      recurringScheduleId: data.recurringScheduleId || null,
       state:             INVOICE_STATES.DRAFT,
       approvalRequired,
       approvalStatus:    approvalRequired ? APPROVAL_STATUS.PENDING : APPROVAL_STATUS.NOT_REQUIRED,
@@ -442,6 +457,18 @@ class InvoiceService {
     const invoice = await this._loadOrThrow(id);
     const arApVoidCredit = require('./arApVoidCredit.service');
     return arApVoidCredit.applyCreditMemo('invoice', invoice, amount, reason, user, ipAddress);
+  }
+
+  /** M8 — preview the early-payment discount currently available on this invoice. */
+  async previewEarlyPaymentDiscount(id) {
+    const invoice = await this._loadOrThrow(id);
+    return require('./earlyPaymentDiscount.service').preview('invoice', invoice);
+  }
+
+  /** M8 — realize the early-payment discount (DR Sales Returns / CR AR) if in window. */
+  async applyEarlyPaymentDiscount(id, user, ipAddress) {
+    const invoice = await this._loadOrThrow(id);
+    return require('./earlyPaymentDiscount.service').apply('invoice', invoice, user, ipAddress, {});
   }
 
   async dispute(id, user, reason, ipAddress) {

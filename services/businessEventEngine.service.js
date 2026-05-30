@@ -84,6 +84,11 @@ const EVENTS = Object.freeze({
   INVOICE_VOIDED:               'invoice.voided',     // AR/AP M5 — GL-correct void
   BILL_VOIDED:                  'bill.voided',
   CREDIT_MEMO_APPLIED:          'credit_memo.applied',
+  // ── AR/AP M8 — enterprise extras ──────────────────────────────────────────
+  RECURRING_INVOICE_GENERATED:  'invoice.recurring_generated',
+  DUNNING_ESCALATED:            'dunning.escalated',
+  EARLY_PAYMENT_DISCOUNT_APPLIED: 'ar_ap.early_payment_discount',
+  CUSTOMER_STATEMENT_GENERATED: 'customer.statement_generated',
 
   // ── Parties ───────────────────────────────────────────────────────────────
   VENDOR_BALANCE_CHANGED:       'vendor.balance_changed',

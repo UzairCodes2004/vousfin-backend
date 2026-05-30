@@ -429,6 +429,11 @@ module.exports = {
     // ── AR/AP Refactor M5 ─────────────────────────────────────────────────────
     VOIDED:          'Voided',
     CREDIT_APPLIED:  'Credit Memo Applied',
+    // ── AR/AP Refactor M8 — enterprise extras ─────────────────────────────────
+    RECURRING_GENERATED: 'Recurring Document Generated',
+    DUNNING_ESCALATED:   'Dunning Escalated',
+    STATEMENT_GENERATED: 'Statement Generated',
+    DISCOUNT_APPLIED:    'Early Payment Discount Applied',
   },
 
   ENTITY_TYPES: {
@@ -451,6 +456,8 @@ module.exports = {
     VENDOR_CREDIT:     'vendorCredit',
     // ── AR/AP Refactor M2: first-class Payment entity ────────────────────────
     PAYMENT:           'payment',
+    // ── AR/AP Refactor M8: recurring invoice schedule ────────────────────────
+    INVOICE_SCHEDULE:  'invoiceSchedule',
   },
 
   // ===============================
@@ -837,6 +844,43 @@ module.exports = {
     MONTHLY:   'monthly',
     QUARTERLY: 'quarterly',
     ANNUAL:    'annual',
+  },
+
+  // ===============================
+  // AR/AP Refactor M8 — Enterprise extras
+  // ===============================
+
+  /**
+   * Structured payment terms (data-driven so the terms engine in
+   * utils/paymentTerms.js can derive dueDate + early-payment discount windows
+   * without hard-coding). `netDays` drives dueDate; `discountPct`/`discountDays`
+   * model "X/Y net Z" early-payment-discount terms (e.g. 2/10 net 30).
+   */
+  PAYMENT_TERMS: {
+    DUE_ON_RECEIPT: { code: 'DUE_ON_RECEIPT', label: 'Due on Receipt', netDays: 0,  discountPct: 0, discountDays: 0 },
+    NET_7:          { code: 'NET_7',          label: 'Net 7',          netDays: 7,  discountPct: 0, discountDays: 0 },
+    NET_15:         { code: 'NET_15',         label: 'Net 15',         netDays: 15, discountPct: 0, discountDays: 0 },
+    NET_30:         { code: 'NET_30',         label: 'Net 30',         netDays: 30, discountPct: 0, discountDays: 0 },
+    NET_45:         { code: 'NET_45',         label: 'Net 45',         netDays: 45, discountPct: 0, discountDays: 0 },
+    NET_60:         { code: 'NET_60',         label: 'Net 60',         netDays: 60, discountPct: 0, discountDays: 0 },
+    NET_90:         { code: 'NET_90',         label: 'Net 90',         netDays: 90, discountPct: 0, discountDays: 0 },
+    '1_10_NET_30':  { code: '1_10_NET_30',    label: '1/10 Net 30',    netDays: 30, discountPct: 1, discountDays: 10 },
+    '2_10_NET_30':  { code: '2_10_NET_30',    label: '2/10 Net 30',    netDays: 30, discountPct: 2, discountDays: 10 },
+    '2_10_NET_60':  { code: '2_10_NET_60',    label: '2/10 Net 60',    netDays: 60, discountPct: 2, discountDays: 10 },
+  },
+
+  /**
+   * Dunning (collections) ladder for overdue receivables. Each level has a
+   * `minDaysOverdue` threshold; the daily dunning job advances an invoice to the
+   * highest level whose threshold it has crossed (idempotent per level).
+   */
+  DUNNING_LEVELS: {
+    NONE:          { level: 0, key: 'none',          label: 'None',                minDaysOverdue: null },
+    REMINDER:      { level: 1, key: 'reminder',      label: 'Friendly Reminder',   minDaysOverdue: 1  },
+    FIRST_NOTICE:  { level: 2, key: 'first_notice',  label: 'First Notice',        minDaysOverdue: 15 },
+    SECOND_NOTICE: { level: 3, key: 'second_notice', label: 'Second Notice',       minDaysOverdue: 30 },
+    FINAL_NOTICE:  { level: 4, key: 'final_notice',  label: 'Final Notice',        minDaysOverdue: 45 },
+    COLLECTIONS:   { level: 5, key: 'collections',   label: 'Sent to Collections', minDaysOverdue: 60 },
   },
 
   /** Vendor risk levels */
