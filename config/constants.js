@@ -423,6 +423,9 @@ module.exports = {
     WRITTEN_OFF:   'Written Off',
     STATE_CHANGED: 'State Changed',
     SCHEDULED:     'Scheduled',
+    // ── AR/AP Refactor M2 ─────────────────────────────────────────────────────
+    PAYMENT_APPLIED: 'Payment Applied',
+    PAYMENT_VOIDED:  'Payment Voided',
   },
 
   ENTITY_TYPES: {
@@ -443,6 +446,8 @@ module.exports = {
     PURCHASE_ORDER:    'purchaseOrder',
     GOODS_RECEIPT:     'goodsReceipt',
     VENDOR_CREDIT:     'vendorCredit',
+    // ── AR/AP Refactor M2: first-class Payment entity ────────────────────────
+    PAYMENT:           'payment',
   },
 
   // ===============================

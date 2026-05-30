@@ -29,6 +29,7 @@ const vendorRiskRoutes    = require('./v1/vendorRisk.routes');    // Phase 3.3 �
 const expenseAllocationRoutes = require('./v1/expenseAllocation.routes'); // Phase 3.3 — Allocation
 const procurementAnalyticsRoutes = require('./v1/procurementAnalytics.routes'); // Phase 3.4 — Analytics
 const auditRoutes = require('./v1/audit.routes'); // ERP Step 9 — unified audit trail
+const paymentRoutes = require('./v1/payment.routes'); // AR/AP M2 — first-class Payment entity
 
 // Mount v1 routes under /api/v1
 router.use('/auth', authRoutes);
@@ -57,6 +58,7 @@ router.use('/vendor-risk',      vendorRiskRoutes);         // Phase 3.3 — Risk
 router.use('/expense-allocation',    expenseAllocationRoutes);    // Phase 3.3 — Allocation
 router.use('/procurement-analytics', procurementAnalyticsRoutes); // Phase 3.4 — Analytics
 router.use('/audit',                 auditRoutes);                // ERP Step 9 — unified audit trail
+router.use('/payments',              paymentRoutes);              // AR/AP M2 — first-class Payment entity
 
 // Health check endpoint (versioned)
 router.get('/health', (req, res) => {

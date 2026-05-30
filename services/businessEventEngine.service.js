@@ -68,6 +68,7 @@ const EVENTS = Object.freeze({
   TRANSACTION_EDITED:           'transaction.edited',
   TRANSACTION_DELETED:          'transaction.deleted',
   PAYMENT_RECORDED:             'payment.recorded',
+  PAYMENT_APPLIED:              'payment.applied',   // AR/AP M2 — first-class Payment posted
 
   // ── Accounts payable / bills ──────────────────────────────────────────────
   BILL_CREATED:                 'bill.created',

@@ -88,7 +88,11 @@ const recordPayment = async (req, res, next) => {
     const { parentTransactionId, ...paymentData } = req.body;
     if (!parentTransactionId) throw new ApiError(400, 'parentTransactionId is required');
 
-    const paymentTx = await transactionService.recordPartialPayment(
+    // AR/AP M2 — delegate to the first-class Payment service. This records a
+    // Payment (single allocation) and returns the underlying child settlement
+    // transaction, preserving the legacy response contract byte-for-byte.
+    const paymentService = require('../services/payment.service');
+    const paymentTx = await paymentService.recordLegacyPayment(
       parentTransactionId,
       req.user.businessId,
       paymentData,
