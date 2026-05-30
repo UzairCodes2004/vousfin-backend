@@ -59,6 +59,13 @@ const startServer = async () => {
       logger.warn(`⚠️ Forecast accuracy job failed to schedule (non-fatal): ${err.message}`);
     }
 
+    // Forecast Platform F5: weekly + drift-triggered retraining (Mon 03:00)
+    try {
+      if (config.FORECAST_RETRAIN_ENABLED) require('./jobs/forecastRetrain.job').scheduleForecastRetrain();
+    } catch (err) {
+      logger.warn(`⚠️ Forecast retrain job failed to schedule (non-fatal): ${err.message}`);
+    }
+
     // Step 3c: Schedule AP automation jobs (Phase 3.3)
     try {
       const cron = require('node-cron');

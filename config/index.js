@@ -71,4 +71,7 @@ module.exports = {
   /** F4 — serve the multi-model ensemble + conformal-calibrated intervals from
    *  the classical fallback path (replaces single Holt-Winters). Default on. */
   FORECAST_ENSEMBLE_ENABLED: process.env.FORECAST_ENSEMBLE_ENABLED !== 'false',
+  /** F5 — weekly + drift-triggered incremental retraining with champion/
+   *  challenger promotion. Default on. */
+  FORECAST_RETRAIN_ENABLED: process.env.FORECAST_RETRAIN_ENABLED !== 'false',
 };

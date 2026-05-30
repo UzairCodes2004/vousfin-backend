@@ -7,6 +7,8 @@ const ForecastAccuracy = require('../models/ForecastAccuracy.model');
 const forecastStore = require('../services/forecasting/forecastStore.service');
 const classical = require('../services/forecasting/classical');
 const ensembleForecast = require('../services/forecasting/ensembleForecast.service');
+const championChallenger = require('../services/forecasting/championChallenger.service');
+const driftMonitor = require('../services/forecasting/driftMonitor.service');
 const lstm = require('../services/forecasting/lstmForecastService');
 const { runAccuracyCapture } = require('../jobs/forecastAccuracy.job');
 const ApiResponse = require('../utils/ApiResponse');
@@ -98,4 +100,33 @@ exports.ensemble = async (req, res, next) => {
 exports.runAccuracy = async (req, res, next) => {
   try { ApiResponse.success(res, await runAccuracyCapture(), 'Accuracy capture complete'); }
   catch (err) { next(err); }
+};
+
+// POST /forecast-registry/retrain — retrain + champion/challenger decision (F5).
+exports.retrain = async (req, res, next) => {
+  try {
+    const result = await championChallenger.retrain(biz(req), {
+      target: req.body?.target || 'Revenue', granularity: req.body?.granularity || 'monthly',
+    });
+    ApiResponse.success(res, result, result.promoted ? 'Retrained — new champion promoted' : 'Retrained');
+  } catch (err) { next(err); }
+};
+
+// GET /forecast-registry/drift — data-drift + accuracy-decay check (F5).
+exports.drift = async (req, res, next) => {
+  try {
+    const result = await driftMonitor.checkDrift(biz(req), {
+      target: req.query.target || 'Revenue', granularity: req.query.granularity || 'monthly',
+    });
+    ApiResponse.success(res, result, 'Drift check');
+  } catch (err) { next(err); }
+};
+
+// GET /forecast-registry/champion — current champion model for a target (F5).
+exports.champion = async (req, res, next) => {
+  try {
+    const key = `${req.query.target || 'Revenue'}-${req.query.granularity || 'monthly'}`;
+    const champ = await championChallenger.getChampion(biz(req), key);
+    ApiResponse.success(res, champ, 'Current champion');
+  } catch (err) { next(err); }
 };
