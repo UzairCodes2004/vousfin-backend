@@ -113,7 +113,7 @@ class DashboardService {
       ? new mongoose.Types.ObjectId(businessId)
       : businessId;
 
-    const accounts = await accountRepository.findByBusiness(businessId);
+    const accounts = (await accountRepository.findByBusiness(businessId)) || [];
     const cashAccounts = accounts.filter(
       acc => acc.accountSubtype === 'Bank and Cash' || /\b(cash|bank)\b/i.test(acc.accountName)
     );

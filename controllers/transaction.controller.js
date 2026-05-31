@@ -237,7 +237,8 @@ const processNaturalLanguage = async (req, res, next) => {
     // Non-fatal — parsing still proceeds with empty accounts on failure.
     let businessAccounts = [];
     try {
-      businessAccounts = await accountRepository.findByBusiness(req.user.businessId);
+      // Defensive `|| []`: never let a nullish repo result crash the parser path.
+      businessAccounts = (await accountRepository.findByBusiness(req.user.businessId)) || [];
     } catch (acctErr) {
       logger.warn('NL parse: could not load business accounts (non-fatal):', acctErr.message);
     }

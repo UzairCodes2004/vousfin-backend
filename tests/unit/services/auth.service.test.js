@@ -9,6 +9,11 @@ const authService = require('../../../services/auth.service');
 const userRepository = require('../../../repositories/user.repository');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../../../utils/email.utils');
 const { ApiError } = require('../../../utils/ApiError');
+const config = require('../../../config');
+
+// In the test env SKIP_EMAIL_VERIFICATION defaults to true (non-production). Tests
+// that exercise the email/verification path toggle it off explicitly; restored after.
+afterEach(() => { config.SKIP_EMAIL_VERIFICATION = true; });
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 const makeUser = (overrides = {}) => ({
@@ -58,7 +63,8 @@ describe('AuthService.registerUser()', () => {
     expect(result).not.toHaveProperty('verificationToken');
   });
 
-  test('should call sendVerificationEmail after creating user', async () => {
+  test('should call sendVerificationEmail after creating user (when verification is required)', async () => {
+    config.SKIP_EMAIL_VERIFICATION = false; // exercise the verification-email path
     userRepository.findByEmail.mockResolvedValue(null);
     userRepository.create.mockResolvedValue(makeUser({ status: 'pending', verificationToken: 'tok123' }));
 
@@ -70,6 +76,7 @@ describe('AuthService.registerUser()', () => {
   });
 
   test('should NOT throw if sendVerificationEmail fails (non-blocking)', async () => {
+    config.SKIP_EMAIL_VERIFICATION = false; // so the email is actually attempted
     userRepository.findByEmail.mockResolvedValue(null);
     userRepository.create.mockResolvedValue(makeUser({ status: 'pending', verificationToken: 'tok' }));
     sendVerificationEmail.mockRejectedValue(new Error('SMTP error'));
@@ -94,7 +101,8 @@ describe('AuthService.loginUser()', () => {
       .rejects.toMatchObject({ statusCode: 403 });
   });
 
-  test('should throw 403 if account is pending', async () => {
+  test('should throw 403 if account is pending (when verification is required)', async () => {
+    config.SKIP_EMAIL_VERIFICATION = false; // otherwise a pending user is auto-activated on login
     userRepository.findByEmail.mockResolvedValue(makeUser({ status: 'pending' }));
     await expect(authService.loginUser('test@vousfin.com', 'pass', '127.0.0.1'))
       .rejects.toMatchObject({ statusCode: 403 });
@@ -116,6 +124,8 @@ describe('AuthService.loginUser()', () => {
     const hash = await bcrypt.hash('CorrectPass', 4);
     userRepository.findByEmail.mockResolvedValue(makeUser({ passwordHash: hash }));
     userRepository.update.mockResolvedValue({});
+    // loginUser re-fetches the fresh user before sanitizing/returning it.
+    userRepository.findActiveById.mockResolvedValue(makeUser({ passwordHash: hash }));
 
     const result = await authService.loginUser('test@vousfin.com', 'CorrectPass', '127.0.0.1');
     expect(result).toHaveProperty('token');

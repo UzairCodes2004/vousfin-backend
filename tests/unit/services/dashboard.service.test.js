@@ -2,11 +2,15 @@
 jest.mock('../../../services/report.service');
 jest.mock('../../../repositories/transaction.repository');
 jest.mock('../../../repositories/account.repository');
+// The chart methods aggregate directly on the JournalEntry model — mock it so the
+// unit test never touches a real database.
+jest.mock('../../../models/JournalEntry.model', () => ({ aggregate: jest.fn() }));
 
 const dashboardService = require('../../../services/dashboard.service');
 const reportService = require('../../../services/report.service');
 const transactionRepository = require('../../../repositories/transaction.repository');
 const accountRepository = require('../../../repositories/account.repository');
+const JournalEntry = require('../../../models/JournalEntry.model');
 
 const BIZ_ID = 'biz001';
 const START = new Date('2026-01-01');
@@ -28,6 +32,7 @@ beforeEach(() => {
   transactionRepository.getByDateRange = jest.fn().mockResolvedValue([]);
   transactionRepository.getByAccount   = jest.fn().mockResolvedValue([]);
   accountRepository.findByBusiness = jest.fn().mockResolvedValue([]);
+  JournalEntry.aggregate.mockResolvedValue([]); // chart aggregations → empty by default
 });
 
 // ── getKPIs ───────────────────────────────────────────────────────────────────
@@ -61,10 +66,9 @@ describe('DashboardService.getRevenueVsExpensesChart()', () => {
   });
 
   test('should group transactions by month and sum revenue/expenses', async () => {
-    transactionRepository.getByDateRange.mockResolvedValue([
-      { transactionDate: new Date('2026-01-15'), transactionType: 'Income',  amount: 5000 },
-      { transactionDate: new Date('2026-01-20'), transactionType: 'Expense', amount: 2000 },
-      { transactionDate: new Date('2026-01-25'), transactionType: 'Income',  amount: 3000 },
+    // service groups via JournalEntry.aggregate → rows keyed by {year,month}
+    JournalEntry.aggregate.mockResolvedValue([
+      { _id: { year: 2026, month: 1 }, revenue: 8000, expenses: 2000 },
     ]);
 
     const result = await dashboardService.getRevenueVsExpensesChart(BIZ_ID, START, END, 'month');
@@ -75,32 +79,22 @@ describe('DashboardService.getRevenueVsExpensesChart()', () => {
 
 // ── getCashFlowTrend ───────────────────────────────────────────────────────────
 describe('DashboardService.getCashFlowTrend()', () => {
-  test('should return empty array when no Cash account found', async () => {
+  test('should return empty array when no Cash/Bank account exists', async () => {
+    // a receivable account is NOT cash/bank → no cash account → []
     accountRepository.findByBusiness.mockResolvedValue([
-      { _id: 'acc_bank', accountName: 'Bank' },
+      { _id: 'acc_ar', accountName: 'Accounts Receivable' },
     ]);
     const result = await dashboardService.getCashFlowTrend(BIZ_ID, START, END);
     expect(result).toEqual([]);
   });
 
-  test('should return net cash flow data when Cash account exists', async () => {
-    const cashAccId = 'acc_cash';
+  test('should return net cash flow data when a Cash account exists', async () => {
     accountRepository.findByBusiness.mockResolvedValue([
-      { _id: cashAccId, accountName: 'Cash' },
+      { _id: 'acc_cash', accountName: 'Cash' },
     ]);
-    transactionRepository.getByAccount.mockResolvedValue([
-      {
-        transactionDate: new Date('2026-01-10'),
-        amount: 10000,
-        debitAccountId:  { _id: cashAccId },
-        creditAccountId: { _id: 'acc_other' },
-      },
-      {
-        transactionDate: new Date('2026-01-20'),
-        amount: 3000,
-        debitAccountId:  { _id: 'acc_other' },
-        creditAccountId: { _id: cashAccId },
-      },
+    // service nets inflow − outflow from the JournalEntry aggregation
+    JournalEntry.aggregate.mockResolvedValue([
+      { _id: { year: 2026, month: 1 }, inflow: 10000, outflow: 3000 },
     ]);
 
     const result = await dashboardService.getCashFlowTrend(BIZ_ID, START, END, 'month');
@@ -122,16 +116,16 @@ describe('DashboardService.getAllDashboardData()', () => {
 // ── _getPeriodKey (private, tested indirectly) ─────────────────────────────────
 describe('DashboardService period grouping', () => {
   test('should group by day when interval=day', async () => {
-    transactionRepository.getByDateRange.mockResolvedValue([
-      { transactionDate: new Date('2026-01-05'), transactionType: 'Income', amount: 1000 },
+    JournalEntry.aggregate.mockResolvedValue([
+      { _id: { year: 2026, month: 1, day: 5 }, revenue: 1000, expenses: 0 },
     ]);
     const result = await dashboardService.getRevenueVsExpensesChart(BIZ_ID, START, END, 'day');
     expect(result[0].period).toBe('2026-01-05');
   });
 
   test('should group by week when interval=week', async () => {
-    transactionRepository.getByDateRange.mockResolvedValue([
-      { transactionDate: new Date('2026-01-05'), transactionType: 'Income', amount: 1000 },
+    JournalEntry.aggregate.mockResolvedValue([
+      { _id: { year: 2026, week: 1 }, revenue: 1000, expenses: 0 },
     ]);
     const result = await dashboardService.getRevenueVsExpensesChart(BIZ_ID, START, END, 'week');
     expect(result[0].period).toMatch(/^\d{4}-W\d{2}$/);

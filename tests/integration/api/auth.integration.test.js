@@ -37,6 +37,7 @@ describe('POST /api/v1/auth/register', () => {
     authService.registerUser.mockResolvedValue({
       _id: 'u1', email: REGISTER_PAYLOAD.email, fullName: REGISTER_PAYLOAD.fullName,
     });
+    authService.generateTokenForUser.mockReturnValue('fake.jwt.token'); // register signs the user in
 
     const res = await request(app)
       .post('/api/v1/auth/register')
@@ -44,7 +45,9 @@ describe('POST /api/v1/auth/register', () => {
 
     expect(res.statusCode).toBe(201);
     expect(res.body.success).toBe(true);
-    expect(res.body.data).toHaveProperty('email', REGISTER_PAYLOAD.email);
+    // register now returns { user, token } and signs the user in
+    expect(res.body.data.user).toHaveProperty('email', REGISTER_PAYLOAD.email);
+    expect(res.body.data).toHaveProperty('token');
   });
 
   test('should return 409 when email is already registered', async () => {
