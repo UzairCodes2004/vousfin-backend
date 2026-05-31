@@ -21,9 +21,16 @@ The Node backend (`services/forecasting/infra/inferenceClient.js` + `lstmForecas
 ```bash
 cd ml-worker
 pip install -r requirements.txt
-python selftest.py                 # optional: verifies libs + global model end-to-end
-uvicorn app:app --host 0.0.0.0 --port 8000
+python selftest.py                          # optional: verifies libs + global model end-to-end
+python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ```
+Or just double-click **`start-worker.bat`** (Windows).
+
+> **Always use `python -m uvicorn`, not bare `uvicorn`.** If you have more than one
+> Python installed, a bare `uvicorn` can run under a *different* Python than the one
+> where the libraries were `pip install`ed → `ModuleNotFoundError: No module named
+> 'lightgbm'`. `python -m uvicorn` always uses the Python on your `python` command.
+
 Point the backend at it: set `LSTM_API_URL=http://localhost:8000` (or `INFERENCE_URL`). The Node side auto-detects it via the health probe and starts using it.
 
 > **Windows note:** `app.py` imports `lightgbm` first on purpose — loading its
