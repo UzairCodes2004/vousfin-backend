@@ -21,14 +21,32 @@ EXPENSE_TYPES = {"expense", "purchase", "payment", "cash purchase", "credit purc
 
 
 def _classify(txn: Dict[str, Any]) -> str:
-    """Return 'revenue' | 'expense' | 'other' for a transaction, mirroring Node."""
-    ttype = str(txn.get("transactionType", "")).strip().lower()
+    """Return 'revenue' | 'expense' | 'other' for a transaction, mirroring Node.
+
+    Ledger truth FIRST: revenue is what is credited to a Revenue/Income account;
+    expense is what is debited to an Expense/Cost account. This mirrors the Node
+    aggregation (lstmForecastService.fetchMonthlyData) exactly, so the worker and
+    the in-process fallback can never disagree on the numbers.
+
+    We must NOT classify by `transactionType` when an account type is known: in a
+    double-entry ledger a customer *receipt* (Dr Bank / Cr Accounts Receivable)
+    has a "receipt"/"sale" transactionType but credits a balance-sheet account,
+    not Revenue. Counting it as revenue double-counts the original sale and
+    inflates the series toward the sum of *all* credits. transactionType is only
+    a last-resort fallback when neither account type is present on the payload.
+    """
     credit = str(txn.get("creditAccountType", "")).strip().lower()
     debit = str(txn.get("debitAccountType", "")).strip().lower()
-    if ttype in REVENUE_TYPES or credit in {"revenue", "income"}:
+    if credit in {"revenue", "income"}:
         return "revenue"
-    if ttype in EXPENSE_TYPES or debit in {"expense", "direct cost", "cost"}:
+    if debit in {"expense", "direct cost", "cost"}:
         return "expense"
+    if not credit and not debit:  # account types unknown → fall back to type label
+        ttype = str(txn.get("transactionType", "")).strip().lower()
+        if ttype in REVENUE_TYPES:
+            return "revenue"
+        if ttype in EXPENSE_TYPES:
+            return "expense"
     return "other"
 
 

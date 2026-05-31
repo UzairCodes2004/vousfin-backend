@@ -254,8 +254,10 @@ async function _callPythonLSTM(businessId, target, horizonMonths, journalEntries
       description:       e.description   || '',
       transactionMode:   e.transactionMode || 'cash',
       status:            e.status         || 'posted',
-      creditAccountType: e.creditAccountType || 'Revenue',
-      debitAccountType:  e.debitAccountType  || 'Expense',
+      // Preserve '' (unresolved account) — don't re-default to Revenue/Expense,
+      // or the worker would over-count unresolved entries (see _fetchRawEntriesForLSTM).
+      creditAccountType: e.creditAccountType ?? '',
+      debitAccountType:  e.debitAccountType  ?? '',
       taxAmount:         Number(e.taxAmount)  || 0,
       balanceAfter:      0,
     })),
@@ -293,8 +295,13 @@ async function _fetchRawEntriesForLSTM(businessId, daysBack = 730) {
           transactionDate: 1, amount: 1, transactionType: 1, description: 1,
           transactionMode: 1, status: 1,
           taxAmount:         { $ifNull: ['$taxAmount', 0] },
-          creditAccountType: { $ifNull: [{ $arrayElemAt: ['$_creditAcc.accountType', 0] }, 'Revenue'] },
-          debitAccountType:  { $ifNull: [{ $arrayElemAt: ['$_debitAcc.accountType',  0] }, 'Expense'] },
+          // Pass the REAL account type through (empty when the lookup doesn't
+          // resolve). Do NOT default to 'Revenue'/'Expense' — that would make
+          // the worker count unresolved entries as revenue/expense, diverging
+          // from fetchMonthlyData (which only counts resolved Revenue/Income
+          // credits). The worker's _classify treats empty as 'other'.
+          creditAccountType: { $ifNull: [{ $arrayElemAt: ['$_creditAcc.accountType', 0] }, ''] },
+          debitAccountType:  { $ifNull: [{ $arrayElemAt: ['$_debitAcc.accountType',  0] }, ''] },
         },
       },
       { $sort: { transactionDate: 1 } },
