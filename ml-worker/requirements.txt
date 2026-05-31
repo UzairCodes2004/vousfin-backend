@@ -1,0 +1,15 @@
+# VousFin ML inference worker (F8). Pin in CI; trained-model deps added on rollout.
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+# ── Forecasting / ML (uncomment as models are added) ──
+# torch==2.4.1
+# pytorch-forecasting==1.1.1
+# lightning==2.4.0
+# lightgbm==4.5.0
+# catboost==1.2.7
+# statsmodels==0.14.2
+# prophet==1.1.6
+# optuna==4.0.0
+# shap==0.46.0
+# evidently==0.4.40
