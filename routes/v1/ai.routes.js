@@ -57,4 +57,7 @@ router.put('/anomaly-alerts/:id/review', validate(reviewAlertSchema),   aiContro
 // AI Financial Intelligence
 router.get('/financial-insights',                                        aiController.financialInsights);
 
+// Business Health Score (auditable, server-side)
+router.get('/health-score',                                              aiController.healthScore);
+
 module.exports = router;

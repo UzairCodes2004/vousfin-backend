@@ -192,6 +192,20 @@ const financialInsights = async (req, res, next) => {
   }
 };
 
+/**
+ * Business Health Score — auditable score from real ledger data.
+ * GET /api/v1/ai/health-score
+ */
+const healthScore = async (req, res, next) => {
+  try {
+    const businessHealthService = require('../services/businessHealth.service');
+    const result = await businessHealthService.getHealthScore(req.user.businessId);
+    ApiResponse.success(res, result, 'Business health score computed');
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   parseNaturalLanguage,
   ragQuery,
@@ -204,4 +218,5 @@ module.exports = {
   semanticSearch,
   preSaveCheck,
   financialInsights,
+  healthScore,
 };
