@@ -11,6 +11,8 @@ const championChallenger = require('../services/forecasting/championChallenger.s
 const driftMonitor = require('../services/forecasting/driftMonitor.service');
 const explainability = require('../services/forecasting/explainability.service');
 const accuracyScore = require('../services/forecasting/accuracyScore.service');
+const governance = require('../services/forecasting/governance.service');
+const usageMeter = require('../services/forecasting/usageMeter.service');
 const lstm = require('../services/forecasting/lstmForecastService');
 const { runAccuracyCapture } = require('../jobs/forecastAccuracy.job');
 const ApiResponse = require('../utils/ApiResponse');
@@ -136,6 +138,28 @@ exports.drift = async (req, res, next) => {
       target: req.query.target || 'Revenue', granularity: req.query.granularity || 'monthly',
     });
     ApiResponse.success(res, result, 'Drift check');
+  } catch (err) { next(err); }
+};
+
+// GET /forecast-registry/governance/dashboard — champion health overview (F9).
+exports.governanceDashboard = async (req, res, next) => {
+  try {
+    ApiResponse.success(res, await governance.championDashboard(biz(req)), 'Model governance dashboard');
+  } catch (err) { next(err); }
+};
+
+// POST /forecast-registry/governance/rollback — evaluate + auto-rollback a target (F9).
+exports.rollback = async (req, res, next) => {
+  try {
+    const result = await governance.autoRollback(biz(req), req.body?.target || 'Revenue', req.body?.granularity || 'monthly');
+    ApiResponse.success(res, result, result.rolledBack ? 'Champion rolled back' : 'No rollback needed');
+  } catch (err) { next(err); }
+};
+
+// GET /forecast-registry/usage — per-tenant forecast API usage (F9 billing).
+exports.usage = async (req, res, next) => {
+  try {
+    ApiResponse.success(res, await usageMeter.usage(biz(req), { from: req.query.from, to: req.query.to }), 'Forecast usage');
   } catch (err) { next(err); }
 };
 

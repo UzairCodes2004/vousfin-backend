@@ -5,13 +5,17 @@ const router  = express.Router();
 const ctrl    = require('../../controllers/forecastRegistry.controller');
 const { authMiddleware }  = require('../../middleware/auth.middleware');
 const { requireBusiness } = require('../../middleware/business.middleware');
+const forecastMeter = require('../../middleware/forecastMeter.middleware'); // F9 usage metering
 
-router.use(authMiddleware, requireBusiness);
+router.use(authMiddleware, requireBusiness, forecastMeter);
 
 router.get('/runs',          ctrl.listRuns);
 router.get('/models',        ctrl.listModels);
 router.get('/accuracy',      ctrl.accuracySummary);
 router.get('/accuracy-score', ctrl.accuracyScore);  // A1 — measured accuracy% + confidence
+router.get('/governance/dashboard', ctrl.governanceDashboard); // F9
+router.post('/governance/rollback', ctrl.rollback);            // F9
+router.get('/usage',         ctrl.usage);                      // F9
 router.get('/ensemble',      ctrl.ensemble);
 router.get('/drift',         ctrl.drift);         // F5
 router.get('/champion',      ctrl.champion);      // F5

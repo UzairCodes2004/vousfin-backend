@@ -11,6 +11,7 @@
 const ForecastRun = require('../models/ForecastRun.model');
 const driftMonitor = require('../services/forecasting/driftMonitor.service');
 const championChallenger = require('../services/forecasting/championChallenger.service');
+const governance = require('../services/forecasting/governance.service'); // F9 auto-rollback
 const logger = require('../config/logger');
 
 const TARGETS = ['Revenue', 'Expenses', 'Net Cash Flow'];
@@ -19,7 +20,7 @@ async function runRetrainSweep({ force = false } = {}) {
   const since = new Date(); since.setDate(since.getDate() - 60);
   const businessIds = await ForecastRun.distinct('businessId', { generatedAt: { $gte: since } });
 
-  const stats = { businesses: businessIds.length, checked: 0, retrained: 0, promoted: 0 };
+  const stats = { businesses: businessIds.length, checked: 0, retrained: 0, promoted: 0, rolledBack: 0 };
   for (const businessId of businessIds) {
     for (const target of TARGETS) {
       try {
@@ -30,12 +31,15 @@ async function runRetrainSweep({ force = false } = {}) {
           if (res.retrained) stats.retrained++;
           if (res.promoted) stats.promoted++;
         }
+        // F9 — auto-rollback the champion if its realized accuracy has regressed.
+        const rb = await governance.autoRollback(businessId, target);
+        if (rb.rolledBack) stats.rolledBack++;
       } catch (err) {
         logger.warn(`[forecastRetrain] ${businessId}/${target} failed: ${err.message}`);
       }
     }
   }
-  logger.info(`[forecastRetrain] sweep: ${stats.retrained} retrained · ${stats.promoted} promoted across ${stats.businesses} businesses`);
+  logger.info(`[forecastRetrain] sweep: ${stats.retrained} retrained · ${stats.promoted} promoted · ${stats.rolledBack} rolled back across ${stats.businesses} businesses`);
   return stats;
 }
 
