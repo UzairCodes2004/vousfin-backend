@@ -1,35 +1,53 @@
 """
-VousFin ML Inference Worker — FastAPI (F8).
+VousFin ML Inference Worker — FastAPI (B3: global / transfer model).
 
-The Python side of the forecasting platform. The Node API (inferenceClient.js)
-calls these endpoints for the heavy/non-linear models (Bi-LSTM / TFT / LightGBM /
-SHAP); when this worker is down or slow, Node's circuit breaker falls back to the
-in-process classical ensemble, so the product never hard-fails.
+The Python side of the forecasting platform. The Node API (inferenceClient.js /
+lstmForecastService) calls these endpoints; Node's circuit breaker falls back to
+its in-process ensemble whenever this worker is down or slow, so the product
+never hard-fails.
 
-Contract (must stay stable — Node depends on it):
-  GET  /api/v1/vousfin/health   -> { "ready": true }
-  POST /api/v1/vousfin/forecast -> { predicted[], lower[], upper[], labels[], modelType }
-  POST /api/v1/vousfin/explain  -> { drivers[], baseValue }   (SHAP)
+Stack (all pip-installable, see requirements.txt):
+  • statsforecast  — AutoETS/AutoARIMA + conformal intervals (per-series)
+  • mlforecast + LightGBM — ONE global model trained across many businesses,
+    giving new/thin-data tenants a strong forecast on day one (transfer learning)
+  • SHAP — feature attribution over the global model
 
-Runnable skeleton: health is real; forecast/explain return a clearly labelled
-placeholder so the wiring is testable before trained models drop in. Replace the
-bodies with PyTorch-Forecasting / LightGBM / SHAP implementations.
+Contract (stable — Node depends on it):
+  GET  /api/v1/vousfin/health   -> { ready: true }
+  POST /api/v1/vousfin/forecast -> { predicted[], lower[], upper[], labels[], modelType, dataSource }
+  POST /api/v1/vousfin/explain  -> { drivers[], baseValue, method }
+  POST /api/v1/vousfin/train    -> retrain the global model from the accumulated panel
+  GET  /api/v1/vousfin/store    -> panel stats
 """
 from __future__ import annotations
 
-from typing import List
+from typing import List, Dict, Any
+import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-app = FastAPI(title="VousFin ML Worker", version="0.1.0")
+from adapters import to_monthly_series, horizon_labels
+from forecasting import statistical_forecast
+from global_model import GlobalModel
+from store import TrainingStore
 
-MODEL_READY = True  # set True once trained artifacts load at startup
+app = FastAPI(title="VousFin ML Worker", version="1.0.0")
+
+GLOBAL = GlobalModel(artifact_dir="artifacts")
+STORE = TrainingStore(data_dir="data")
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    GLOBAL.load()  # load a previously-trained global artifact if present
 
 
 class Txn(BaseModel):
     transactionDate: str
-    amount: float
+    amount: float = 0.0
     transactionType: str = "Income"
+    creditAccountType: str = "Revenue"
+    debitAccountType: str = "Expense"
 
 
 class ForecastRequest(BaseModel):
@@ -43,41 +61,76 @@ class ForecastRequest(BaseModel):
 class ExplainRequest(BaseModel):
     businessId: str
     target: str = "Revenue"
-    features: dict = {}
+    transactions: List[Txn] = []
 
 
 @app.get("/api/v1/vousfin/health")
-def health():
-    return {"ready": MODEL_READY}
+def health() -> Dict[str, Any]:
+    # The worker is "ready" whenever it can serve a real statistical forecast.
+    return {"ready": True, "globalModel": GLOBAL.ready}
 
 
 @app.post("/api/v1/vousfin/forecast")
-def forecast(req: ForecastRequest):
-    """Placeholder: monthly aggregate + naive carry-forward with a widening band.
-    Swap for the Bi-LSTM/TFT inference. Shape matches what Node expects."""
-    monthly: dict = {}
-    for t in req.transactions:
-        key = t.transactionDate[:7]
-        monthly[key] = monthly.get(key, 0.0) + (t.amount or 0.0)
-    series = [monthly[k] for k in sorted(monthly)]
-    last = series[-1] if series else 0.0
-    predicted = [round(last, 2) for _ in range(req.horizonMonths)]
-    lower = [round(v * (1 - 0.05 * (i + 1)), 2) for i, v in enumerate(predicted)]
-    upper = [round(v * (1 + 0.05 * (i + 1)), 2) for i, v in enumerate(predicted)]
+def forecast(req: ForecastRequest) -> Dict[str, Any]:
+    series = to_monthly_series([t.model_dump() for t in req.transactions], req.target, req.businessId)
+    h = max(1, int(req.horizonMonths))
+
+    if series.empty or len(series) < 3:
+        return {"predicted": [], "lower": [], "upper": [], "labels": [],
+                "modelType": "Insufficient data", "dataSource": "none"}
+
+    # Calibrated intervals always come from the conformal statistical model.
+    stat = statistical_forecast(series, h, level=90)
+    predicted = stat["predicted"]
+    lower, upper = stat["lower"], stat["upper"]
+    model_type, source = stat["modelType"], "statistical"
+
+    # Prefer the global transfer model's point forecast (better cold-start), but
+    # keep the conformal half-widths from the statistical model for honest bands.
+    g = GLOBAL.forecast(series, h) if GLOBAL.ready else None
+    if g and len(g["predicted"]) == h:
+        half = [max(0.0, (upper[i] - lower[i]) / 2.0) for i in range(h)]
+        predicted = g["predicted"]
+        lower = [round(max(0.0, predicted[i] - half[i]), 2) for i in range(h)]
+        upper = [round(predicted[i] + half[i], 2) for i in range(h)]
+        model_type, source = g["modelType"] + " + conformal 90%", "global"
+
+    # Accumulate the (de-identified) series for the next global training run.
+    try:
+        STORE.ingest(series)
+    except Exception:
+        pass
+
     return {
         "predicted": predicted, "lower": lower, "upper": upper,
-        "labels": [f"M+{i+1}" for i in range(req.horizonMonths)],
-        "modelType": "ML Worker (placeholder — install trained Bi-LSTM/TFT)",
+        "labels": horizon_labels(series["ds"].iloc[-1], h),
+        "modelType": model_type, "dataSource": source,
     }
 
 
 @app.post("/api/v1/vousfin/explain")
-def explain(req: ExplainRequest):
-    """Placeholder SHAP: rank provided features by absolute magnitude.
-    Swap for shap.Explainer over the GBM/DL member."""
-    items = sorted(req.features.items(), key=lambda kv: abs(kv[1] or 0), reverse=True)
-    return {
-        "baseValue": 0.0,
-        "drivers": [{"name": k, "shap": round(v, 4)} for k, v in items[:10]],
-        "method": "placeholder — install SHAP over the GBM member",
-    }
+def explain(req: ExplainRequest) -> Dict[str, Any]:
+    series = to_monthly_series([t.model_dump() for t in req.transactions], req.target, req.businessId)
+    out = GLOBAL.explain(series) if (not series.empty and GLOBAL.ready) else None
+    if out:
+        return out
+    # Fallback: rank recent momentum/level as crude drivers.
+    y = series["y"].to_numpy(dtype=float) if not series.empty else np.array([])
+    drivers = []
+    if len(y) >= 2:
+        drivers = [
+            {"name": "recent_level", "shap": round(float(y[-1]), 4)},
+            {"name": "recent_change", "shap": round(float(y[-1] - y[-2]), 4)},
+        ]
+    return {"baseValue": 0.0, "drivers": drivers, "method": "fallback (global model not trained)"}
+
+
+@app.post("/api/v1/vousfin/train")
+def train() -> Dict[str, Any]:
+    """Retrain the global model from the accumulated panel of all tenants."""
+    return GLOBAL.train(STORE.panel())
+
+
+@app.get("/api/v1/vousfin/store")
+def store_stats() -> Dict[str, Any]:
+    return STORE.stats()

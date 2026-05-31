@@ -1,15 +1,22 @@
-# VousFin ML inference worker (F8). Pin in CI; trained-model deps added on rollout.
+# VousFin ML inference worker (B3 — global / transfer model). Pin in CI.
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pydantic==2.9.2
-# ── Forecasting / ML (uncomment as models are added) ──
+
+# ── Forecasting / ML core (installed by default for B3) ──
+numpy==1.26.4
+pandas==2.2.2
+pyarrow==17.0.0           # parquet panel store
+statsforecast==1.7.6      # AutoETS/AutoARIMA + conformal intervals
+mlforecast==0.13.4        # global model orchestration over LightGBM
+lightgbm==4.5.0           # the global gradient-boosted model
+shap==0.46.0              # SHAP attribution over the global model
+scikit-learn==1.5.1
+joblib==1.4.2
+
+# ── Optional heavier members (uncomment on rollout) ──
 # torch==2.4.1
-# pytorch-forecasting==1.1.1
-# lightning==2.4.0
-# lightgbm==4.5.0
-# catboost==1.2.7
-# statsmodels==0.14.2
+# pytorch-forecasting==1.1.1   # DeepAR / TFT global probabilistic models
 # prophet==1.1.6
-# optuna==4.0.0
-# shap==0.46.0
-# evidently==0.4.40
+# optuna==4.0.0                # hyper-parameter search
+# evidently==0.4.40            # drift dashboards
