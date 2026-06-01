@@ -912,6 +912,19 @@ async function generateLSTMForecast(businessId, target = 'Revenue', horizonMonth
               ...(lstmResult.kpiSummary || {}),
               confidenceScore: conf.score, confidenceLabel: conf.label,
             };
+            // Populate the historical series + labels so the chart and the
+            // plain-English explanation have real context (the worker returns
+            // only the forecast horizon, which left "historical" empty → the UI
+            // showed "trend stable" and a bare forecast line).
+            try {
+              const metricKey = { Revenue: 'revenue', Expenses: 'expenses', 'Net Cash Flow': 'profit' }[target] || 'revenue';
+              const histRows = (await fetchMonthlyData(businessId, 12)).slice(-6);
+              if (histRows.length) {
+                lstmResult.historical = histRows.map(m => Math.round(m[metricKey] || 0));
+                const histLabels = histRows.map(m => MONTH_NAMES[m.month - 1]);
+                lstmResult.labels = [...histLabels, ...(lstmResult.labels || [])];
+              }
+            } catch { /* non-fatal — forecast still returns without history */ }
             // F3 — persist the served run for audit + ex-post accuracy (fire-and-forget).
             if (config.FORECAST_REGISTRY_ENABLED) {
               forecastStore.recordForecast(businessId, {

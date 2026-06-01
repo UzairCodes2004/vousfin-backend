@@ -38,6 +38,23 @@ Point the backend at it: set `LSTM_API_URL=http://localhost:8000` (or `INFERENCE
 > crash (0xC0000005) from duplicate OpenMP runtimes. Keep that import first.
 
 ## Train the global model
+
+**Fastest path — bootstrap a strong prior (recommended first run):**
+```bash
+python bootstrap_global.py                  # ~400 diverse businesses, 24–36 months each
+python bootstrap_global.py --businesses 800 # bigger prior
+```
+Synthesizes a large, diverse panel of business **archetypes** (retail/Q4,
+summer/winter seasonal, Eid, B2B-lumpy, education, high-growth, declining…)
+across a wide range of scales, trains the global LightGBM, and saves
+`artifacts/global_mlforecast.joblib`. A brand-new tenant with only a few months
+of history then gets a seasonality- and trend-aware forecast on day one
+(`dataSource: "global"`) instead of a flat line. We never train on other
+tenants' raw data — isolation is absolute; the prior is the learned monthly
+*dynamics*, and each real forecast's level is anchored to that tenant's own
+recent history.
+
+**Or train from real accumulated series:**
 1. The running worker **accumulates** every forecasted series (de-identified) into `data/panel.parquet`.
 2. Train across all of them:
    ```bash
