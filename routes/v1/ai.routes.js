@@ -63,4 +63,7 @@ router.get('/health-score',                                              aiContr
 // Forward-looking outlook (projected runway / margin / forward health)
 router.get('/health-outlook',                                            aiController.healthOutlook);
 
+// Unified "Needs attention" feed (merged + ranked insights/forecast/anomalies)
+router.get('/needs-attention',                                           aiController.needsAttention);
+
 module.exports = router;

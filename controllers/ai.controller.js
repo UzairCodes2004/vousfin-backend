@@ -222,6 +222,21 @@ const healthOutlook = async (req, res, next) => {
   }
 };
 
+/**
+ * Unified "Needs attention" feed — merges financial insights, forecast signals
+ * and anomalies into one ranked, de-duplicated action list.
+ * GET /api/v1/ai/needs-attention
+ */
+const needsAttention = async (req, res, next) => {
+  try {
+    const proactiveInsights = require('../services/proactiveInsights.service');
+    const result = await proactiveInsights.getNeedsAttention(req.user.businessId);
+    ApiResponse.success(res, result, 'Needs-attention feed generated');
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   parseNaturalLanguage,
   ragQuery,
@@ -236,4 +251,5 @@ module.exports = {
   financialInsights,
   healthScore,
   healthOutlook,
+  needsAttention,
 };
