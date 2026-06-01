@@ -110,18 +110,22 @@ function _fmtAmt(value, currency) {
  * Returns one of: 'insufficient' | 'sparse' | 'adequate' | 'rich'
  * Based on the count of months that have non-zero revenue OR non-zero expenses.
  *
- * Thresholds (conservative for SMEs):
+ * Thresholds (honest for SMEs — "rich" requires a full seasonal year):
  *   0  months → insufficient  (no forecast possible)
  *   1–2       → sparse        (SES / flat extrapolation, low confidence)
- *   3–5       → adequate      (Holt's Double ES, medium confidence)
- *   6+        → rich          (Holt-Winters Tri-ES, high confidence)
+ *   3–11      → adequate      (trend forecast, medium confidence)
+ *   12+       → rich          (seasonal model, high confidence)
+ *
+ * Note: 6 months is NOT "rich". Reliable monthly seasonality needs ≥1 full
+ * year of history, so we only claim "rich" at 12+ months. This keeps the UI
+ * badge honest instead of overstating confidence on thin data.
  */
 function _classifySufficiency(monthlyData) {
   const nonZero = (monthlyData || [])
     .filter(m => (m.revenue || 0) > 0 || (m.expenses || 0) > 0).length;
   if (nonZero === 0)  return 'insufficient';
   if (nonZero <= 2)   return 'sparse';
-  if (nonZero <= 5)   return 'adequate';
+  if (nonZero <= 11)  return 'adequate';
   return 'rich';
 }
 
@@ -147,8 +151,8 @@ function _computeRealConfidence(series, tier, anomalyPenalty) {
   const baseByTier = {
     insufficient: 30,   // no real data — shown as "Insufficient" not a fake score
     sparse:       48,   // 1-2 months: simple smoothing, wide uncertainty
-    adequate:     62,   // 3-5 months: trend estimation, moderate confidence
-    rich:         80,   // 6+ months: seasonal model, high confidence
+    adequate:     62,   // 3-11 months: trend estimation, moderate confidence
+    rich:         80,   // 12+ months: seasonal model, high confidence
   };
 
   const base  = baseByTier[tier] ?? 50;
@@ -867,14 +871,47 @@ async function generateLSTMForecast(businessId, target = 'Revenue', horizonMonth
         if (isReady) {
           const lstmResult = await _callPythonLSTM(businessId, target, horizonMonths, recentEntries);
           if (lstmResult?.predicted?.length > 0) {
-            lstmResult.modelType  = 'Bi-LSTM + Attention (Real ML)';
-            lstmResult.dataSource = 'lstm_live';
+            // HONESTY: keep the worker's REAL engine + data-source labels
+            // (e.g. "Global LightGBM (transfer) + conformal 90%" / "AutoETS +
+            // conformal 90%", dataSource 'global' | 'statistical'). Never relabel
+            // as "Bi-LSTM" or force tier 'rich' — the model and data depth must
+            // be reported truthfully.
+            lstmResult.modelType  = lstmResult.modelType || 'ML worker';
+            lstmResult.dataSource = (lstmResult.dataSource && lstmResult.dataSource !== 'none')
+              ? lstmResult.dataSource : 'worker';
             lstmResult.currency   = currency;
             const anomalyRisk = await fetchAnomalyRisk(businessId);
             const scenarios   = generateScenarios(lstmResult.predicted, anomalyRisk.riskScore);
             lstmResult.scenarios   = scenarios;
             lstmResult.anomalyRisk = anomalyRisk;
-            lstmResult.dataSufficiency = { months: recentEntries.length, tier: 'rich', isInsufficient: false, message: 'Bi-LSTM trained on live transactions.' };
+
+            // Honest data sufficiency from ACTUAL active months (distinct
+            // YYYY-MM present), not a hardcoded 'rich'.
+            const activeMonths = new Set(
+              recentEntries.map(e => {
+                try { return new Date(e.transactionDate).toISOString().slice(0, 7); }
+                catch { return ''; }
+              })
+            ).size;
+            const realTier = activeMonths === 0 ? 'insufficient'
+              : activeMonths <= 2  ? 'sparse'
+              : activeMonths <= 11 ? 'adequate'
+              : 'rich';
+            const conf = _computeRealConfidence([], realTier, anomalyRisk.confidencePenalty || 0);
+            lstmResult.dataSufficiency = {
+              months: activeMonths, nonZeroMonths: activeMonths, tier: realTier, isInsufficient: false,
+              message: realTier === 'rich'
+                ? `Rich history (${activeMonths} months) — strong basis for forecasting.`
+                : realTier === 'adequate'
+                  ? `Moderate history (${activeMonths} months) — forecast enabled; more data sharpens seasonality.`
+                  : `Limited history (${activeMonths} month${activeMonths > 1 ? 's' : ''}) — forecast is indicative only.`,
+            };
+            // Honest, tier-based confidence so the worker path isn't stuck at a
+            // misleading flat 30%.
+            lstmResult.kpiSummary = {
+              ...(lstmResult.kpiSummary || {}),
+              confidenceScore: conf.score, confidenceLabel: conf.label,
+            };
             // F3 — persist the served run for audit + ex-post accuracy (fire-and-forget).
             if (config.FORECAST_REGISTRY_ENABLED) {
               forecastStore.recordForecast(businessId, {
