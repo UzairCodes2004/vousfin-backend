@@ -40,7 +40,10 @@ const paymentSchema = new mongoose.Schema(
     // inbound = customer receipt (AR), outbound = vendor disbursement (AP)
     direction:  { type: String, enum: ['inbound', 'outbound'], required: true, index: true },
     partyType:  { type: String, enum: ['customer', 'vendor'], required: true },
-    partyId:    { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
+    // Nullable: an unlinked AR/AP entry (e.g. a manual credit-sale journal with no
+    // customer) can still be settled. The cash + outstanding move; there is simply
+    // no party subledger to update.
+    partyId:    { type: mongoose.Schema.Types.ObjectId, required: false, default: null, index: true },
     partySnapshot: {
       name:  { type: String, default: null },
       email: { type: String, default: null },

@@ -16,9 +16,10 @@ router.use(authMiddleware, requireBusiness);
 router.post('/', validate(createBillSchema), billController.createDraft);
 router.get('/',  billController.list);
 
-// Detail + timeline
+// Detail + timeline + PDF
 router.get('/:id',          billController.getById);
 router.get('/:id/timeline', billController.getTimeline);
+router.get('/:id/pdf',      billController.downloadPdf);
 
 // Phase 2: Update draft
 router.put('/:id', validate(updateBillSchema), billController.updateDraft);

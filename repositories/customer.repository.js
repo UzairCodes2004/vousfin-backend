@@ -87,15 +87,17 @@ class CustomerRepository extends BaseRepository {
    * @param {number} delta - Positive to increase, negative to decrease
    * @returns {Promise<Object|null>}
    */
-  async updateReceivableBalance(customerId, delta) {
+  async updateReceivableBalance(customerId, delta, session = null) {
     const validCustomerId = sanitizeAndValidateId(customerId);
     if (typeof delta !== 'number' || isNaN(delta)) {
       throw new Error('Delta must be a number');
     }
+    const options = { new: true, runValidators: false };
+    if (session) options.session = session; // join an all-or-nothing transaction when given
     return this.model.findByIdAndUpdate(
       validCustomerId,
       { $inc: { currentReceivableBalance: delta } },
-      { new: true, runValidators: false }
+      options
     ).exec();
   }
 

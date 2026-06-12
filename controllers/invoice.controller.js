@@ -6,15 +6,17 @@
 //
 const invoiceService = require('../services/invoice.service');
 const invoicePdfService = require('../services/invoicePdf.service');
+const { buildBusinessHeader } = require('../utils/pdfBusinessHeader');
 const ApiResponse = require('../utils/ApiResponse');
 
 /** Build the canonical user payload services expect from req.user (auth attaches id, not _id). */
 function actor(req) {
   return {
-    _id:      req.user.id,
-    fullName: req.user.fullName,
-    email:    req.user.email,
-    role:     req.user.role,
+    _id:        req.user.id,
+    fullName:   req.user.fullName,
+    email:      req.user.email,
+    role:       req.user.role,
+    businessId: req.user.businessId, // R-05: lets services scope loads to the tenant
   };
 }
 
@@ -51,14 +53,9 @@ exports.downloadPdf = async (req, res, next) => {
     const biz = await Business.findById(req.user.businessId).lean();
     await invoicePdfService.streamPdf(
       invoice.toObject ? invoice.toObject() : invoice,
-      {
-        businessName: biz?.businessName || '',
-        address:      biz?.address || '',
-        phone:        biz?.phone || '',
-        email:        biz?.email || '',
-        taxId:        biz?.taxId || biz?.ntn || '',
-      },
-      res
+      buildBusinessHeader(biz),
+      res,
+      { type: 'invoice' }
     );
   } catch (err) { next(err); }
 };
@@ -142,7 +139,7 @@ exports.applyCreditMemo = async (req, res, next) => {
 // M8 — early-payment discount
 exports.previewEarlyPaymentDiscount = async (req, res, next) => {
   try {
-    const preview = await invoiceService.previewEarlyPaymentDiscount(req.params.id);
+    const preview = await invoiceService.previewEarlyPaymentDiscount(req.params.id, req.user.businessId);
     ApiResponse.success(res, preview, 'Early-payment discount preview');
   } catch (err) { next(err); }
 };

@@ -117,7 +117,7 @@ const anomalyAlertSchema = new mongoose.Schema(
     scanId: {
       type: String,
       required: true,
-      index: true,
+      // index defined explicitly below via schema.index() — don't use inline index:true
     },
   },
   {

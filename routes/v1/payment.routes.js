@@ -7,8 +7,9 @@ const { requireBusiness } = require('../../middleware/business.middleware');
 
 router.use(authMiddleware, requireBusiness);
 
-router.post('/',    paymentCtrl.record);   // record + apply (multi-allocation)
-router.get('/',     paymentCtrl.list);     // list (?direction&partyId&status&startDate&endDate)
-router.get('/:id',  paymentCtrl.getById);
+router.post('/',              paymentCtrl.record);   // record + apply (multi-allocation)
+router.post('/auto-allocate', paymentCtrl.autoAllocate); // Phase 2: auto allocation
+router.get('/',               paymentCtrl.list);     // list (?direction&partyId&status&startDate&endDate)
+router.get('/:id',            paymentCtrl.getById);
 
 module.exports = router;

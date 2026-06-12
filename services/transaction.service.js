@@ -14,14 +14,35 @@ const fxService    = require('./fx.service');
 const taxEngine    = require('./taxEngine.service');   // Phase 5.4
 const { businessEvents, EVENTS } = require('./businessEventEngine.service'); // ERP refactor Step 2
 const partyBalanceService = require('./partyBalance.service'); // ERP refactor Step 4 — centralized AR/AP balance engine
+const { withTransaction } = require('../utils/withTransaction'); // all-or-nothing multi-write saves
 // Phase 5.1: Period lock model (inline require to avoid circular deps)
 
 class TransactionService {
   /**
+   * R-03 tax-integrity guard. The tax engine is the authority for how much tax a
+   * transaction carries. A client-supplied amount may only fine-tune that figure
+   * within a small rounding tolerance (so the posted tax matches what the user
+   * saw on screen); any amount beyond tolerance is rejected in favour of the
+   * engine value, so a forged/incorrect client amount can never corrupt the tax
+   * ledger or the filing.
+   *
+   * @param {number|null} requestedTaxAmount  client-supplied tax (or null)
+   * @param {number} engineTax                the engine's authoritative tax
+   * @returns {number} the tax amount to actually post
+   */
+  _clampTaxToEngine(requestedTaxAmount, engineTax) {
+    const eng = Math.round((Number(engineTax) || 0) * 100) / 100;
+    if (requestedTaxAmount == null) return eng;
+    const req = Math.round((Number(requestedTaxAmount) || 0) * 100) / 100;
+    const tolerance = Math.max(0.05, eng * 0.01); // 1% or 5 minor units, whichever larger
+    return Math.abs(req - eng) <= tolerance ? req : eng;
+  }
+
+  /**
    * Create a single journal entry (v2).
    * Supports standard entries, AR/AP (Credit Sales/Purchases), and multi-line journals.
    */
-  async createTransaction(data, userId, ipAddress) {
+  async createTransaction(data, userId, ipAddress, session = null) {
     // 0. Phase 4 — Multi-line journal: derive primary accounts from journalLines when
     //    the caller supplies lines but omits explicit debitAccountId / creditAccountId.
     //    This lets the NL confirm flow forward the full journal line set and still satisfy
@@ -44,11 +65,64 @@ class TransactionService {
       throw new ApiError(400, 'Debit and credit accounts must be different');
     }
 
+    // 1b. Idempotency: if caller provides an idempotencyKey, skip posting if already done
+    if (data.idempotencyKey) {
+      const JournalEntry = require('../models/JournalEntry.model');
+      const existing = await JournalEntry.findOne(
+        { businessId: data.businessId, 'metadata.idempotencyKey': data.idempotencyKey },
+        { _id: 1 }
+      ).lean();
+      if (existing) {
+        logger.info(`[createTransaction] idempotent skip — key ${data.idempotencyKey} already posted as ${existing._id}`);
+        return JournalEntry.findById(existing._id);
+      }
+      // Carry the key forward so it's stored on the new JE
+      data.metadata = { ...(data.metadata || {}), idempotencyKey: data.idempotencyKey };
+      delete data.idempotencyKey;
+    }
+
+    // 1c. Double-submit guard — set ONLY by the UI form controller.
+    // Catches double-clicks and network retries: an exact duplicate (same accounts,
+    // amount, date, description) posted within the last 10 seconds is rejected.
+    // Batch/Excel/NL/system paths never set this flag — imports and schedulers may
+    // legitimately post identical rows.
+    if (data.doubleSubmitGuard) {
+      delete data.doubleSubmitGuard;
+      const recentDup = await transactionRepository.findOne({
+        businessId:      data.businessId,
+        amount:          data.amount,
+        debitAccountId:  data.debitAccountId,
+        creditAccountId: data.creditAccountId,
+        description:     data.description,
+        transactionDate: new Date(data.transactionDate),
+        createdAt:       { $gte: new Date(Date.now() - 10_000) },
+      });
+      if (recentDup) {
+        throw new ApiError(
+          409,
+          'Possible duplicate: an identical transaction was recorded seconds ago. If this is intentional, wait a few seconds and submit again.'
+        );
+      }
+    }
+
     // 2. Validate accounts belong to the business
     const debitAccount = await accountRepository.findOneByBusinessAndId(data.businessId, data.debitAccountId);
     const creditAccount = await accountRepository.findOneByBusinessAndId(data.businessId, data.creditAccountId);
     if (!debitAccount || !creditAccount) {
       throw new ApiError(400, 'Invalid account(s) for this business');
+    }
+
+    // 2c. Tenant isolation: validate every journal line account belongs to this business.
+    // Only debitAccountId/creditAccountId are checked above; compound journalLines are not,
+    // which would allow a caller to update another tenant's account balances.
+    if (data.journalLines?.length > 0) {
+      const lineIds = [...new Set(data.journalLines.map(l => l.accountId?.toString()).filter(Boolean))];
+      const validAccounts = await accountRepository.findAllByBusinessAndIds(data.businessId, lineIds);
+      const validSet = new Set(validAccounts.map(a => a._id.toString()));
+      const invalid = lineIds.filter(id => !validSet.has(id));
+      if (invalid.length > 0) {
+        throw new ApiError(400, `Journal line account(s) do not belong to this business: ${invalid.join(', ')}`);
+      }
     }
 
     // 2b. FX fields — populate currencyCode / exchangeRate / baseCurrencyAmount when a
@@ -60,7 +134,9 @@ class TransactionService {
           data.amount,
           data.currencyCode,
           data.businessId,
-          data.transactionDate
+          data.transactionDate,
+          data.exchangeRate,          // honour a caller-supplied rate when none is stored for the date
+          data.baseCurrencyAmount     // prevent double-conversion if caller pre-computed the base amount
         );
         data.currencyCode       = fxFields.currencyCode;
         data.exchangeRate       = fxFields.exchangeRate;
@@ -109,13 +185,31 @@ class TransactionService {
     let pendingTaxLines = [];
     let taxMeta = null;
 
+    const NON_TAXABLE_TYPES = new Set([
+      TRANSACTION_TYPES.TRANSFER,
+      TRANSACTION_TYPES.BANK_TRANSFER,
+      TRANSACTION_TYPES.OWNER_INVESTMENT,
+      TRANSACTION_TYPES.OWNER_WITHDRAWAL,
+      TRANSACTION_TYPES.LOAN_DISBURSEMENT,
+      TRANSACTION_TYPES.LOAN_REPAYMENT,
+      TRANSACTION_TYPES.DEPRECIATION,
+      TRANSACTION_TYPES.CLOSING_ENTRY,
+      TRANSACTION_TYPES.OPENING_BALANCE,
+      TRANSACTION_TYPES.FX_GAIN,
+      TRANSACTION_TYPES.FX_LOSS,
+      TRANSACTION_TYPES.FX_REVALUATION,
+      TRANSACTION_TYPES.ADJUSTING_ENTRY,
+    ]);
+
     const skipTax = data.skipTax === true ||
                     data.entryType === 'closing' ||
                     data.entryType === 'opening_balance' ||
                     data.transactionSource === 'system_generated' ||
                     // Installment engine creates compound (3-line) journals that are already
                     // balanced.  Adding tax lines would break the DR = CR invariant.
-                    data.transactionSource === TRANSACTION_SOURCES.INSTALLMENT_ENGINE;
+                    data.transactionSource === TRANSACTION_SOURCES.INSTALLMENT_ENGINE ||
+                    // Non-taxable transaction types: financing, capital, FX, adjusting
+                    NON_TAXABLE_TYPES.has(data.transactionType);
 
     if (!skipTax) {
       try {
@@ -179,8 +273,8 @@ class TransactionService {
             }
           }
 
-          // If caller already set an explicit taxAmount, trust it (manual override)
-          const explicitTaxAmount = (data.taxAmount && data.taxAmount > 0) ? data.taxAmount : null;
+          // R-03: capture any client-supplied taxAmount as a *requested* figure.
+          const requestedTaxAmount = (data.taxAmount && data.taxAmount > 0) ? data.taxAmount : null;
 
           const taxResult = await taxEngine.resolveApplicableTaxes({
             businessId:      data.businessId,
@@ -196,8 +290,20 @@ class TransactionService {
           });
 
           if (taxResult.taxApplied && taxResult.lines.length > 0) {
-            // If explicit taxAmount was provided, override engine's calculation
-            const effectiveTaxAmount = explicitTaxAmount ?? taxResult.totalTax;
+            // R-03 GUARD: the tax engine is authoritative. A manual override may
+            // only adjust the engine's figure within a small rounding tolerance
+            // (to match what the frontend displayed). Anything beyond tolerance is
+            // ignored in favour of the engine value, so a bad/forged client amount
+            // can never corrupt the tax ledger or the filing.
+            const engineTax = Math.round((taxResult.totalTax || 0) * 100) / 100;
+            const effectiveTaxAmount = this._clampTaxToEngine(requestedTaxAmount, engineTax);
+            if (requestedTaxAmount != null && effectiveTaxAmount === engineTax &&
+                Math.round(requestedTaxAmount * 100) / 100 !== engineTax) {
+              logger.warn(`[Tax] Manual taxAmount ${requestedTaxAmount} is outside tolerance of engine value ${engineTax} — using engine value (R-03 guard).`);
+            }
+            // Only remap per-line amounts when we actually accepted a value that
+            // differs from the engine's own calculation.
+            const explicitTaxAmount = effectiveTaxAmount !== engineTax ? effectiveTaxAmount : null;
             const primaryLine = taxResult.lines[0];
 
             // Store tax metadata on the entry
@@ -265,11 +371,10 @@ class TransactionService {
       const txDate = data.transactionDate ? new Date(data.transactionDate) : new Date();
       const yyyymm = txDate.getFullYear().toString() +
                      String(txDate.getMonth() + 1).padStart(2, '0');
-      const rand   = String(Math.floor(Math.random() * 99999) + 1).padStart(5, '0');
       if (SALE_TYPES_FOR_INV.includes(data.transactionType)) {
-        data.invoiceNumber = `INV-${yyyymm}-${rand}`;
+        data.invoiceNumber = await this._generateInvoiceNumber(data.businessId, 'INV', yyyymm);
       } else if (PURCHASE_TYPES_FOR_BILL.includes(data.transactionType)) {
-        data.invoiceNumber = `BILL-${yyyymm}-${rand}`;
+        data.invoiceNumber = await this._generateInvoiceNumber(data.businessId, 'BILL', yyyymm);
       }
     }
 
@@ -366,7 +471,7 @@ class TransactionService {
         const customer = await customerRepository.findByBusinessAndId(data.businessId, data.customerId);
         if (customer) {
           await partyBalanceService.adjustReceivable(data.businessId, data.customerId, baseAmount, {
-            userId, reason: 'credit_sale', entityType: ENTITY_TYPES.JOURNAL_ENTRY,
+            userId, reason: 'credit_sale', entityType: ENTITY_TYPES.JOURNAL_ENTRY, session,
           });
         }
       }
@@ -384,7 +489,7 @@ class TransactionService {
         const vendor = await vendorRepository.findByBusinessAndId(data.businessId, data.vendorId);
         if (vendor) {
           await partyBalanceService.adjustPayable(data.businessId, data.vendorId, baseAmount, {
-            userId, reason: 'credit_purchase', entityType: ENTITY_TYPES.JOURNAL_ENTRY,
+            userId, reason: 'credit_purchase', entityType: ENTITY_TYPES.JOURNAL_ENTRY, session,
           });
         }
       }
@@ -524,21 +629,32 @@ class TransactionService {
       }
     }
 
-    // 8. Create the entry
-    const transaction = await transactionRepository.createTransaction(entryData);
-
-    // 9. Update running account balances
-    if (data.journalLines && data.journalLines.length > 0) {
-      // Multi-line mode: update each line (journal line amounts are always in base currency)
-      for (const line of data.journalLines) {
-        await this._updateAccountBalance(line.accountId, line.amount, line.type);
+    // 8 + 9. Insert the entry AND update running balances as ONE atomic unit (#10).
+    // On a replica set (Atlas) the journal-entry insert and the per-account
+    // running-balance updates commit together or roll back together — so the
+    // ledger and the balances can never diverge if a write fails midway. On a
+    // standalone dev server withTransaction transparently falls back to the
+    // previous non-atomic behaviour, so nothing breaks anywhere. If the caller
+    // already owns a transaction (session passed in), we join it rather than
+    // nesting a new one.
+    const persist = async (txnSession) => {
+      const tx = await transactionRepository.createTransaction(entryData, txnSession);
+      // Use entryData.journalLines (not data.journalLines) so auto-generated
+      // lines — COGS on inventory sales, tax legs — are reflected in the COA
+      // running balance too. Without this the COA drifts from the Balance Sheet.
+      if (entryData.journalLines && entryData.journalLines.length > 0) {
+        for (const line of entryData.journalLines) {
+          await this._updateAccountBalance(line.accountId, line.amount, line.type, txnSession);
+        }
+      } else {
+        // Standard 1:1 mode — baseAmount keeps foreign-currency entries posting
+        // the correct base-currency equivalent to the ledger.
+        await this._updateAccountBalance(data.debitAccountId,  baseAmount, 'debit',  txnSession);
+        await this._updateAccountBalance(data.creditAccountId, baseAmount, 'credit', txnSession);
       }
-    } else {
-      // Standard 1:1 mode — use baseAmount so foreign-currency transactions post the
-      // correct PKR equivalent to the ledger (not the raw foreign-currency figure)
-      await this._updateAccountBalance(data.debitAccountId,  baseAmount, 'debit');
-      await this._updateAccountBalance(data.creditAccountId, baseAmount, 'credit');
-    }
+      return tx;
+    };
+    const transaction = session ? await persist(session) : await withTransaction(persist);
 
     // 10. Audit log
     await auditService.logCreate(
@@ -624,9 +740,29 @@ class TransactionService {
   }
 
   /**
+   * Generate a sequential invoice/bill number for a given prefix and date string.
+   * Format: {prefix}-{dateStr}-{seq:05d}  e.g. INV-202506-00001
+   * Sequential over random to prevent duplicate numbers.
+   * @private
+   */
+  async _generateInvoiceNumber(businessId, prefix, dateStr) {
+    // Atomic counter: findOneAndUpdate on a dedicated counters collection avoids
+    // the race condition where concurrent requests both read the same "last" value
+    // and generate the same invoice number → E11000 duplicate key.
+    const InvoiceCounter = require('../models/InvoiceCounter.model');
+    const key = `${businessId}:${prefix}:${dateStr}`;
+    const doc = await InvoiceCounter.findOneAndUpdate(
+      { _id: key },
+      { $inc: { seq: 1 } },
+      { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
+    );
+    return `${prefix}-${dateStr}-${String(doc.seq).padStart(5, '0')}`;
+  }
+
+  /**
    * Record a partial or full payment against a parent transaction (Settlement Engine).
    */
-  async recordPartialPayment(parentTransactionId, businessId, paymentData, userId, ipAddress) {
+  async recordPartialPayment(parentTransactionId, businessId, paymentData, userId, ipAddress, session = null) {
     // 1. Validate Parent
     const parent = await transactionRepository.findByIdWithDetails(parentTransactionId, businessId);
     if (!parent) throw new ApiError(404, 'Parent transaction not found');
@@ -690,46 +826,53 @@ class TransactionService {
       vendorId: parent.vendorId ? parent.vendorId._id : null,
     };
 
-    const childTx = await this.createTransaction(childData, userId, ipAddress);
-
-    // 5. Update Parent
+    // 5. Pre-compute the parent's new settled state (pure — no writes yet).
     const newRemainingBalance = parent.remainingBalance - paymentData.amount;
     const newPartiallyPaidAmount = (parent.partiallyPaidAmount || 0) + paymentData.amount;
     let newPaymentStatus = PAYMENT_STATUS.PARTIALLY_PAID;
-    
     if (newRemainingBalance === 0) {
       newPaymentStatus = PAYMENT_STATUS.PAID;
     } else if (parent.dueDate && new Date() > parent.dueDate) {
       newPaymentStatus = PAYMENT_STATUS.OVERDUE;
     }
 
-    const parentUpdate = {
-      remainingBalance: newRemainingBalance,
-      partiallyPaidAmount: newPartiallyPaidAmount,
-      paymentStatus: newPaymentStatus,
-      status: newRemainingBalance === 0 ? JOURNAL_STATUS.SETTLED : JOURNAL_STATUS.PARTIALLY_SETTLED,
-      $push: { 
-        relatedTransactions: childTx._id,
-        settlements: {
-          transactionId: childTx._id,
-          amount: paymentData.amount,
-          date: childData.transactionDate
-        }
+    // ── All-or-nothing settlement ────────────────────────────────────────────
+    // The child settlement entry, the parent's balance/status update and the
+    // party-balance update must all commit together or all roll back. Run them in
+    // one transaction. If a caller already opened a transaction (passes `session`),
+    // join it instead of nesting a new one.
+    const runUnit = session ? (fn) => fn(session) : (fn) => withTransaction(fn);
+    const childTx = await runUnit(async (s) => {
+      const child = await this.createTransaction(childData, userId, ipAddress, s);
+
+      const parentUpdate = {
+        remainingBalance: newRemainingBalance,
+        partiallyPaidAmount: newPartiallyPaidAmount,
+        paymentStatus: newPaymentStatus,
+        status: newRemainingBalance === 0 ? JOURNAL_STATUS.SETTLED : JOURNAL_STATUS.PARTIALLY_SETTLED,
+        $push: {
+          relatedTransactions: child._id,
+          settlements: {
+            transactionId: child._id,
+            amount: paymentData.amount,
+            date: childData.transactionDate,
+          },
+        },
+      };
+      await transactionRepository.updateTransaction(parent._id, businessId, parentUpdate, s);
+
+      // Update Customer/Vendor balances (centralized — emits *_BALANCE_CHANGED)
+      if (isReceivable && parent.customerId) {
+        await partyBalanceService.adjustReceivable(businessId, parent.customerId._id, -paymentData.amount, {
+          userId, reason: 'payment_received', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: child._id, session: s,
+        });
+      } else if (!isReceivable && parent.vendorId) {
+        await partyBalanceService.adjustPayable(businessId, parent.vendorId._id, -paymentData.amount, {
+          userId, reason: 'payment_made', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: child._id, session: s,
+        });
       }
-    };
-
-    await transactionRepository.updateTransaction(parent._id, businessId, parentUpdate);
-
-    // 6. Update Customer/Vendor balances (centralized — emits *_BALANCE_CHANGED)
-    if (isReceivable && parent.customerId) {
-      await partyBalanceService.adjustReceivable(businessId, parent.customerId._id, -paymentData.amount, {
-        userId, reason: 'payment_received', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: childTx._id,
-      });
-    } else if (!isReceivable && parent.vendorId) {
-      await partyBalanceService.adjustPayable(businessId, parent.vendorId._id, -paymentData.amount, {
-        userId, reason: 'payment_made', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: childTx._id,
-      });
-    }
+      return child;
+    });
 
     // 7. AR/AP refactor M1 — broadcast PAYMENT_RECORDED so the linked Invoice/Bill
     //    document is reconciled FROM the ledger (paidAmount / remainingBalance /
@@ -758,7 +901,7 @@ class TransactionService {
    * Helper: Update account balance based on side (debit/credit) and account normal balance.
    * @private
    */
-  async _updateAccountBalance(accountId, amount, side) {
+  async _updateAccountBalance(accountId, amount, side, session = null) {
     const account = await accountRepository.findById(accountId);
     if (!account) throw new ApiError(500, `Account ${accountId} not found`);
     let delta = 0;
@@ -771,15 +914,24 @@ class TransactionService {
     }
 
     try {
-      await accountRepository.updateRunningBalance(accountId, delta);
+      await accountRepository.updateRunningBalance(accountId, delta, session);
     } catch (balanceErr) {
-      // Balance update failed AFTER the journal entry was already saved.
-      // Log the drift so it can be reconciled — do NOT silently swallow.
-      logger.error(
-        `BALANCE_DRIFT_WARNING: Failed to update runningBalance for account ${accountId} ` +
-        `(delta=${delta}, side=${side}). The journal entry was saved but the balance is stale. ` +
-        `Error: ${balanceErr.message}`
-      );
+      if (session) {
+        // Inside a MongoDB transaction — withTransaction() will retry on WriteConflict,
+        // so no real drift occurs. Use warn, not error, to avoid alarm spam in logs.
+        logger.warn(
+          `[balance-retry] Write conflict on account ${accountId} (delta=${delta}, side=${side}) — ` +
+          `withTransaction will retry. Error: ${balanceErr.message}`
+        );
+      } else {
+        // Outside any transaction — the JE was already committed and the balance
+        // update failed separately. This IS a real balance drift. Needs reconciliation.
+        logger.error(
+          `BALANCE_DRIFT_WARNING: account ${accountId} (delta=${delta}, side=${side}) — ` +
+          `JE saved without matching balance update. Manual reconciliation needed. ` +
+          `Error: ${balanceErr.message}`
+        );
+      }
       // Re-throw so the caller (and any wrapping transaction) can act on this.
       throw balanceErr;
     }
@@ -888,22 +1040,31 @@ class TransactionService {
       }
     }
 
-    const updated = await transactionRepository.updateTransaction(transactionId, businessId, {
-      ...updateData,
-      lastModifiedBy: userId,
-    });
-    if (!updated) throw new ApiError(404, 'Transaction not found after update');
-
+    let updated;
     if (amountChanged || debitChanged || creditChanged) {
-      await this._updateAccountBalance(original.debitAccountId._id, original.amount, 'debit');
-      await this._updateAccountBalance(original.creditAccountId._id, original.amount, 'credit');
-
-      const finalDebitId = debitChanged ? updateData.debitAccountId : original.debitAccountId._id;
+      const finalDebitId  = debitChanged  ? updateData.debitAccountId  : original.debitAccountId._id;
       const finalCreditId = creditChanged ? updateData.creditAccountId : original.creditAccountId._id;
-      const finalAmount = amountChanged ? updateData.amount : original.amount;
-
-      await this._updateAccountBalance(finalDebitId, finalAmount, 'debit');
-      await this._updateAccountBalance(finalCreditId, finalAmount, 'credit');
+      const finalAmount   = amountChanged ? updateData.amount          : original.amount;
+      updated = await withTransaction(async (txnSession) => {
+        const tx = await transactionRepository.updateTransaction(transactionId, businessId, {
+          ...updateData,
+          lastModifiedBy: userId,
+        }, txnSession);
+        if (!tx) throw new ApiError(404, 'Transaction not found after update');
+        // Reverse old balances
+        await this._updateAccountBalance(original.debitAccountId._id,  original.amount, 'credit', txnSession);
+        await this._updateAccountBalance(original.creditAccountId._id, original.amount, 'debit',  txnSession);
+        // Apply new balances
+        await this._updateAccountBalance(finalDebitId,  finalAmount, 'debit',  txnSession);
+        await this._updateAccountBalance(finalCreditId, finalAmount, 'credit', txnSession);
+        return tx;
+      });
+    } else {
+      updated = await transactionRepository.updateTransaction(transactionId, businessId, {
+        ...updateData,
+        lastModifiedBy: userId,
+      });
+      if (!updated) throw new ApiError(404, 'Transaction not found after update');
     }
 
     // AR/AP parent reconciliation ─────────────────────────────────────────────
@@ -1008,6 +1169,19 @@ class TransactionService {
 
     // 3. Build reversal entry data
     const effectiveDate = reversalDate ? new Date(reversalDate) : new Date();
+
+    // Also check that the reversal's own date is not in a locked period
+    if (original.entryType === 'normal') {
+      const AccountingPeriod = require('../models/AccountingPeriod.model');
+      const reversalPeriod = await AccountingPeriod.findCoveringPeriod(businessId, effectiveDate);
+      if (reversalPeriod && reversalPeriod.status === 'locked') {
+        throw new ApiError(
+          423,
+          `Reversal date falls in a locked period "${reversalPeriod.name}". Use a different reversal date or an admin override.`
+        );
+      }
+    }
+
     const reasonLabel   = reason ? `Reversal (${reason})` : 'Reversal';
     const reversalDesc  = `${reasonLabel}: ${original.description}`;
 
@@ -1139,58 +1313,13 @@ class TransactionService {
    * Also rolls back customer/vendor balances if applicable.
    */
   async deleteTransaction(transactionId, businessId, userId, ipAddress) {
-    const original = await transactionRepository.findByIdWithDetails(transactionId, businessId);
-    if (!original) throw new ApiError(404, 'Transaction not found');
-    if (original.status === JOURNAL_STATUS.REVERSED) throw new ApiError(400, 'Transaction already reversed');
-    if (original.partiallyPaidAmount > 0) throw new ApiError(400, 'Cannot reverse a transaction that has payments applied. Reverse the payments first.');
-
-    // Create reversal entry
-    const reversalData = {
-      businessId,
-      transactionDate: new Date(),
-      description: `Reversal of: ${original.description}`,
-      transactionType: original.transactionType,
-      amount: original.amount,
-      debitAccountId: original.creditAccountId._id,
-      creditAccountId: original.debitAccountId._id,
-      inputMethod: original.inputMethod,
-      status: JOURNAL_STATUS.POSTED,
-      reversalOf: original._id,
-      createdBy: userId,
-      lastModifiedBy: userId,
-    };
-    const reversal = await transactionRepository.createTransaction(reversalData);
-
-    // Revert Account Balances
-    await this._updateAccountBalance(reversal.debitAccountId, original.amount, 'debit');
-    await this._updateAccountBalance(reversal.creditAccountId, original.amount, 'credit');
-
-    // Revert Customer/Vendor Balances (centralized — emits *_BALANCE_CHANGED)
-    if (original.transactionType === TRANSACTION_TYPES.CREDIT_SALE && original.customerId) {
-        await partyBalanceService.adjustReceivable(businessId, original.customerId._id, -original.amount, {
-          userId, reason: 'transaction_deleted', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: original._id,
-        });
-    } else if (original.transactionType === TRANSACTION_TYPES.CREDIT_PURCHASE && original.vendorId) {
-        await partyBalanceService.adjustPayable(businessId, original.vendorId._id, -original.amount, {
-          userId, reason: 'transaction_deleted', entityType: ENTITY_TYPES.JOURNAL_ENTRY, entityId: original._id,
-        });
-    }
-
-    // Mark original as reversed
-    await transactionRepository.updateTransaction(transactionId, businessId, { status: JOURNAL_STATUS.REVERSED, paymentStatus: null, remainingBalance: 0 });
-
-    await auditService.logReversal(
-      ENTITY_TYPES.JOURNAL_ENTRY,
+    return this.reverseTransaction(
       transactionId,
       businessId,
+      { reversalDate: new Date(), reason: 'Deleted by user' },
       userId,
-      original,
-      { reversalId: reversal._id },
       ipAddress
     );
-
-    reportCache.invalidate(businessId.toString());
-    return reversal;
   }
 
   /**
@@ -1426,7 +1555,7 @@ class TransactionService {
 
     if (overdueEntries.length === 0) return { scanned: 0, updated: 0 };
     const ids = overdueEntries.map(e => e._id);
-    const result = await JournalEntry.updateMany(
+    const result = await JournalEntry.collection.updateMany(
       { _id: { $in: ids } },
       { $set: { paymentStatus: PAYMENT_STATUS.OVERDUE } }
     );
@@ -1462,7 +1591,7 @@ class TransactionService {
     }
 
     const ids = overdueEntries.map(e => e._id);
-    const result = await JournalEntry.updateMany(
+    const result = await JournalEntry.collection.updateMany(
       { _id: { $in: ids } },
       { $set: { paymentStatus: PAYMENT_STATUS.OVERDUE } }
     );

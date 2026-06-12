@@ -181,9 +181,56 @@ class PaymentService {
       : payment;
   }
 
-  // ───────────────────────────────────────────────────────────────────────────
+  /**
+   * Phase 2 - Accounts Receivable: Auto-Allocate a lump sum payment.
+   * Fetches open invoices (or bills) for the party, oldest first, and automatically
+   * builds the allocations array, then records the payment.
+   */
+  async autoAllocatePayment(businessId, partyType, partyId, paymentData, userId, ipAddress) {
+    const amount = r2(paymentData.amount);
+    if (!(amount > 0)) throw new ApiError(400, 'Payment amount must be greater than zero');
+
+    const DocumentModel = partyType === 'vendor' ? Bill : Invoice;
+    const query = {
+      businessId,
+      [partyType === 'vendor' ? 'vendorId' : 'customerId']: partyId,
+      state: { $in: ['approved', 'partially_paid'] },
+      remainingBalance: { $gt: 0 },
+      isArchived: false,
+    };
+    const openDocs = await DocumentModel.find(query).sort({ dueDate: 1, issueDate: 1 }).lean();
+
+    const allocations = [];
+    let remainingToAllocate = amount;
+
+    for (const doc of openDocs) {
+      if (remainingToAllocate <= 0) break;
+
+      const allocAmount = Math.min(doc.remainingBalance, remainingToAllocate);
+      allocations.push({
+        documentType: partyType === 'vendor' ? 'bill' : 'invoice',
+        documentId: doc._id,
+        amount: r2(allocAmount),
+      });
+
+      remainingToAllocate = r2(remainingToAllocate - allocAmount);
+    }
+
+    if (allocations.length === 0) {
+      throw new ApiError(400, 'No open documents found to auto-allocate this payment.');
+    }
+
+    const dataWithAllocations = {
+      ...paymentData,
+      allocations,
+    };
+
+    return await this.recordPayment(businessId, dataWithAllocations, userId, ipAddress);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════════
   // Validation + resolution (no writes — the primary rollback guarantee)
-  // ───────────────────────────────────────────────────────────────────────────
+  // ════════════════════════════════════════════════════════════════════════════════
 
   async _validateAndResolve(businessId, data) {
     const amount = r2(data.amount);
@@ -235,14 +282,17 @@ class PaymentService {
       }
 
       const thisDirection = isAR ? 'inbound' : 'outbound';
+      // An unlinked AR/AP entry (no customer/vendor — e.g. a manual credit-sale
+      // journal) can still be settled: we post the cash receipt and reduce the
+      // outstanding, just without touching any party subledger. partyId stays null.
       const thisPartyId = (isAR ? je.customerId : je.vendorId) || null;
-      if (!thisPartyId) throw new ApiError(400, 'The target entry is not linked to a customer/vendor');
+      const thisPartyKey = thisPartyId ? String(thisPartyId) : null;
 
       // A single payment is for a single party and a single direction (AR or AP).
-      if (direction === null) { direction = thisDirection; partyId = String(thisPartyId); }
+      if (direction === null) { direction = thisDirection; partyId = thisPartyKey; }
       else {
         if (direction !== thisDirection) throw new ApiError(400, 'A payment cannot mix receivable and payable allocations');
-        if (partyId !== String(thisPartyId)) throw new ApiError(400, 'All allocations of a payment must be for the same party');
+        if (partyId !== thisPartyKey) throw new ApiError(400, 'All allocations of a payment must be for the same party');
       }
 
       if (!documentType) documentType = isAR ? 'invoice' : 'bill';
@@ -285,6 +335,7 @@ class PaymentService {
   }
 
   async _partySnapshot(businessId, direction, partyId) {
+    if (!partyId) return {}; // unlinked AR/AP entry — no party to snapshot
     try {
       if (direction === 'inbound') {
         const c = await customerRepository.findByBusinessAndId(businessId, partyId);

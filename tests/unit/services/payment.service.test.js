@@ -207,6 +207,27 @@ describe('recordPayment — rollback safety', () => {
   });
 });
 
+// ── Unlinked AR/AP (no customer/vendor on the target entry) ──────────────────
+describe('recordPayment — settles an entry with no linked party', () => {
+  it('records the payment with partyId=null instead of throwing', async () => {
+    // A manual credit-sale journal with NO customer (the "Client Invoice
+    // Generated" case) — previously this rejected with "not linked to a
+    // customer/vendor"; it must now settle.
+    JES.je1 = makeJE({ _id: 'je1', customerId: null, remainingBalance: 100000 });
+
+    const payment = await paymentService.recordPayment(BIZ, {
+      amount: 100000, cashAccountId: CASH, paymentDate: new Date(),
+      allocations: [{ parentTransactionId: 'je1', amount: 100000 }],
+    }, 'u1', '127.0.0.1');
+
+    expect(payment.direction).toBe('inbound');
+    expect(payment.partyId).toBeNull();
+    expect(payment.partySnapshot).toEqual({});
+    expect(txService.recordPartialPayment).toHaveBeenCalledTimes(1);
+    expect(payment.status).toBe('completed');
+  });
+});
+
 // ── Legacy adapter ───────────────────────────────────────────────────────────
 describe('recordLegacyPayment — backward-compatible single allocation', () => {
   it('returns the child settlement transaction (legacy contract)', async () => {

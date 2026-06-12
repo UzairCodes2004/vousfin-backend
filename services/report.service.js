@@ -148,25 +148,128 @@ class ReportService {
     };
 
     const liabilityAccounts = accounts.filter(a => a.accountType === 'Liability').map(mapAcc);
-    const equityAccounts    = accounts.filter(a => a.accountType === 'Equity').map(mapAcc);
+    // Exclude any real account literally named "Current Year Earnings" — the
+    // synthetic derived line below already represents this value correctly.
+    // Showing both creates a duplicate row and double-counts unclosed earnings.
+    const equityAccounts = accounts
+      .filter(a => a.accountType === 'Equity')
+      .filter(a => !/^current.?year.?earnings$/i.test(a.accountName.trim()))
+      .map(mapAcc);
+
+    // ── Current-year (unclosed) earnings ─────────────────────────────────────
+    // The accounting identity guarantees (as-of balances):
+    //     Assets − Liabilities − Equity  ≡  Revenue − Expenses
+    // Net income not yet moved into a Retained Earnings equity account by a
+    // fiscal-year close still sits in the Revenue/Expense accounts and MUST be
+    // shown inside equity — otherwise the Balance Sheet cannot balance. We derive
+    // it from the SAME balanceMap used for every other line (so it includes COGS
+    // that lives only in journalLines) and present it as one synthetic equity
+    // line.
+    //
+    // IMPORTANT: we use the ECONOMIC direction per account, exactly like sectionTotal.
+    // Contra-revenue accounts (debit-normal, e.g. Sales Returns & Allowances) must
+    // have their balance NEGATED when summing into the Revenue total — a debit-normal
+    // account in a credit-dominated section REDUCES, not adds, to that section.
+    // Similarly contra-expense accounts (credit-normal) negate inside the Expense total.
+    //
+    // Additionally: if a "Current Year Earnings" REAL equity account exists (from a
+    // partial close that credited CYE rather than Retained Earnings), its balance is
+    // excluded from equityAccounts above but must be included here so the synthetic
+    // line captures total net income (closed + unclosed) and the equation balances.
+    const r2 = (v) => Math.round((Number(v) || 0) * 100) / 100;
+
+    // Economic sum: debit-normal accounts in a credit-natural section are negated.
+    const economicSum = (map, type) => {
+      const creditNatural = (type === 'Revenue' || type === 'Liability' || type === 'Equity');
+      return accounts
+        .filter(a => a.accountType === type)
+        .reduce((s, a) => {
+          const bal = map[a._id.toString()] || 0;
+          // If account's normalBalance opposes the section's natural direction, negate.
+          const isOpposite = creditNatural
+            ? a.normalBalance === 'Debit'    // debit-normal inside credit section
+            : a.normalBalance === 'Credit';  // credit-normal inside debit section
+          return s + (isOpposite ? -bal : bal);
+        }, 0);
+    };
+
+    // Any real equity account literally named "Current Year Earnings" is excluded from
+    // equityAccounts (to avoid double-counting with the synthetic line). Capture its
+    // economic balance and roll it into the synthetic total so the equation holds even
+    // when partial closing entries credit this account instead of Retained Earnings.
+    const realCYEBalance = r2(
+      accounts
+        .filter(a => a.accountType === 'Equity' && /^current.?year.?earnings$/i.test(a.accountName.trim()))
+        .reduce((s, a) => {
+          const bal = balanceMap[a._id.toString()] || 0;
+          return s + (a.normalBalance === 'Debit' ? -bal : bal);
+        }, 0)
+    );
+
+    const currentEarnings = r2(economicSum(balanceMap, 'Revenue') - economicSum(balanceMap, 'Expense') + realCYEBalance);
+    const compareEarnings = compareMap
+      ? r2(economicSum(compareMap, 'Revenue') - economicSum(compareMap, 'Expense') +
+          accounts
+            .filter(a => a.accountType === 'Equity' && /^current.?year.?earnings$/i.test(a.accountName.trim()))
+            .reduce((s, a) => {
+              const bal = compareMap[a._id.toString()] || 0;
+              return s + (a.normalBalance === 'Debit' ? -bal : bal);
+            }, 0)
+        )
+      : undefined;
+
+    // Inject as a synthetic equity account so the equity detail foots to its total.
+    if (currentEarnings !== 0 || (compareEarnings && compareEarnings !== 0)) {
+      equityAccounts.push({
+        accountId:      null,
+        accountCode:    '',
+        accountName:    'Current Year Earnings',
+        accountType:    'Equity',
+        accountSubtype: 'Equity',
+        balance:        currentEarnings,
+        compareBalance: compareMap ? (compareEarnings || 0) : undefined,
+        isDerived:      true,
+      });
+    }
 
     const assetGroups     = groupBySubtype(assetAccounts);
     const liabilityGroups = groupBySubtype(liabilityAccounts);
     const equityGroups    = groupBySubtype(equityAccounts);
 
-    const totalAssets      = assetAccounts.reduce((s, a) => s + a.balance, 0);
-    const totalLiabilities = liabilityAccounts.reduce((s, a) => s + a.balance, 0);
-    const totalEquity      = equityAccounts.reduce((s, a) => s + a.balance, 0);
-    const equationValid    = Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01;
+    // For all three section totals, use the account's normalBalance to determine
+    // whether a positive `balance` value INCREASES or DECREASES the section total.
+    // • Credit-normal accounts (most liabilities, equity, revenue):  balance adds normally.
+    // • Debit-normal accounts inside Liability / Equity sections:     balance reduces the total
+    //   (e.g. Drawings reduces equity; an overpaid liability is effectively an asset).
+    const sectionTotal = (accs) => accs.reduce((s, a) => {
+      const nb = accounts.find(x => x._id?.toString() === a.accountId?.toString())?.normalBalance || 'Credit';
+      // For the equity / liability sections the "natural" direction is Credit.
+      // A debit-normal account in those sections (e.g. Drawings) moves in the opposite direction.
+      return s + (nb === 'Debit' ? -a.balance : a.balance);
+    }, 0);
 
-    // Retained earnings = all net income accumulated to asOfDate
-    const retainedEarnings = await this._getRetainedEarnings(businessId, asOfDate);
+    const totalAssets      = assetAccounts.reduce((s, a) => {
+      // Most assets are Debit-normal; contra-assets (AccumDep) are Credit-normal.
+      // `_getBalancesAsOf` already returns the right sign for both:
+      // debit-normal balance = DR − CR  (positive when in normal direction)
+      // credit-normal balance = CR − DR  (positive when in normal direction, e.g. AccumDep has CR credit)
+      // But for assets: debit-normal positive → adds to assets;
+      //                credit-normal positive → REDUCES assets (contra-asset).
+      const nb = accounts.find(x => x._id?.toString() === a.accountId?.toString())?.normalBalance || 'Debit';
+      return s + (nb === 'Credit' ? -a.balance : a.balance);
+    }, 0);
+    const totalLiabilities = sectionTotal(liabilityAccounts);
+    const totalEquity      = sectionTotal(equityAccounts);
+    const equationValid    = Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01;
 
     const result = {
       assets:      { groups: assetGroups,     accounts: assetAccounts,     total: totalAssets },
       liabilities: { groups: liabilityGroups, accounts: liabilityAccounts, total: totalLiabilities },
       equity:      { groups: equityGroups,    accounts: equityAccounts,    total: totalEquity },
-      retainedEarnings,
+      // Backward-compatible field — now the (correct) unclosed earnings, which are
+      // ALSO already included inside `equity` / `totalEquity` above.
+      retainedEarnings: currentEarnings,
+      currentEarnings,
       totalAssets,
       totalLiabilities,
       totalEquity,
@@ -247,7 +350,10 @@ class ReportService {
 
     for (const { tx, cashAccId } of allCashTxns) {
       const isDebitCash = tx.debitAccountId.toString() === cashAccId;
-      const cashEffect  = isDebitCash ? tx.amount : -tx.amount;
+      const rawAmount   = (tx.baseCurrencyAmount != null && tx.baseCurrencyAmount !== 0)
+        ? tx.baseCurrencyAmount
+        : tx.amount;
+      const cashEffect  = isDebitCash ? rawAmount : -rawAmount;
       const key         = tx.transactionType || 'Other';
       const label       = TYPE_LABELS[key] || (key.charAt(0) + key.slice(1).toLowerCase().replace(/_/g, ' '));
 
@@ -428,19 +534,30 @@ class ReportService {
     const ledgerByAccount = new Map();
 
     for (const tx of txns) {
-      const sides = [
-        { acc: tx.debitAccountId,  side: 'debit'  },
-        { acc: tx.creditAccountId, side: 'credit' },
-      ];
+      // Expand each entry into its EFFECTIVE lines — the same normalisation the
+      // Trial Balance / Balance Sheet use (journalLines when present, else the
+      // synthesised top-level pair). Previously the GL read only the top-level
+      // debit/credit accounts, so the COGS / tax legs that live in journalLines
+      // were missing from per-account ledgers and the GL disagreed with the TB.
+      const hasLines = Array.isArray(tx.journalLines) && tx.journalLines.length > 0;
+      const lines = hasLines
+        ? tx.journalLines.map(l => ({
+            accId:  l.accountId ? l.accountId.toString() : null,
+            side:   l.type,
+            amount: l.amount,
+          }))
+        : [
+            { accId: tx.debitAccountId  ? (tx.debitAccountId._id  || tx.debitAccountId).toString()  : null, side: 'debit',  amount: tx.amount },
+            { accId: tx.creditAccountId ? (tx.creditAccountId._id || tx.creditAccountId).toString() : null, side: 'credit', amount: tx.amount },
+          ];
 
-      for (const { acc, side } of sides) {
-        if (!acc) continue;
-        const accId = acc._id ? acc._id.toString() : acc.toString();
-        // If filtering by specific account, skip unrelated sides
+      for (const { accId, side, amount } of lines) {
+        if (!accId) continue;
+        // If filtering by specific account, skip unrelated lines
         if (accountId && accId !== accountId.toString()) continue;
 
         if (!ledgerByAccount.has(accId)) {
-          const accDoc = accountLookup.get(accId) || acc;
+          const accDoc = accountLookup.get(accId) || {};
           ledgerByAccount.set(accId, {
             accountId:      accId,
             accountCode:    accDoc.accountCode || '',
@@ -461,11 +578,11 @@ class ReportService {
         // Effect on account balance
         let debitAmt = 0, creditAmt = 0, effect = 0;
         if (side === 'debit') {
-          debitAmt = tx.amount;
-          effect   = nb === 'Debit' ? tx.amount : -tx.amount;
+          debitAmt = amount;
+          effect   = nb === 'Debit' ? amount : -amount;
         } else {
-          creditAmt = tx.amount;
-          effect    = nb === 'Credit' ? tx.amount : -tx.amount;
+          creditAmt = amount;
+          effect    = nb === 'Credit' ? amount : -amount;
         }
 
         ledger.entries.push({
@@ -838,21 +955,6 @@ class ReportService {
     }
 
     return Object.fromEntries(balanceMap);
-  }
-
-  /**
-   * Compute retained earnings = cumulative net income (all revenue − all expenses) to asOfDate.
-   * @private
-   */
-  async _getRetainedEarnings(businessId, asOfDate) {
-    try {
-      // Use getIncomeStatement from the start of time to asOfDate
-      const epochStart = new Date('2000-01-01');
-      const { netIncome } = await this.getIncomeStatement(businessId, epochStart, asOfDate);
-      return Math.round(netIncome * 100) / 100;
-    } catch {
-      return 0;
-    }
   }
 }
 

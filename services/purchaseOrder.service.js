@@ -85,9 +85,12 @@ class PurchaseOrderService {
     return po;
   }
 
-  async _loadOrThrow(id) {
+  async _loadOrThrow(id, businessId = null) {
     if (!mongoose.Types.ObjectId.isValid(id)) throw new ApiError(400, 'Invalid purchase order id');
-    const po = await PurchaseOrder.findById(id);
+    // R-05: tenant scope when provided
+    const po = businessId
+      ? await PurchaseOrder.findOne({ _id: id, businessId })
+      : await PurchaseOrder.findById(id);
     if (!po) throw new ApiError(404, 'Purchase order not found');
     if (po.isArchived) throw new ApiError(410, 'Purchase order has been archived');
     return po;
@@ -182,7 +185,7 @@ class PurchaseOrderService {
   // ─────────────────────────────────────────────────────────────────────────
 
   async updateDraft(id, data, user, ipAddress) {
-    const po = await this._loadOrThrow(id);
+    const po = await this._loadOrThrow(id, user?.businessId);
     if (po.state !== PO_STATES.DRAFT) {
       throw new ApiError(409, 'Only draft purchase orders can be edited');
     }
@@ -221,7 +224,7 @@ class PurchaseOrderService {
   // ─────────────────────────────────────────────────────────────────────────
 
   async submitForApproval(id, user, ipAddress) {
-    const po = await this._loadOrThrow(id);
+    const po = await this._loadOrThrow(id, user?.businessId);
     if (!po.approvalRequired) {
       return this._applyStateChange(po, PO_STATES.APPROVED, user, {
         reason: 'Below approval threshold — auto-approved',
@@ -240,7 +243,7 @@ class PurchaseOrderService {
   }
 
   async approve(id, user, note, ipAddress) {
-    const po = await this._loadOrThrow(id);
+    const po = await this._loadOrThrow(id, user?.businessId);
     po.approvalLog.push({
       action:    'approved',
       actorId:   user._id,
@@ -256,7 +259,7 @@ class PurchaseOrderService {
   }
 
   async reject(id, user, note, ipAddress) {
-    const po = await this._loadOrThrow(id);
+    const po = await this._loadOrThrow(id, user?.businessId);
     po.approvalLog.push({
       action:    'rejected',
       actorId:   user._id,
@@ -286,7 +289,7 @@ class PurchaseOrderService {
    * @param {Object}   user
    */
   async recordGrnReceipt(poId, receivedItems, grnId, user) {
-    const po = await this._loadOrThrow(poId);
+    const po = await this._loadOrThrow(poId, user?.businessId);
     if (![PO_STATES.APPROVED, PO_STATES.PARTIALLY_RECEIVED].includes(po.state)) {
       throw new ApiError(
         409,
@@ -326,17 +329,17 @@ class PurchaseOrderService {
   // ─────────────────────────────────────────────────────────────────────────
 
   async cancel(id, user, reason, ipAddress) {
-    const po = await this._loadOrThrow(id);
+    const po = await this._loadOrThrow(id, user?.businessId);
     return this._applyStateChange(po, PO_STATES.CANCELLED, user, { reason, ipAddress });
   }
 
   async close(id, user, reason, ipAddress) {
-    const po = await this._loadOrThrow(id);
+    const po = await this._loadOrThrow(id, user?.businessId);
     return this._applyStateChange(po, PO_STATES.CLOSED, user, { reason, ipAddress });
   }
 
   async softDelete(id, user, ipAddress) {
-    const po = await this._loadOrThrow(id);
+    const po = await this._loadOrThrow(id, user?.businessId);
     if (po.isArchived) return po;
     po.isArchived = true;
     po.archivedAt = new Date();

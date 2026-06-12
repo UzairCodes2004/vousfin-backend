@@ -68,7 +68,8 @@ const chartOfAccountSchema = new mongoose.Schema(
     runningBalance: {
       type: Number,
       default: 0,
-      min: 0, // Not strictly enforced (can be negative for liabilities/equity), but kept as a hint
+      // Signed: positive when in normal-balance position, negative when contra.
+      // Liabilities, equity, and contra-asset accounts can legitimately go negative.
     },
   },
   {

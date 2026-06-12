@@ -15,6 +15,9 @@
 
 jest.mock('../../../config/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 jest.mock('../../../utils/reportCache', () => ({ invalidate: jest.fn(), get: jest.fn(), set: jest.fn(), clear: jest.fn() }));
+// Run the balanced-journal poster on its non-atomic fallback path (no live DB
+// session in this mocked test) — same code, session injected as null.
+jest.mock('../../../utils/withTransaction', () => ({ withTransaction: (fn) => fn(null) }));
 jest.mock('../../../repositories/customer.repository', () => ({ updateReceivableBalance: jest.fn() }));
 jest.mock('../../../repositories/vendor.repository',   () => ({ updatePayableBalance:    jest.fn() }));
 jest.mock('../../../repositories/account.repository',  () => ({ findById: jest.fn(), updateRunningBalance: jest.fn() }));
@@ -84,7 +87,7 @@ describe('Scenario 1 — AP recognition propagates: vendor balance + event + cac
     await partyBalanceService.adjustPayable(BIZ_A, 'v1', 1000, { reason: 'bill_approved' });
     await flush();
 
-    expect(vendorRepository.updatePayableBalance).toHaveBeenCalledWith('v1', 1000);   // AP module
+    expect(vendorRepository.updatePayableBalance).toHaveBeenCalledWith('v1', 1000, null);   // AP module (3rd arg = no session)
     expect(reportCache.invalidate).toHaveBeenCalledWith(BIZ_A);                        // analytics module
   });
 });
@@ -96,7 +99,7 @@ describe('Scenario 2 — AR recognition propagates: customer balance + event + c
     await partyBalanceService.adjustReceivable(BIZ_A, 'c1', 500, { reason: 'invoice_approved' });
     await flush();
 
-    expect(customerRepository.updateReceivableBalance).toHaveBeenCalledWith('c1', 500);
+    expect(customerRepository.updateReceivableBalance).toHaveBeenCalledWith('c1', 500, null);
     expect(reportCache.invalidate).toHaveBeenCalledWith(BIZ_A);
   });
 });
@@ -108,7 +111,7 @@ describe('Scenario 3 — Settlement propagates: balance decrement + event + cach
     await partyBalanceService.adjustPayable(BIZ_A, 'v1', -1000, { reason: 'bill_paid' });
     await flush();
 
-    expect(vendorRepository.updatePayableBalance).toHaveBeenCalledWith('v1', -1000);
+    expect(vendorRepository.updatePayableBalance).toHaveBeenCalledWith('v1', -1000, null);
     expect(reportCache.invalidate).toHaveBeenCalledWith(BIZ_A);
   });
 });
@@ -130,7 +133,8 @@ describe('Scenario 4 — Tenant isolation: a tenant event never touches another 
 // ════════════════════════════════════════════════════════════════════════════
 describe('Scenario 5 — Balanced journal posts AND moves both running balances', () => {
   it('creates the JE and updates debit + credit accounts with the right signs', async () => {
-    JournalEntry.create.mockImplementation((doc) => Promise.resolve({ _id: 'je1', ...doc }));
+    JournalEntry.create.mockImplementation((docs) =>
+      Promise.resolve([{ _id: 'je1', ...(Array.isArray(docs) ? docs[0] : docs) }]));
     accountRepository.findById.mockImplementation((id) =>
       Promise.resolve({ _id: id, normalBalance: id === 'AR' ? 'Debit' : 'Credit' })
     );
@@ -141,8 +145,8 @@ describe('Scenario 5 — Balanced journal posts AND moves both running balances'
     });
 
     expect(je._id).toBe('je1');
-    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith('AR', 1000);   // DR debit-normal +
-    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith('SALES', 1000); // CR credit-normal +
+    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith('AR', 1000, null);   // DR debit-normal +
+    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith('SALES', 1000, null); // CR credit-normal +
   });
 });
 
@@ -182,7 +186,8 @@ describe('Scenario 7 — Invoice approval recognizes COGS across inventory + led
       .mockResolvedValueOnce({ cogsAmount: 300 })
       .mockResolvedValueOnce({ cogsAmount: 80 });
     inventoryService.resolveCostAccounts.mockResolvedValue({ cogsAccountId: 'COGS', inventoryAccountId: 'INV' });
-    JournalEntry.create.mockImplementation((doc) => Promise.resolve({ _id: 'jeCogs', ...doc }));
+    JournalEntry.create.mockImplementation((docs) =>
+      Promise.resolve([{ _id: 'jeCogs', ...(Array.isArray(docs) ? docs[0] : docs) }]));
     accountRepository.findById.mockResolvedValue({ _id: 'x', normalBalance: 'Debit' });
     accountRepository.updateRunningBalance.mockResolvedValue(undefined);
 
@@ -199,10 +204,12 @@ describe('Scenario 7 — Invoice approval recognizes COGS across inventory + led
 
     expect(inventoryService.reduceStock).toHaveBeenCalledTimes(2);
     expect(total).toBe(380);
-    const cogsJe = JournalEntry.create.mock.calls.find((c) => c[0].debitAccountId === 'COGS');
-    expect(cogsJe).toBeTruthy();
-    expect(cogsJe[0].creditAccountId).toBe('INV');
-    expect(cogsJe[0].amount).toBe(380);
+    // create() is now called array-form: create([entry], { session }).
+    const cogsCall = JournalEntry.create.mock.calls.find((c) => c[0][0]?.debitAccountId === 'COGS');
+    expect(cogsCall).toBeTruthy();
+    const cogsEntry = cogsCall[0][0];
+    expect(cogsEntry.creditAccountId).toBe('INV');
+    expect(cogsEntry.amount).toBe(380);
   });
 });
 

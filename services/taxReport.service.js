@@ -16,9 +16,13 @@
 
 const mongoose       = require('mongoose');
 const { getProfile } = require('../config/countryTaxProfiles');
+const transactionRepository = require('../repositories/transaction.repository'); // EFFECTIVE_LINES_STAGE
 const logger         = require('../config/logger');
 
 const JournalEntry   = () => mongoose.model('JournalEntry');
+const ChartOfAccount = () => mongoose.model('ChartOfAccount');
+
+const r2 = (v) => Math.round((Number(v) || 0) * 100) / 100;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Tax Ledger
@@ -196,6 +200,91 @@ async function getWhtSummary(businessId, { startDate, endDate }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Tax-to-Ledger Reconciliation (authoritative)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve a business's tax control accounts, split into output (liability) and
+ * input (asset) sides. Codes come from the country profile's additionalAccounts
+ * plus the two base accounts (2120 GST Payable, 2125 WHT Payable). We classify
+ * by accountType — NOT by code range — because some receivable tax accounts
+ * (e.g. 2122 WHT Receivable) carry a 2xxx code but are Assets (input side).
+ * @private
+ */
+async function _resolveTaxAccounts(businessId, country = 'PK') {
+  const profile = getProfile(country);
+  const codes = new Set(['2120', '2125', ...((profile.additionalAccounts || []).map(a => a.accountCode))]);
+  const accounts = await ChartOfAccount()
+    .find({ businessId, accountCode: { $in: [...codes] } })
+    .select('accountCode accountName accountType')
+    .lean();
+  return {
+    output: accounts.filter(a => a.accountType === 'Liability'), // tax collected / owed
+    input:  accounts.filter(a => a.accountType === 'Asset'),     // recoverable input tax
+  };
+}
+
+/**
+ * Recompute output/input tax for the period DIRECTLY from the movement on the
+ * GL tax control accounts — the authoritative source of truth. This ties the
+ * tax return to the ledger by construction and captures EVERY tax posting,
+ * regardless of which code path created it (transaction-first, invoice/bill
+ * recognition, or a manual journal). Uses the shared effective-lines stage so
+ * compound (multi-line) journals are handled correctly.
+ *
+ *   output tax = Σ(credits − debits) on output (liability) tax accounts
+ *   input  tax = Σ(debits − credits) on input  (asset)     tax accounts
+ *
+ * @returns {Promise<{glOutputTax:number, glInputTax:number, glNetPayable:number, taxAccounts:object}>}
+ */
+async function reconcileTaxToLedger(businessId, { startDate, endDate } = {}, country = 'PK') {
+  const { output, input } = await _resolveTaxAccounts(businessId, country);
+  const outIds = output.map(a => a._id);
+  const inIds  = input.map(a => a._id);
+  if (outIds.length === 0 && inIds.length === 0) {
+    return { glOutputTax: 0, glInputTax: 0, glNetPayable: 0, taxAccounts: { output: [], input: [] } };
+  }
+
+  const match = { businessId: new mongoose.Types.ObjectId(String(businessId)), status: 'posted' };
+  if (startDate || endDate) {
+    match.transactionDate = {};
+    if (startDate) match.transactionDate.$gte = startDate;
+    if (endDate)   match.transactionDate.$lte = endDate;
+  }
+
+  const rows = await JournalEntry().aggregate([
+    { $match: match },
+    transactionRepository.EFFECTIVE_LINES_STAGE,
+    { $unwind: '$effectiveLines' },
+    { $match: { 'effectiveLines.accountId': { $in: [...outIds, ...inIds] } } },
+    { $group: {
+      _id: { acct: '$effectiveLines.accountId', type: '$effectiveLines.type' },
+      total: { $sum: '$effectiveLines.amount' },
+    } },
+  ]);
+
+  const byAcct = {}; // accountId → { debit, credit }
+  for (const row of rows) {
+    const id = String(row._id.acct);
+    byAcct[id] = byAcct[id] || { debit: 0, credit: 0 };
+    byAcct[id][row._id.type] += row.total;
+  }
+
+  let glOutputTax = 0, glInputTax = 0;
+  for (const a of output) { const m = byAcct[String(a._id)] || { debit: 0, credit: 0 }; glOutputTax += (m.credit - m.debit); }
+  for (const a of input)  { const m = byAcct[String(a._id)] || { debit: 0, credit: 0 }; glInputTax  += (m.debit - m.credit); }
+  glOutputTax = r2(glOutputTax);
+  glInputTax  = r2(glInputTax);
+
+  return {
+    glOutputTax,
+    glInputTax,
+    glNetPayable: r2(glOutputTax - glInputTax),
+    taxAccounts: { output: output.map(a => a.accountCode), input: input.map(a => a.accountCode) },
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Filing Period Summary (country-specific)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -227,6 +316,23 @@ async function getFilingSummary(businessId, { startDate, endDate }, country = 'P
   const summary = await getTaxSummary(businessId, { startDate, endDate }, country);
   const profile = getProfile(country);
 
+  // Cross-check the transaction-derived summary against the GL tax accounts so
+  // the return is provably tied to the books (audit trail). reconciled=false
+  // means a tax posting exists in the ledger that the summary didn't capture.
+  let reconciliation = null;
+  try {
+    const recon = await reconcileTaxToLedger(businessId, { startDate, endDate }, country);
+    reconciliation = {
+      ...recon,
+      reportOutputTax: summary.outputTax,
+      reportInputTax:  summary.inputTax,
+      reportNetPayable: summary.netPayable,
+      reconciled: Math.abs(recon.glNetPayable - summary.netPayable) < 0.01,
+    };
+  } catch (err) {
+    logger.warn(`[taxReport] reconciliation failed (non-fatal): ${err.message}`);
+  }
+
   const base = {
     country,
     countryName:      profile.countryName,
@@ -237,6 +343,7 @@ async function getFilingSummary(businessId, { startDate, endDate }, country = 'P
     outputByType:     summary.outputByType,
     inputByType:      summary.inputByType,
     status:           summary.netPayable > 0 ? 'payable' : summary.netPayable < 0 ? 'refundable' : 'nil',
+    reconciliation,
   };
 
   // Country-specific fields
@@ -292,4 +399,5 @@ module.exports = {
   getTaxSummary,
   getWhtSummary,
   getFilingSummary,
+  reconcileTaxToLedger,
 };

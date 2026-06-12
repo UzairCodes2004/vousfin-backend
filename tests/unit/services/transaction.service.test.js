@@ -13,6 +13,11 @@ jest.mock('../../../services/inventory.service');
 jest.mock('../../../models/AccountingPeriod.model', () => ({
   findCoveringPeriod: jest.fn().mockResolvedValue(null),
 }));
+// Cycle-2 hardening replaced random invoice numbers with an atomic InvoiceCounter
+// sequence — a real Mongoose model, so stub it for unit tests (no DB available).
+jest.mock('../../../models/InvoiceCounter.model', () => ({
+  findOneAndUpdate: jest.fn().mockResolvedValue({ seq: 1 }),
+}));
 
 const transactionService = require('../../../services/transaction.service');
 const transactionRepository = require('../../../repositories/transaction.repository');
@@ -167,8 +172,12 @@ describe('TransactionService.deleteTransaction()', () => {
 
     const result = await transactionService.deleteTransaction('tx001', 'biz001', 'user1', '127.0.0.1');
     expect(result._id).toBe('tx_rev');
+    // The reversal also stamps metadata.reversalId on the original for auditability.
     expect(transactionRepository.updateTransaction).toHaveBeenCalledWith(
-      'tx001', 'biz001', { status: 'reversed', paymentStatus: null, remainingBalance: 0 }
+      'tx001', 'biz001', expect.objectContaining({
+        status: 'reversed', paymentStatus: null, remainingBalance: 0,
+        metadata: expect.objectContaining({ reversalId: 'tx_rev' }),
+      })
     );
   });
 });

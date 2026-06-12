@@ -1,4 +1,27 @@
 // repositories/base.repository.js
+const logger = require('../config/logger');
+
+// Strip infrastructure details (hostnames, ports, replica-set names) from
+// Mongo driver errors before they propagate to HTTP responses.
+function sanitizeDbError(error) {
+  const msg = error?.message || String(error);
+  // MongoDB driver errors contain the full topology description in their message.
+  // Replace anything that looks like a hostname, IP:port, or connection failure —
+  // e.g. "connection 17 to <ip>:27017 timed out" must never reach a client.
+  if (msg.includes('ENOTFOUND') || msg.includes('ETIMEOUT') || msg.includes('ECONNREFUSED') ||
+      msg.includes('topology') || msg.includes('mongod') || msg.includes('mongodb.net') ||
+      msg.includes('timed out') || msg.includes('Server selection') ||
+      /\bconnection \d+ to\b/.test(msg) ||
+      /\b\d{1,3}(\.\d{1,3}){3}:\d{2,5}\b/.test(msg)) {
+    return 'Database connection error. Please try again.';
+  }
+  // Duplicate key: expose constraint name but not internal field path
+  if (error?.code === 11000) {
+    return 'A record with this value already exists.';
+  }
+  return msg;
+}
+
 /**
  * Generic base repository providing common CRUD operations.
  * @template T - Mongoose model type
@@ -21,7 +44,8 @@ class BaseRepository {
       const document = new this.model(data);
       return await document.save();
     } catch (error) {
-      throw new Error(`Error creating document: ${error.message}`);
+      logger.error(`[BaseRepository.create] ${error.message}`);
+      throw new Error(`Error creating document: ${sanitizeDbError(error)}`);
     }
   }
 
@@ -45,7 +69,8 @@ class BaseRepository {
       }
       return await query.exec();
     } catch (error) {
-      throw new Error(`Error finding document by ID: ${error.message}`);
+      logger.error(`[BaseRepository.findById] ${error.message}`);
+      throw new Error(`Error finding document by ID: ${sanitizeDbError(error)}`);
     }
   }
 
@@ -69,7 +94,8 @@ class BaseRepository {
       }
       return await query.exec();
     } catch (error) {
-      throw new Error(`Error finding document: ${error.message}`);
+      logger.error(`[BaseRepository.findOne] ${error.message}`);
+      throw new Error(`Error finding document: ${sanitizeDbError(error)}`);
     }
   }
 
@@ -108,7 +134,8 @@ class BaseRepository {
       ]);
       return { data, total, page, limit };
     } catch (error) {
-      throw new Error(`Error finding documents: ${error.message}`);
+      logger.error(`[BaseRepository.findAll] ${error.message}`);
+      throw new Error(`Error finding documents: ${sanitizeDbError(error)}`);
     }
   }
 
@@ -123,7 +150,8 @@ class BaseRepository {
     try {
       return await this.model.findByIdAndUpdate(id, updateData, options).exec();
     } catch (error) {
-      throw new Error(`Error updating document: ${error.message}`);
+      logger.error(`[BaseRepository.update] ${error.message}`);
+      throw new Error(`Error updating document: ${sanitizeDbError(error)}`);
     }
   }
 
@@ -137,7 +165,8 @@ class BaseRepository {
     try {
       return await this.model.findByIdAndDelete(id).exec();
     } catch (error) {
-      throw new Error(`Error deleting document: ${error.message}`);
+      logger.error(`[BaseRepository.delete] ${error.message}`);
+      throw new Error(`Error deleting document: ${sanitizeDbError(error)}`);
     }
   }
 
@@ -150,7 +179,8 @@ class BaseRepository {
     try {
       return await this.model.countDocuments(conditions);
     } catch (error) {
-      throw new Error(`Error counting documents: ${error.message}`);
+      logger.error(`[BaseRepository.count] ${error.message}`);
+      throw new Error(`Error counting documents: ${sanitizeDbError(error)}`);
     }
   }
 
@@ -164,7 +194,8 @@ class BaseRepository {
       const count = await this.model.countDocuments(conditions).limit(1);
       return count > 0;
     } catch (error) {
-      throw new Error(`Error checking existence: ${error.message}`);
+      logger.error(`[BaseRepository.exists] ${error.message}`);
+      throw new Error(`Error checking existence: ${sanitizeDbError(error)}`);
     }
   }
 
@@ -177,7 +208,8 @@ class BaseRepository {
     try {
       return await this.model.aggregate(pipeline);
     } catch (error) {
-      throw new Error(`Aggregation error: ${error.message}`);
+      logger.error(`[BaseRepository.aggregate] ${error.message}`);
+      throw new Error(`Aggregation error: ${sanitizeDbError(error)}`);
     }
   }
 }

@@ -6,6 +6,7 @@ const validate = require('../../middleware/validate.middleware');
 const {
   createBusinessSchema,
   updateBusinessSchema,
+  confirmActionSchema,
   addCustomAccountSchema,
   updateAccountSchema,
   listAccountsQuerySchema,
@@ -18,6 +19,10 @@ router.use(authMiddleware);
 router.post('/', validate(createBusinessSchema), businessController.createBusiness);
 router.get('/', businessController.getBusiness);
 router.put('/', validate(updateBusinessSchema), businessController.updateBusiness);
+
+// Destructive maintenance routes (require typed business-name confirmation)
+router.post('/reset', validate(confirmActionSchema), businessController.resetBusinessData);
+router.delete('/', validate(confirmActionSchema), businessController.deleteBusiness);
 
 // Chart of accounts routes (business must exist)
 router.get('/accounts', validate(listAccountsQuerySchema, 'query'), businessController.getAccounts);

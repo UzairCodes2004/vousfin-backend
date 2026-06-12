@@ -58,6 +58,50 @@ const updateBusiness = async (req, res, next) => {
 };
 
 /**
+ * Reset (wipe) all data for the current business but keep the business profile.
+ * POST /api/v1/business/reset
+ * Body: { confirmName } — must exactly match the business name.
+ */
+const resetBusinessData = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const existing = await businessService.getBusinessByUserId(userId);
+    if (!existing) {
+      throw new ApiError(404, 'Business profile not found');
+    }
+    if ((req.body.confirmName || '').trim() !== existing.businessName) {
+      throw new ApiError(400, 'Confirmation text does not match your business name');
+    }
+    const result = await businessService.resetBusinessData(existing._id, userId, req.ip);
+    ApiResponse.success(res, result, 'All business data has been reset. A fresh chart of accounts was created.');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Permanently delete the current user's business and all its data.
+ * DELETE /api/v1/business
+ * Body: { confirmName } — must exactly match the business name.
+ */
+const deleteBusiness = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const existing = await businessService.getBusinessByUserId(userId);
+    if (!existing) {
+      throw new ApiError(404, 'Business profile not found');
+    }
+    if ((req.body.confirmName || '').trim() !== existing.businessName) {
+      throw new ApiError(400, 'Confirmation text does not match your business name');
+    }
+    const result = await businessService.deleteBusiness(existing._id, userId);
+    ApiResponse.success(res, result, 'Business permanently deleted. You can now create a new one.');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
  * List chart of accounts for the current business.
  * GET /api/v1/business/accounts
  * Query: accountType (optional)
@@ -198,6 +242,8 @@ module.exports = {
   createBusiness,
   getBusiness,
   updateBusiness,
+  resetBusinessData,
+  deleteBusiness,
   getAccounts,
   syncAccounts,
   addCustomAccount,

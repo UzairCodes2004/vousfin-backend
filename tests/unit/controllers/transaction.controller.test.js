@@ -3,6 +3,16 @@ jest.mock('../../../services/transaction.service');
 jest.mock('../../../services/nlParser/services/parserService');
 jest.mock('../../../repositories/account.repository');
 jest.mock('../../../utils/excelParser.utils');
+// createFormTransaction routes through the approval gate; its evaluate() reads
+// the real Business model. Stub it to "approval disabled → post directly" so the
+// controller delegates straight to the (mocked) transaction service.
+jest.mock('../../../services/approval.service', () => ({
+  submitOrPost: jest.fn(async (data, actor, ip) => ({
+    pendingApproval: false,
+    transaction: await require('../../../services/transaction.service')
+      .createTransaction(data, actor.id, ip),
+  })),
+}));
 jest.mock('../../../config/logger', () => ({
   info: jest.fn(), warn: jest.fn(), error: jest.fn(),
 }));

@@ -7,6 +7,10 @@ const isoDate = () =>
     'date.iso':  'Must be in ISO format (YYYY-MM-DD)',
   });
 
+// Helpers for sensible defaults
+const todayStr = () => new Date().toISOString().split('T')[0];
+const startOfYearStr = () => `${new Date().getFullYear()}-01-01`;
+
 const dateRangeValidation = (value, helpers) => {
   if (value.startDate && value.endDate && new Date(value.startDate) > new Date(value.endDate))
     return helpers.error('date.greater', { message: 'startDate cannot be after endDate' });
@@ -14,33 +18,35 @@ const dateRangeValidation = (value, helpers) => {
 };
 
 // ─── Income Statement ─────────────────────────────────────────────────────────
+// Note: startDate/endDate/asOfDate are optional here — controllers apply sensible
+// defaults (today / start-of-year) when they are absent.
 const incomeStatementSchema = Joi.object({
-  startDate: isoDate().required().messages({ 'any.required': 'startDate is required' }),
-  endDate:   isoDate().required().messages({ 'any.required': 'endDate is required'   }),
+  startDate: isoDate().optional(),
+  endDate:   isoDate().optional(),
 }).custom(dateRangeValidation);
 
 // ─── Balance Sheet ────────────────────────────────────────────────────────────
 const balanceSheetSchema = Joi.object({
-  asOfDate:    isoDate().required().messages({ 'any.required': 'asOfDate is required' }),
+  asOfDate:    isoDate().optional(),
   compareDate: isoDate().optional(),
 });
 
 // ─── Cash Flow ────────────────────────────────────────────────────────────────
 const cashFlowSchema = Joi.object({
-  startDate: isoDate().required(),
-  endDate:   isoDate().required(),
+  startDate: isoDate().optional(),
+  endDate:   isoDate().optional(),
 }).custom(dateRangeValidation);
 
 // ─── Trial Balance ────────────────────────────────────────────────────────────
 const trialBalanceSchema = Joi.object({
-  asOfDate: isoDate().required().messages({ 'any.required': 'asOfDate is required' }),
+  asOfDate: isoDate().optional(),
   fromDate: isoDate().optional(),
 });
 
 // ─── General Ledger ───────────────────────────────────────────────────────────
 const generalLedgerSchema = Joi.object({
-  startDate: isoDate().required(),
-  endDate:   isoDate().required(),
+  startDate: isoDate().optional(),
+  endDate:   isoDate().optional(),
   accountId: Joi.string().hex().length(24).optional(),
 }).custom(dateRangeValidation);
 

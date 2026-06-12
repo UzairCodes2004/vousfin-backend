@@ -14,6 +14,10 @@ jest.mock('../../../repositories/account.repository', () => ({
   updateRunningBalance: jest.fn(),
 }));
 jest.mock('../../../config/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
+// Simulate the standalone-server fallback: run the unit WITHOUT a session, which
+// keeps balance updates best-effort (mirrors local dev). The real atomic path is
+// the same code with a real session injected.
+jest.mock('../../../utils/withTransaction', () => ({ withTransaction: (fn) => fn(null) }));
 
 const { postBalancedJournal, applyRunningBalance } = require('../../../services/ledgerPosting.service');
 const JournalEntry = require('../../../models/JournalEntry.model');
@@ -29,8 +33,10 @@ beforeEach(() => {
     Promise.resolve({ _id: id, normalBalance: id === ID_DR ? 'Debit' : 'Credit' })
   );
   accountRepository.updateRunningBalance.mockResolvedValue(undefined);
-  // create() echoes the payload back with an _id (mirrors Mongoose .create()).
-  JournalEntry.create.mockImplementation((doc) => Promise.resolve({ _id: 'je-1', ...doc }));
+  // create([doc], opts) echoes the payload back in an array with an _id
+  // (mirrors Mongoose .create() array form used by the atomic poster).
+  JournalEntry.create.mockImplementation((docs) =>
+    Promise.resolve([{ _id: 'je-1', ...(Array.isArray(docs) ? docs[0] : docs) }]));
 });
 
 describe('ledgerPosting.postBalancedJournal()', () => {
@@ -42,10 +48,10 @@ describe('ledgerPosting.postBalancedJournal()', () => {
     expect(JournalEntry.create).toHaveBeenCalledTimes(1);
     expect(je._id).toBe('je-1');
 
-    // Debit side hits a Debit-normal account → +100
-    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith(ID_DR, 100);
+    // Debit side hits a Debit-normal account → +100 (3rd arg = session, null in fallback)
+    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith(ID_DR, 100, null);
     // Credit side hits a Credit-normal account → +100
-    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith(ID_CR, 100);
+    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith(ID_CR, 100, null);
     expect(accountRepository.updateRunningBalance).toHaveBeenCalledTimes(2);
   });
 
@@ -56,9 +62,9 @@ describe('ledgerPosting.postBalancedJournal()', () => {
     });
 
     // Debit on a Credit-normal account → -40
-    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith(ID_CR, -40);
+    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith(ID_CR, -40, null);
     // Credit on a Debit-normal account → -40
-    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith(ID_DR, -40);
+    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith(ID_DR, -40, null);
   });
 
   it('skips running-balance updates when updateBalances is false', async () => {
@@ -76,6 +82,33 @@ describe('ledgerPosting.postBalancedJournal()', () => {
       businessId: 'b1', amount: 100, debitAccountId: ID_DR, creditAccountId: ID_CR,
     });
     expect(je._id).toBe('je-1'); // ledger write survived a balance-cache failure (Rule 3)
+  });
+});
+
+describe('ledgerPosting.postBalancedJournal() — atomicity', () => {
+  it('threads a caller-provided session into the JE insert and both balance updates', async () => {
+    await postBalancedJournal(
+      { businessId: 'b1', amount: 100, debitAccountId: ID_DR, creditAccountId: ID_CR },
+      { session: 'SESSION' }
+    );
+    // JE created with the session (array form).
+    expect(JournalEntry.create).toHaveBeenCalledWith(
+      [expect.objectContaining({ amount: 100 })],
+      { session: 'SESSION' }
+    );
+    // Balances moved with the same session.
+    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith(ID_DR, 100, 'SESSION');
+    expect(accountRepository.updateRunningBalance).toHaveBeenCalledWith(ID_CR, 100, 'SESSION');
+  });
+
+  it('THROWS (rolls back) when a balance update fails inside a transaction', async () => {
+    accountRepository.updateRunningBalance.mockRejectedValue(new Error('write conflict'));
+    await expect(
+      postBalancedJournal(
+        { businessId: 'b1', amount: 100, debitAccountId: ID_DR, creditAccountId: ID_CR },
+        { session: 'SESSION' }   // strict path
+      )
+    ).rejects.toThrow('write conflict');
   });
 });
 

@@ -57,15 +57,23 @@ jest.mock('../../../models/Invoice.model', () => {
   };
 
   Invoice.findById = async (id) => stateStore.get(String(id)) || null;
-  Invoice.findOne  = async (query) => {
+  // Chainable mock: supports both `await findOne(...)` and `findOne().sort().select().lean()`
+  const _chain = (val) => ({
+    sort: () => _chain(val), select: () => _chain(val), populate: () => _chain(val),
+    lean: async () => val,
+    then: (res, rej) => Promise.resolve(val).then(res, rej),
+    catch: (rej) => Promise.resolve(val).catch(rej),
+  });
+  Invoice.findOne  = (query) => {
+    let found = null;
     for (const v of stateStore.values()) {
       let match = true;
       for (const k of Object.keys(query || {})) {
         if (v[k] !== query[k]) { match = false; break; }
       }
-      if (match) return v;
+      if (match) { found = v; break; }
     }
-    return null;
+    return _chain(found);
   };
   Invoice.find = async () => Array.from(stateStore.values());
   Invoice.countDocuments = async () => stateStore.size;

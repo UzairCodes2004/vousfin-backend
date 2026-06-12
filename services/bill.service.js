@@ -15,6 +15,7 @@ const auditService = require('./audit.service');
 const billMatchingService = require('./billMatching.service');
 const partyBalanceService = require('./partyBalance.service');     // ERP Step 4 — centralized AP balance
 const { postBalancedJournal } = require('./ledgerPosting.service'); // ERP Step 4 — JE + running-balance sync
+const { withTransaction } = require('../utils/withTransaction');   // R-01 — atomic recognition unit
 const { businessEvents, EVENTS } = require('./businessEventEngine.service'); // ERP Step 4 — event broadcasts
 const { ApiError } = require('../utils/ApiError');
 const { validateDocumentData, assertNoDuplicateNumber, assertPartyExists } = require('../utils/arApValidation'); // M4
@@ -94,8 +95,34 @@ class BillService {
   // Creation
   // ───────────────────────────────────────────────────────────────────────────
 
+  /**
+   * Auto-generate a unique bill number for a business.
+   * Format: BILL-YYYYMM-NNNNN (sequential within the calendar month).
+   * @private
+   */
+  async _generateBillNumber(businessId) {
+    const now = new Date();
+    const yyyymm = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const last = await Bill.findOne({
+      businessId,
+      billNumber: { $regex: `^BILL-${yyyymm}-` },
+    }).sort({ createdAt: -1 }).select('billNumber').lean();
+
+    let seq = 1;
+    if (last?.billNumber) {
+      const n = parseInt(last.billNumber.split('-').pop(), 10);
+      if (!isNaN(n)) seq = n + 1;
+    }
+    return `BILL-${yyyymm}-${String(seq).padStart(5, '0')}`;
+  }
+
   async createDraft(data, user, ipAddress) {
     const hasLines = Array.isArray(data.lineItems) && data.lineItems.length > 0;
+
+    // Auto-generate bill number if the caller omitted it
+    if (!data.billNumber?.trim()) {
+      data.billNumber = await this._generateBillNumber(data.businessId);
+    }
 
     // ── M4 enterprise validation (service layer) ─────────────────────────────
     validateDocumentData(data, { kind: 'bill', isUpdate: false });
@@ -174,7 +201,7 @@ class BillService {
   // ───────────────────────────────────────────────────────────────────────────
 
   async submitForApproval(id, user, ipAddress, opts = {}) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     if (!bill.approvalRequired) {
       return this._applyStateChange(bill, BILL_STATES.APPROVED, user, {
         reason: 'Below approval threshold — auto-approved',
@@ -199,7 +226,7 @@ class BillService {
 
   /** M6 — act on the multi-level approval chain (reject/reassign/escalate). */
   async actOnApproval(id, action, user, { note, level } = {}, ipAddress) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     const approvalEngine = require('./approvalEngine.service');
     if (!bill.approvalChain || bill.approvalChain.length === 0) {
       throw new ApiError(409, 'This bill has no approval chain');
@@ -218,7 +245,7 @@ class BillService {
   }
 
   async approve(id, user, note, ipAddress) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
 
     // ── M6: multi-level approval — advance the chain one step ────────────────
     const approvalEngine = require('./approvalEngine.service');
@@ -272,7 +299,7 @@ class BillService {
   }
 
   async reject(id, user, note, ipAddress) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     bill.approvalLog.push({
       action: 'rejected',
       actorId: user._id,
@@ -293,7 +320,7 @@ class BillService {
   // ───────────────────────────────────────────────────────────────────────────
 
   async schedule(id, user, payDate, ipAddress) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     bill.scheduledPayDate = payDate || null;
     return this._applyStateChange(bill, BILL_STATES.SCHEDULED, user, {
       reason: payDate ? `Scheduled for ${new Date(payDate).toISOString()}` : null,
@@ -302,33 +329,33 @@ class BillService {
   }
 
   async cancel(id, user, reason, ipAddress) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     return this._applyStateChange(bill, BILL_STATES.CANCELLED, user, { reason, ipAddress });
   }
 
   /** M5 — GL-correct void (reverses recognition + reclaims payments; never deletes). */
   async void(id, reason, user, ipAddress) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     const arApVoidCredit = require('./arApVoidCredit.service');
     return arApVoidCredit.voidDocument('bill', bill, reason, user, ipAddress);
   }
 
   /** M5 — apply a vendor credit memo (DR AP / CR Expense) to this bill. */
   async applyCreditMemo(id, amount, reason, user, ipAddress) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     const arApVoidCredit = require('./arApVoidCredit.service');
     return arApVoidCredit.applyCreditMemo('bill', bill, amount, reason, user, ipAddress);
   }
 
   /** M8 — preview the early-payment discount currently available on this bill. */
-  async previewEarlyPaymentDiscount(id) {
-    const bill = await this._loadOrThrow(id);
+  async previewEarlyPaymentDiscount(id, businessId = null) {
+    const bill = await this._loadOrThrow(id, businessId);
     return require('./earlyPaymentDiscount.service').preview('bill', bill);
   }
 
   /** M8 — realize the early-payment discount taken (DR AP / CR Discount Received). */
   async applyEarlyPaymentDiscount(id, user, ipAddress) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     return require('./earlyPaymentDiscount.service').apply('bill', bill, user, ipAddress, {});
   }
 
@@ -336,7 +363,7 @@ class BillService {
    * Phase 2 — update a draft bill (only drafts can be edited).
    */
   async updateDraft(id, data, user, ipAddress) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     if (bill.state !== BILL_STATES.DRAFT) {
       throw new ApiError(409, 'Only draft bills can be edited');
     }
@@ -395,7 +422,7 @@ class BillService {
   }
 
   async markPaid(id, user, ipAddress) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     const outstanding = Math.round(
       ((bill.remainingBalance != null ? bill.remainingBalance : bill.totalAmount) || 0) * 100
     ) / 100;
@@ -582,62 +609,67 @@ class BillService {
     const netAmount = r2(bill.amount || (bill.totalAmount - (bill.taxAmount || 0)));
     const primaryAmount = netAmount > 0 ? netAmount : r2(bill.totalAmount);
 
-    // Running tally of what we actually credit to the AP control account — the
-    // vendor's payable balance is incremented by exactly this at the end so the
-    // GL control account and Σ(vendor balances) stay equal. (Rule 5)
-    let apCredited = 0;
-
-    // ── Primary JE: DR Expense / Inventory, CR Accounts Payable ─────────────
-    let primaryJe = null;
-    try {
-      primaryJe = await postBalancedJournal({
-        businessId,
-        transactionDate:  bill.issueDate,
-        description:      `AP Liability — ${bill.billNumber}${bill.vendorSnapshot?.vendorName ? ' (' + bill.vendorSnapshot.vendorName + ')' : ''}`,
-        transactionType:  TRANSACTION_TYPES.CREDIT_PURCHASE,
-        amount:           primaryAmount,
-        debitAccountId:   debitAccountId,
-        creditAccountId:  apAccount._id,
-        status:           JOURNAL_STATUS.POSTED,
-        transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
-        invoiceNumber:    bill.billNumber,
-        vendorId:         bill.vendorId || null,
-        currencyCode:     bill.currencyCode || 'PKR',
-        exchangeRate:     bill.exchangeRate || 1,
-        createdBy:        user._id,
-        lastModifiedBy:   user._id,
-        // M9 — this entry is the immutable projection of the authoritative bill.
-        isProjection:     true,
-        projectionOf:     { documentType: 'bill', documentId: bill._id },
-      });
-      apCredited = r2(apCredited + primaryAmount);
-    } catch (e) {
-      logger.error(`[bill] failed to create AP liability JE for ${bill.billNumber}: ${e.message}`);
-      return null;
-    }
-
-    // ── Update bill with the journal reference ────────────────────────────────
-    bill.apLiabilityJournalId = primaryJe._id;
-    // Also set linkedJournalEntryId if not already set
-    if (!bill.linkedJournalEntryId) bill.linkedJournalEntryId = primaryJe._id;
-    await bill.save();
-
-    // ── Tax JE: DR Input Tax Receivable, CR Accounts Payable ─────────────────
+    // ── Resolve the optional input-tax account up-front (read, no write) ─────
     const taxAmount = r2(bill.taxAmount || 0);
+    let inputTaxAcc = null;
     if (taxAmount > 0) {
-      const inputTaxAcc = await ChartOfAccount.findOne({
+      const acc = await ChartOfAccount.findOne({
         businessId,
         accountCode: { $in: ['1170', '1171', '1172'] },
       }).lean();
+      if (acc && acc._id.toString() !== apAccount._id.toString()) inputTaxAcc = acc;
+    }
 
-      if (inputTaxAcc && inputTaxAcc._id.toString() !== apAccount._id.toString()) {
-        try {
+    // ── R-01: recognize AP atomically ────────────────────────────────────────
+    // The primary JE, the optional input-tax JE, the bill document update and the
+    // vendor balance move now commit together or roll back together (standalone
+    // dev falls back to non-atomic). A failure rolls everything back, so a bill is
+    // never half-recognized (e.g. AP posted but the vendor balance missing).
+    let primaryJe = null;
+    const preLinked = bill.linkedJournalEntryId; // remember to restore on rollback
+    try {
+      await withTransaction(async (session) => {
+        let apCredited = 0;
+        primaryJe = await postBalancedJournal({
+          businessId,
+          transactionDate:  bill.issueDate,
+          description:      `AP Liability — ${bill.billNumber}${bill.vendorSnapshot?.vendorName ? ' (' + bill.vendorSnapshot.vendorName + ')' : ''}`,
+          transactionType:  TRANSACTION_TYPES.CREDIT_PURCHASE,
+          amount:           primaryAmount,
+          debitAccountId:   debitAccountId,
+          creditAccountId:  apAccount._id,
+          status:           JOURNAL_STATUS.POSTED,
+          transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+          invoiceNumber:    bill.billNumber,
+          vendorId:         bill.vendorId || null,
+          currencyCode:     bill.currencyCode || 'PKR',
+          exchangeRate:     bill.exchangeRate || 1,
+          createdBy:        user._id,
+          lastModifiedBy:   user._id,
+          // M9 — this entry is the immutable projection of the authoritative bill.
+          isProjection:     true,
+          projectionOf:     { documentType: 'bill', documentId: bill._id },
+        }, { session });
+        apCredited = r2(apCredited + primaryAmount);
+
+        bill.apLiabilityJournalId = primaryJe._id;
+        if (!bill.linkedJournalEntryId) bill.linkedJournalEntryId = primaryJe._id;
+        await bill.save({ session });
+
+        // Input-tax JE: DR Input Tax Receivable, CR Accounts Payable.
+        // taxAmount/taxType tagged so this entry counts toward recoverable input
+        // tax on the tax return. 'GST Receivable' → taxType 'GST'.
+        if (inputTaxAcc) {
+          const inputTaxType = (inputTaxAcc.accountName || 'Tax')
+            .replace(/\b(Payable|Receivable|Input)\b/ig, '').replace(/\(.*?\)/g, '').trim() || 'Tax';
           await postBalancedJournal({
             businessId,
             transactionDate:  bill.issueDate,
             description:      `AP Input Tax — ${bill.billNumber}`,
             transactionType:  TRANSACTION_TYPES.CREDIT_PURCHASE,
             amount:           taxAmount,
+            taxAmount:        taxAmount,
+            taxType:          inputTaxType,
             debitAccountId:   inputTaxAcc._id,
             creditAccountId:  apAccount._id,
             status:           JOURNAL_STATUS.POSTED,
@@ -648,34 +680,35 @@ class BillService {
             exchangeRate:     bill.exchangeRate || 1,
             createdBy:        user._id,
             lastModifiedBy:   user._id,
-          });
+          }, { session });
           apCredited = r2(apCredited + taxAmount);
-        } catch (e) {
-          logger.warn(`[bill] tax JE failed for ${bill.billNumber}: ${e.message}`);
         }
-      }
-    }
 
-    // ── ERP Step 4: mirror the AP credit onto the vendor's payable balance ───
-    // Routed through the centralized engine so a VENDOR_BALANCE_CHANGED event is
-    // broadcast (dashboard / forecasting / aging subscribers). Fire-and-forget
-    // event; the balance write itself is awaited. (Rules 5, 9, 10)
-    if (bill.vendorId && apCredited > 0) {
-      await partyBalanceService.adjustPayable(businessId, bill.vendorId, apCredited, {
-        userId: user._id, reason: 'bill_approved', entityType: ENTITY_TYPES.BILL, entityId: bill._id,
+        // Mirror the AP credit onto the vendor's payable balance (broadcasts
+        // VENDOR_BALANCE_CHANGED). Joined to the same transaction.
+        if (bill.vendorId && apCredited > 0) {
+          await partyBalanceService.adjustPayable(businessId, bill.vendorId, apCredited, {
+            userId: user._id, reason: 'bill_approved', entityType: ENTITY_TYPES.BILL, entityId: bill._id, session,
+          });
+        }
       });
+    } catch (e) {
+      bill.apLiabilityJournalId = undefined;
+      bill.linkedJournalEntryId = preLinked;
+      logger.error(`[bill] AP recognition rolled back for ${bill.billNumber}: ${e.message}`);
+      return null;
     }
 
     return primaryJe;
   }
 
   async transitionState(id, toState, user, { reason = null, ipAddress = null } = {}) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     return this._applyStateChange(bill, toState, user, { reason, ipAddress });
   }
 
   async softDelete(id, user, ipAddress) {
-    const bill = await this._loadOrThrow(id);
+    const bill = await this._loadOrThrow(id, user?.businessId);
     if (bill.isArchived) return bill;
     bill.isArchived = true;
     bill.archivedAt = new Date();
@@ -776,11 +809,14 @@ class BillService {
   // Read APIs
   // ───────────────────────────────────────────────────────────────────────────
 
-  async _loadOrThrow(id) {
+  async _loadOrThrow(id, businessId = null) {
     if (!mongoose.Types.ObjectId.isValid(id)) {
       throw new ApiError(400, 'Invalid bill id');
     }
-    const bill = await Bill.findById(id);
+    // R-05: scope by tenant when provided so cross-tenant ids can't be loaded.
+    const bill = businessId
+      ? await Bill.findOne({ _id: id, businessId })
+      : await Bill.findById(id);
     if (!bill) throw new ApiError(404, 'Bill not found');
     if (bill.isArchived) throw new ApiError(410, 'Bill has been archived');
     return bill;

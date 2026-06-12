@@ -42,6 +42,11 @@ const businessSchema = new mongoose.Schema(
       uppercase: true,
       trim: true,
     },
+    timezone: {
+      type: String,
+      default: 'UTC',
+      trim: true,
+    },
     // Reporting currency may differ from functional currency (e.g. USD functional, PKR reporting).
     // Null means "same as currency" — resolved at query time, never stored redundantly.
     reportingCurrency: {
@@ -58,6 +63,29 @@ const businessSchema = new mongoose.Schema(
       default: FISCAL_YEAR_START_MONTH_DEFAULT,
     },
     logoUrl: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+
+    // ── Contact / branding details (all optional, shown on invoices) ──────────
+    phone: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    email: {
+      type: String,
+      default: null,
+      lowercase: true,
+      trim: true,
+    },
+    address: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    website: {
       type: String,
       default: null,
       trim: true,
@@ -106,6 +134,30 @@ const businessSchema = new mongoose.Schema(
         default: () => new Map(),
       },
     },
+
+    // ── Approval Workflow (#6) ───────────────────────────────────────────────
+    /**
+     * approvalSettings controls whether large transactions must be reviewed
+     * before they post to the ledger. All defaults mean "disabled" so existing
+     * businesses are completely unaffected until they explicitly turn it on.
+     */
+    approvalSettings: {
+      // Master switch — when false, every transaction posts immediately (legacy behaviour).
+      enabled:   { type: Boolean, default: false },
+      // Amounts STRICTLY GREATER than this (in base currency) require approval.
+      threshold: { type: Number,  default: 0, min: 0 },
+      // When false, the person who submitted a transaction cannot approve it
+      // themselves (segregation of duties). Default true keeps single-user SMBs working.
+      allowSelfApproval: { type: Boolean, default: true },
+    },
+
+    // ── FR-02.3 — Trend-alert thresholds ─────────────────────────────────────
+    /**
+     * Per-business detection thresholds for the trend monitor. Mixed so new
+     * rule knobs never need a schema migration; trendMonitor.service merges
+     * these over safe defaults. Empty = all defaults.
+     */
+    trendAlertConfig: { type: mongoose.Schema.Types.Mixed, default: {} },
   },
   {
     timestamps: true,

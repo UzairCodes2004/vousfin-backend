@@ -83,20 +83,38 @@ class AccountRepository extends BaseRepository {
   }
 
   /**
+   * Return all accounts from a list of IDs that belong to the given business.
+   * Used to validate journal line account IDs for tenant isolation.
+   */
+  async findAllByBusinessAndIds(businessId, ids) {
+    const mongoose = require('mongoose');
+    const validIds = ids
+      .filter(id => mongoose.isValidObjectId(id))
+      .map(id => new mongoose.Types.ObjectId(id));
+    if (!validIds.length) return [];
+    return this.model.find(
+      { businessId, _id: { $in: validIds } },
+      { _id: 1 }
+    ).lean();
+  }
+
+  /**
    * Update the running balance of an account by a delta.
    * @param {string} accountId
    * @param {number} delta - Positive or negative amount to add to current balance
    * @returns {Promise<Object|null>} Updated account
    */
-  async updateRunningBalance(accountId, delta) {
+  async updateRunningBalance(accountId, delta, session = null) {
     const validAccountId = sanitizeAndValidateId(accountId);
     if (typeof delta !== 'number' || isNaN(delta)) {
       throw new Error('Delta must be a number');
     }
+    const options = { returnDocument: 'after', runValidators: false };
+    if (session) options.session = session; // join an all-or-nothing transaction when given
     return this.model.findByIdAndUpdate(
       validAccountId,
       { $inc: { runningBalance: delta } },
-      { new: true, runValidators: false }
+      options
     ).exec();
   }
 

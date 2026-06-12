@@ -15,12 +15,18 @@ const errorMiddleware = (err, req, res, next) => {
   let message = err.message || 'Internal server error';
   let stack = err.stack;
 
-  // Handle Mongoose validation errors
+  // Handle Mongoose validation errors — extract per-field details so the client
+  // knows exactly which field failed and why (e.g. enum violation, maxlength, etc.)
   if (err instanceof mongoose.Error.ValidationError) {
     statusCode = 400;
     message = 'Validation failed';
-    const errors = Object.values(err.errors).map(e => e.message);
-    return ApiResponse.error(res, message, statusCode, { details: errors });
+    const details = Object.entries(err.errors).map(([field, e]) => ({
+      field,
+      message: e.message,
+      value: e.value,
+    }));
+    const errors = details.map(d => d.message).join(', ');
+    return ApiResponse.error(res, message, statusCode, { errors, details });
   }
 
   // Handle MongoDB duplicate key error (code 11000)

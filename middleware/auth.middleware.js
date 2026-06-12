@@ -35,14 +35,20 @@ const authMiddleware = async (req, res, next) => {
       throw new ApiError(401, 'Invalid token.');
     }
 
+    // Support both current {userId} payload and legacy {id} payload (backward compat)
+    const resolvedUserId = decoded.userId || decoded.id;
+    if (!resolvedUserId) {
+      throw new ApiError(401, 'Invalid token: missing user identifier.');
+    }
+
     // Check if token is blacklisted
-    const isBlacklisted = await userRepository.isTokenBlacklisted(decoded.userId, token);
+    const isBlacklisted = await userRepository.isTokenBlacklisted(resolvedUserId, token);
     if (isBlacklisted) {
       throw new ApiError(401, 'Token has been revoked. Please login again.');
     }
 
     // Fetch user from database (ensure it still exists and is active)
-    const user = await userRepository.findActiveById(decoded.userId);
+    const user = await userRepository.findActiveById(resolvedUserId);
     if (!user) {
       throw new ApiError(401, 'User account not found or has been deleted.');
     }
@@ -82,9 +88,10 @@ const optionalAuthMiddleware = async (req, res, next) => {
     }
     if (token) {
       const decoded = verifyToken(token);
-      const isBlacklisted = await userRepository.isTokenBlacklisted(decoded.userId, token);
+      const resolvedUserId = decoded.userId || decoded.id;
+      const isBlacklisted = resolvedUserId ? await userRepository.isTokenBlacklisted(resolvedUserId, token) : true;
       if (!isBlacklisted) {
-        const user = await userRepository.findActiveById(decoded.userId);
+        const user = await userRepository.findActiveById(resolvedUserId);
         if (user && user.status === 'active') {
           req.user = {
             id: user._id,

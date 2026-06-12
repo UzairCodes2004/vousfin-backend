@@ -87,15 +87,17 @@ class VendorRepository extends BaseRepository {
    * @param {number} delta - Positive to increase, negative to decrease
    * @returns {Promise<Object|null>}
    */
-  async updatePayableBalance(vendorId, delta) {
+  async updatePayableBalance(vendorId, delta, session = null) {
     const validVendorId = sanitizeAndValidateId(vendorId);
     if (typeof delta !== 'number' || isNaN(delta)) {
       throw new Error('Delta must be a number');
     }
+    const options = { new: true, runValidators: false };
+    if (session) options.session = session; // join an all-or-nothing transaction when given
     return this.model.findByIdAndUpdate(
       validVendorId,
       { $inc: { currentPayableBalance: delta } },
-      { new: true, runValidators: false }
+      options
     ).exec();
   }
 

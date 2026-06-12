@@ -79,7 +79,7 @@ class PartyBalanceService {
     const amount = round2(delta);
     if (!id || amount === 0) return null; // nothing to do — safe no-op
 
-    const updated = await customerRepository.updateReceivableBalance(id, amount);
+    const updated = await customerRepository.updateReceivableBalance(id, amount, ctx.session || null);
     if (!updated) {
       // Party was deleted between read and write — log, don't throw (the ledger
       // write that triggered this has already succeeded; never break it).
@@ -118,7 +118,7 @@ class PartyBalanceService {
     const amount = round2(delta);
     if (!id || amount === 0) return null; // nothing to do — safe no-op
 
-    const updated = await vendorRepository.updatePayableBalance(id, amount);
+    const updated = await vendorRepository.updatePayableBalance(id, amount, ctx.session || null);
     if (!updated) {
       logger.warn(`[partyBalance] vendor ${id} not found while adjusting payable by ${amount}`);
       return null;

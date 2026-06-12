@@ -22,5 +22,6 @@ router.route('/:id')
 router.patch('/:id/toggle-active', inventoryController.toggleActive);
 router.post('/:id/add-stock',      inventoryController.addStock);
 router.get('/:id/ledger',          inventoryController.getStockLedger);
+router.post('/:id/recalculate',    inventoryController.recalculate); // R-04 — replay & heal WAC
 
 module.exports = router;

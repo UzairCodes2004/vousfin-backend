@@ -1,5 +1,6 @@
 // models/JournalEntry.model.js
 const mongoose = require('mongoose');
+const { ApiError } = require('../utils/ApiError');
 const {
   TRANSACTION_TYPES,
   INPUT_METHODS,
@@ -10,6 +11,7 @@ const {
   TRANSACTION_CATEGORIES,
   ENTRY_TYPE,
   ADJUSTING_TYPE,
+  PERIOD_STATUS,
 } = require('../config/constants');
 
 /**
@@ -70,8 +72,13 @@ const journalEntrySchema = new mongoose.Schema(
       ref: 'ChartOfAccount',
       required: true,
       validate: {
+        // In findOneAndUpdate partial updates, `this.debitAccountId` may be
+        // absent from the update object even though the field exists on the
+        // document (only changed fields are sent). Guard against that so the
+        // validator doesn't crash with "undefined.toString()". The service
+        // layer already enforces debit ≠ credit before calling the repo.
         validator: function (value) {
-          // Ensure debit and credit accounts are different
+          if (!this.debitAccountId) return true;
           return this.debitAccountId.toString() !== value.toString();
         },
         message: 'Debit and credit accounts must be different',
@@ -276,6 +283,11 @@ const journalEntrySchema = new mongoose.Schema(
       default: null,
       maxlength: 3,
       uppercase: true,
+    },
+    timezone: {
+      type: String,
+      default: 'UTC',
+      trim: true,
     },
     exchangeRate: {
       type: Number,
@@ -644,7 +656,7 @@ journalEntrySchema.statics.getAccountTurnover = async function (businessId, acco
 // ===============================
 // Pre-save Middleware
 // ===============================
-journalEntrySchema.pre('save', function () {
+journalEntrySchema.pre('save', async function () {
   if (this.description) {
     this.description = this.description.trim();
   }
@@ -654,6 +666,13 @@ journalEntrySchema.pre('save', function () {
   // Auto-set baseCurrencyAmount if not provided
   if (this.isNew && this.baseCurrencyAmount === null) {
     this.baseCurrencyAmount = this.amount * (this.exchangeRate || 1);
+  }
+
+  // ── Period Immutability Check ──
+  const AccountingPeriod = mongoose.model('AccountingPeriod');
+  const period = await AccountingPeriod.findCoveringPeriod(this.businessId, this.transactionDate);
+  if (period && (period.status === PERIOD_STATUS.CLOSED || period.status === PERIOD_STATUS.LOCKED)) {
+    throw new ApiError(403, `Cannot modify journal entries in a ${period.status.toLowerCase()} accounting period.`);
   }
 
   // ── Invariant: keep paymentStatus and JournalStatus consistent with remainingBalance ──
@@ -682,6 +701,100 @@ journalEntrySchema.pre('save', function () {
     }
   }
 });
+
+// ===============================
+// Pre-update / Delete Middleware for Period Immutability
+// ===============================
+// Mongoose 9 async middleware must NOT use the next() callback — it should
+// throw to signal an error and return to proceed. Passing `next` as a
+// parameter causes Mongoose 9 to leave it undefined (async hooks are
+// promise-based), so calling next() throws "next is not a function".
+async function checkPeriodLock() {
+  const docToUpdate = await this.model.findOne(this.getQuery());
+  if (!docToUpdate) return;
+
+  const AccountingPeriod = mongoose.model('AccountingPeriod');
+
+  const origPeriod = await AccountingPeriod.findCoveringPeriod(docToUpdate.businessId, docToUpdate.transactionDate);
+  if (origPeriod && (origPeriod.status === PERIOD_STATUS.CLOSED || origPeriod.status === PERIOD_STATUS.LOCKED)) {
+    throw new ApiError(403, `Cannot modify journal entries in a ${origPeriod.status.toLowerCase()} accounting period.`);
+  }
+
+  const update = this.getUpdate ? this.getUpdate() : null;
+  if (update && (update.transactionDate || update.$set?.transactionDate)) {
+    const newDate = update.transactionDate || update.$set.transactionDate;
+    const newPeriod = await AccountingPeriod.findCoveringPeriod(docToUpdate.businessId, newDate);
+    if (newPeriod && (newPeriod.status === PERIOD_STATUS.CLOSED || newPeriod.status === PERIOD_STATUS.LOCKED)) {
+      throw new ApiError(403, `Cannot move journal entry to a ${newPeriod.status.toLowerCase()} accounting period.`);
+    }
+  }
+}
+
+journalEntrySchema.pre('findOneAndUpdate', checkPeriodLock);
+journalEntrySchema.pre('updateOne', checkPeriodLock);
+journalEntrySchema.pre('deleteOne', checkPeriodLock);
+journalEntrySchema.pre('findOneAndDelete', checkPeriodLock);
+journalEntrySchema.pre('updateMany', function () {
+  throw new ApiError(403, 'Bulk updates not supported due to strict period locking invariants.');
+});
+
+// ===============================
+// Post-write: keep the report cache fresh for ANY journal write
+// ===============================
+// Financial reports (Balance Sheet, P&L, Trial Balance, GL, Tax) are derived
+// from posted journal entries and cached per-business. Invalidate that cache on
+// every JE write so NO posting path can leave a report stale — this covers
+// ledgerPosting.postBalancedJournal (AR/AP recognition, COGS, recurring,
+// inventory-recalc adjustments) which don't invalidate explicitly, plus direct
+// creates and reversals. Best-effort: a cache hiccup must never block a ledger write.
+function _invalidateReportCache(businessId) {
+  if (!businessId) return;
+  try {
+    require('../utils/reportCache').invalidate(String(businessId));
+  } catch (_) { /* cache is best-effort */ }
+}
+// FR-02.1 — balance-equation runtime invariant: after any posting, verify
+// Assets = Liabilities + Equity within a short debounce window. Fire-and-forget
+// and best-effort: the check must never slow down or block a ledger write.
+// The 5-second debounce coalesces batch postings into one verification, which
+// also satisfies the "statements reflect postings within 5 seconds" window.
+const _equationTimers = new Map();
+function _scheduleEquationCheck(businessId) {
+  if (!businessId) return;
+  const key = String(businessId);
+  if (_equationTimers.has(key)) return;            // already scheduled
+  _equationTimers.set(key, setTimeout(async () => {
+    _equationTimers.delete(key);
+    try {
+      await require('../services/trendMonitor.service').checkBalanceEquation(key);
+    } catch (_) { /* invariant check is best-effort; cron re-checks anyway */ }
+    try {
+      // FR-03.2 — health indicators react to every posting (real-time AC)
+      await require('../services/healthIndicators.service').evaluateAndAlert(key);
+    } catch (_) { /* best-effort; trend cron re-evaluates anyway */ }
+  }, 5_000).unref?.() ?? null);
+}
+
+journalEntrySchema.post('save', function (doc) {
+  _invalidateReportCache(doc && doc.businessId);
+  _scheduleEquationCheck(doc && doc.businessId);
+});
+journalEntrySchema.post('insertMany', function (docs) {
+  const ids = new Set((docs || []).map((d) => d && d.businessId && String(d.businessId)).filter(Boolean));
+  for (const id of ids) { _invalidateReportCache(id); _scheduleEquationCheck(id); }
+});
+
+// Prevent duplicate invoice numbers within the same business.
+// Sparse + partialFilterExpression: only entries with a string invoiceNumber are indexed.
+journalEntrySchema.index(
+  { businessId: 1, invoiceNumber: 1 },
+  {
+    unique: true,
+    sparse: true,
+    name: 'idx_je_invoice_number',
+    partialFilterExpression: { invoiceNumber: { $type: 'string' } },
+  }
+);
 
 // ===============================
 // Model Export

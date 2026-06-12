@@ -35,7 +35,7 @@ const shared = {
 
 const createBillSchema = Joi.object({
   ...shared,
-  billNumber: shared.billNumber.required(),
+  billNumber: shared.billNumber.allow('', null),  // optional — service auto-generates when blank
   issueDate:  shared.issueDate.required(),
 })
   .or('amount', 'lineItems')

@@ -45,6 +45,16 @@ const customerSchema = new mongoose.Schema(
       trim: true,
       maxlength: 300,
     },
+    creditLimit: {
+      type: Number,
+      default: null,
+      min: 0,
+    },
+    creditLimitAction: {
+      type: String,
+      enum: ['warn', 'block'],
+      default: 'warn',
+    },
     currentReceivableBalance: {
       type: Number,
       default: 0,

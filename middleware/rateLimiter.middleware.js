@@ -8,7 +8,8 @@ const config = require('../config');
  */
 const defaultLimiter = rateLimit({
   windowMs: config.RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000, // 15 minutes
-  limit: config.RATE_LIMIT_MAX_REQUESTS || 100, // limit each IP to 100 requests per windowMs
+  limit: config.RATE_LIMIT_MAX_REQUESTS || (process.env.NODE_ENV === 'development' ? 50000 : 100),
+  skip: (req) => process.env.NODE_ENV === 'development' && req.ip === '::1', // bypass for localhost in dev
   standardHeaders: 'draft-7', // Return rate limit info in `RateLimit-*` headers
   legacyHeaders: false, // Disable `X-RateLimit-*` headers
   message: {

@@ -30,9 +30,12 @@ class GoodsReceiptService {
   // Private helpers
   // ─────────────────────────────────────────────────────────────────────────
 
-  async _loadOrThrow(id) {
+  async _loadOrThrow(id, businessId = null) {
     if (!mongoose.Types.ObjectId.isValid(id)) throw new ApiError(400, 'Invalid GRN id');
-    const grn = await GoodsReceipt.findById(id);
+    // R-05: tenant scope when provided
+    const grn = businessId
+      ? await GoodsReceipt.findOne({ _id: id, businessId })
+      : await GoodsReceipt.findById(id);
     if (!grn) throw new ApiError(404, 'Goods receipt not found');
     if (grn.isArchived) throw new ApiError(410, 'Goods receipt has been archived');
     return grn;
@@ -216,7 +219,7 @@ class GoodsReceiptService {
   // ─────────────────────────────────────────────────────────────────────────
 
   async confirm(id, user, ipAddress) {
-    const grn = await this._loadOrThrow(id);
+    const grn = await this._loadOrThrow(id, user?.businessId);
     if (grn.state !== GRN_STATES.DRAFT) {
       throw new ApiError(409, `Only draft GRNs can be confirmed. Current state: "${grn.state}"`);
     }
@@ -346,7 +349,7 @@ class GoodsReceiptService {
   // ─────────────────────────────────────────────────────────────────────────
 
   async reconcile(id, resolutions, user, ipAddress) {
-    const grn = await this._loadOrThrow(id);
+    const grn = await this._loadOrThrow(id, user?.businessId);
     if (grn.state !== GRN_STATES.DISCREPANCY_REPORTED) {
       throw new ApiError(409, 'Only GRNs in discrepancy_reported state can be reconciled');
     }
@@ -382,7 +385,7 @@ class GoodsReceiptService {
   // ─────────────────────────────────────────────────────────────────────────
 
   async linkBill(id, billId, user) {
-    const grn = await this._loadOrThrow(id);
+    const grn = await this._loadOrThrow(id, user?.businessId);
     if (!grn.linkedBillIds.some((b) => b.toString() === billId.toString())) {
       grn.linkedBillIds.push(billId);
       grn.lastModifiedBy = user._id;
@@ -396,12 +399,12 @@ class GoodsReceiptService {
   // ─────────────────────────────────────────────────────────────────────────
 
   async cancel(id, user, reason, ipAddress) {
-    const grn = await this._loadOrThrow(id);
+    const grn = await this._loadOrThrow(id, user?.businessId);
     return this._applyStateChange(grn, GRN_STATES.CANCELLED, user, { reason, ipAddress });
   }
 
   async softDelete(id, user, ipAddress) {
-    const grn = await this._loadOrThrow(id);
+    const grn = await this._loadOrThrow(id, user?.businessId);
     if (grn.isArchived) return grn;
     grn.isArchived = true;
     grn.archivedAt = new Date();

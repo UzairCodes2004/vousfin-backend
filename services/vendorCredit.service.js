@@ -36,9 +36,12 @@ class VendorCreditService {
   // Private helpers
   // ─────────────────────────────────────────────────────────────────────────
 
-  async _loadOrThrow(id) {
+  async _loadOrThrow(id, businessId = null) {
     if (!mongoose.Types.ObjectId.isValid(id)) throw new ApiError(400, 'Invalid vendor credit id');
-    const vc = await VendorCredit.findById(id);
+    // R-05: tenant scope when provided
+    const vc = businessId
+      ? await VendorCredit.findOne({ _id: id, businessId })
+      : await VendorCredit.findById(id);
     if (!vc) throw new ApiError(404, 'Vendor credit not found');
     if (vc.isArchived) throw new ApiError(410, 'Vendor credit has been archived');
     return vc;
@@ -123,7 +126,7 @@ class VendorCreditService {
    * @param {string} [ipAddress]
    */
   async applyToBill(vcId, billId, amount, user, notes, ipAddress) {
-    const vc = await this._loadOrThrow(vcId);
+    const vc = await this._loadOrThrow(vcId, user?.businessId);
     if (vc.state === VENDOR_CREDIT_STATES.CANCELLED) {
       throw new ApiError(409, 'Cannot apply a cancelled vendor credit');
     }
@@ -278,7 +281,7 @@ class VendorCreditService {
   // ─────────────────────────────────────────────────────────────────────────
 
   async cancel(id, user, reason, ipAddress) {
-    const vc = await this._loadOrThrow(id);
+    const vc = await this._loadOrThrow(id, user?.businessId);
     if (vc.state === VENDOR_CREDIT_STATES.FULLY_APPLIED) {
       throw new ApiError(409, 'A fully applied credit cannot be cancelled. Reverse the applications first.');
     }
@@ -309,7 +312,7 @@ class VendorCreditService {
   }
 
   async softDelete(id, user, ipAddress) {
-    const vc = await this._loadOrThrow(id);
+    const vc = await this._loadOrThrow(id, user?.businessId);
     if (vc.isArchived) return vc;
     vc.isArchived = true;
     vc.archivedAt = new Date();

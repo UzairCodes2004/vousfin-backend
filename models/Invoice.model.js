@@ -155,6 +155,14 @@ const invoiceSchema = new mongoose.Schema(
       index: true,
     },
 
+    // The bad-debt adjusting journal posted when an invoice is written off
+    // (DR Bad Debt Expense 6370 / CR Accounts Receivable 1110).
+    writeOffJournalId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'JournalEntry',
+      default: null,
+    },
+
     // ── AR/AP M5 — GL-correct void + credit memos ─────────────────────────────
     voidedAt:           { type: Date, default: null },
     voidReason:         { type: String, default: null, maxlength: 500 },

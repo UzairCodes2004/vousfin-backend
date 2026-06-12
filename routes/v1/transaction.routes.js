@@ -15,6 +15,7 @@ const {
   transactionFiltersSchema,
   transactionIdParamSchema,
   reverseTransactionSchema,
+  batchTransactionsSchema,
 } = require('../../validations/transaction.validation');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -23,6 +24,9 @@ router.use(authMiddleware, requireBusiness);
 
 // Transaction Creation (v2)
 router.post('/form', validate(createTransactionSchema), transactionController.createFormTransaction);
+
+// #9 — Server-side batch posting (gated + idempotent)
+router.post('/batch', validate(batchTransactionsSchema), transactionController.postBatchTransactions);
 
 // AR/AP & Settlements (v2)
 router.get('/outstanding', transactionController.getOutstandingBalances);

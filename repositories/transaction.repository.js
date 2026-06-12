@@ -13,6 +13,33 @@ const REPORT_STATUSES = [
   JOURNAL_STATUS.SETTLED,
 ];
 
+/**
+ * Shared aggregation stage that normalises every journal entry into a uniform
+ * array of `{ accountId, type, amount }` lines:
+ *   • Compound entries (journalLines.length > 0) → use the explicit lines
+ *     (these carry the COGS / tax legs that exist ONLY in journalLines).
+ *   • Simple 2-account entries                   → synthesise debit + credit
+ *     from the top-level debitAccountId / creditAccountId.
+ *
+ * This is the SINGLE source of line-normalisation reused by the Income Statement,
+ * Balance Sheet and Trial Balance so the three statements can never disagree
+ * about an entry's effect on the ledger. (Rule 4 — no duplicate logic.)
+ */
+const EFFECTIVE_LINES_STAGE = {
+  $addFields: {
+    effectiveLines: {
+      $cond: {
+        if: { $gt: [{ $size: { $ifNull: ['$journalLines', []] } }, 0] },
+        then: '$journalLines',
+        else: [
+          { accountId: '$debitAccountId',  type: 'debit',  amount: '$amount' },
+          { accountId: '$creditAccountId', type: 'credit', amount: '$amount' },
+        ],
+      },
+    },
+  },
+};
+
 class TransactionRepository extends BaseRepository {
   constructor() {
     super(JournalEntry);
@@ -23,9 +50,14 @@ class TransactionRepository extends BaseRepository {
    * @param {Object} data - Journal entry data
    * @returns {Promise<Object>}
    */
-  async createTransaction(data) {
+  async createTransaction(data, session = null) {
     if (!data.businessId || !data.transactionDate || !data.amount) {
       throw new Error('Missing required fields for transaction');
+    }
+    if (session) {
+      // Save inside the caller's all-or-nothing transaction.
+      const doc = new this.model(data);
+      return doc.save({ session });
     }
     return this.create(data);
   }
@@ -198,13 +230,15 @@ class TransactionRepository extends BaseRepository {
    * @param {Object} updateData
    * @returns {Promise<Object|null>}
    */
-  async updateTransaction(id, businessId, updateData) {
+  async updateTransaction(id, businessId, updateData, session = null) {
     const validId = sanitizeAndValidateId(id);
     const validBusinessId = sanitizeAndValidateId(businessId);
+    const options = { new: true, runValidators: true };
+    if (session) options.session = session; // join an all-or-nothing transaction when given
     return this.model.findOneAndUpdate(
       { _id: validId, businessId: validBusinessId },
       { ...updateData, updatedAt: new Date() },
-      { new: true, runValidators: true }
+      options
     ).exec();
   }
 
@@ -402,8 +436,22 @@ class TransactionRepository extends BaseRepository {
   async getIncomeStatementData(businessId, startDate, endDate) {
     const validBusinessId = sanitizeAndValidateId(businessId);
 
+    // The Income Statement must reflect EVERY journal line — including the COGS /
+    // tax legs that live ONLY in journalLines on compound entries. We therefore
+    // normalise with the SAME effective-lines stage the Trial Balance / Balance
+    // Sheet use (getDebitCreditTotals), then classify each line by its account
+    // type. Previously this read only the top-level debit/credit accounts, so a
+    // transaction-first inventory sale's COGS (held in journalLines) was invisible
+    // to the P&L while still hitting the Balance Sheet — the two disagreed.
+    //
+    // Convention preserved from the previous implementation:
+    //   • Revenue = CREDIT lines posted to a Revenue account
+    //   • Expense = DEBIT  lines posted to an Expense account
+    //     (COGS accounts are accountType 'Expense', subtype 'Direct Cost')
+    // Closing entries (DR Revenue / CR Retained Earnings) are naturally excluded:
+    // their debit hits a Revenue account (ignored on the debit side) and their
+    // credit hits Equity (ignored on the credit side).
     const pipeline = [
-      // Step 1: Index-covered match — uses idx_report_core compound index
       {
         $match: {
           businessId: new mongoose.Types.ObjectId(validBusinessId),
@@ -412,37 +460,27 @@ class TransactionRepository extends BaseRepository {
           isArchived: { $ne: true },
         },
       },
-      // Step 2: Minimal lookups — only 3 fields fetched instead of full doc
+      EFFECTIVE_LINES_STAGE,
+      { $unwind: '$effectiveLines' },
       {
         $lookup: {
           from: 'chartofaccounts',
-          localField: 'debitAccountId',
+          localField: 'effectiveLines.accountId',
           foreignField: '_id',
-          as: 'debitAcc',
+          as: 'acc',
           pipeline: [{ $project: { accountName: 1, accountType: 1 } }],
         },
       },
-      {
-        $lookup: {
-          from: 'chartofaccounts',
-          localField: 'creditAccountId',
-          foreignField: '_id',
-          as: 'creditAcc',
-          pipeline: [{ $project: { accountName: 1, accountType: 1 } }],
-        },
-      },
-      { $unwind: { path: '$debitAcc',  preserveNullAndEmptyArrays: true } },
-      { $unwind: { path: '$creditAcc', preserveNullAndEmptyArrays: true } },
-      // Step 3: $facet splits the stream once; each branch groups independently in Mongo
+      { $unwind: { path: '$acc', preserveNullAndEmptyArrays: true } },
       {
         $facet: {
           revenue: [
-            { $match: { 'creditAcc.accountType': 'Revenue' } },
-            { $group: { _id: '$creditAcc.accountName', amount: { $sum: '$amount' } } },
+            { $match: { 'acc.accountType': 'Revenue', 'effectiveLines.type': 'credit' } },
+            { $group: { _id: '$acc.accountName', amount: { $sum: '$effectiveLines.amount' } } },
           ],
           expenses: [
-            { $match: { 'debitAcc.accountType': 'Expense' } },
-            { $group: { _id: '$debitAcc.accountName', amount: { $sum: '$amount' } } },
+            { $match: { 'acc.accountType': 'Expense', 'effectiveLines.type': 'debit' } },
+            { $group: { _id: '$acc.accountName', amount: { $sum: '$effectiveLines.amount' } } },
           ],
         },
       },
@@ -490,21 +528,8 @@ class TransactionRepository extends BaseRepository {
           isArchived: { $ne: true },
         },
       },
-      // Normalise each document into an array of effective lines
-      {
-        $addFields: {
-          effectiveLines: {
-            $cond: {
-              if: { $gt: [{ $size: { $ifNull: ['$journalLines', []] } }, 0] },
-              then: '$journalLines',  // use explicit multi-line entries
-              else: [                 // synthesise 2-line entry from top-level fields
-                { accountId: '$debitAccountId',  type: 'debit',  amount: '$amount' },
-                { accountId: '$creditAccountId', type: 'credit', amount: '$amount' },
-              ],
-            },
-          },
-        },
-      },
+      // Normalise each document into an array of effective lines (shared stage)
+      EFFECTIVE_LINES_STAGE,
       { $unwind: '$effectiveLines' },
       // Separate into debit/credit streams
       {
@@ -543,20 +568,7 @@ class TransactionRepository extends BaseRepository {
           isArchived: { $ne: true },
         },
       },
-      {
-        $addFields: {
-          effectiveLines: {
-            $cond: {
-              if: { $gt: [{ $size: { $ifNull: ['$journalLines', []] } }, 0] },
-              then: '$journalLines',
-              else: [
-                { accountId: '$debitAccountId',  type: 'debit',  amount: '$amount' },
-                { accountId: '$creditAccountId', type: 'credit', amount: '$amount' },
-              ],
-            },
-          },
-        },
-      },
+      EFFECTIVE_LINES_STAGE,
       { $unwind: '$effectiveLines' },
       {
         $facet: {
@@ -656,4 +668,8 @@ class TransactionRepository extends BaseRepository {
   }
 }
 
-module.exports = new TransactionRepository();
+const transactionRepository = new TransactionRepository();
+// Exported for unit tests asserting the Income Statement and Trial Balance share
+// one line-normalisation stage (and therefore cannot diverge).
+transactionRepository.EFFECTIVE_LINES_STAGE = EFFECTIVE_LINES_STAGE;
+module.exports = transactionRepository;

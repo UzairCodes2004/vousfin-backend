@@ -10,7 +10,7 @@ const objectIdPattern = /^[0-9a-fA-F]{24}$/;
 const journalLineSchema = Joi.object({
   accountId: Joi.string().pattern(objectIdPattern).required(),
   type: Joi.string().valid('debit', 'credit').required(),
-  amount: Joi.number().positive().precision(2).required(),
+  amount: Joi.number().positive().max(999_999_999_999).precision(2).required(),
   description: Joi.string().max(200).allow('', null).optional(),
 });
 
@@ -24,8 +24,15 @@ const createTransactionSchema = Joi.object({
   description: Joi.string().min(3).max(500).required().trim(),
   transactionType: Joi.string().valid(...Object.values(TRANSACTION_TYPES)).optional(),
   transactionMode: Joi.string().valid(...Object.values(TRANSACTION_MODES)).optional(),
-  amount: Joi.number().positive().precision(2).required(),
-  
+  // Cap at 1 trillion to prevent float-precision loss and catch obvious data-entry errors.
+  // Optional when journalLines provided — the custom validator below auto-computes amount
+  // from the debit total so callers don't need to pre-calculate it.
+  amount: Joi.when('journalLines', {
+    is:        Joi.array().min(1).required(),
+    then:      Joi.number().positive().max(999_999_999_999).precision(2).optional(),
+    otherwise: Joi.number().positive().max(999_999_999_999).precision(2).required(),
+  }),
+
   // Account IDs (Required for backward compatibility)
   debitAccountId: Joi.string().pattern(objectIdPattern).required(),
   creditAccountId: Joi.string().pattern(objectIdPattern).required(),
@@ -46,7 +53,7 @@ const createTransactionSchema = Joi.object({
   // Metadata
   transactionReference: Joi.string().max(100).allow('', null).trim().optional(),
   invoiceNumber:        Joi.string().max(50).allow('', null).trim().optional(),   // ← ADDED: invoice/bill ref
-  paymentMethod:        Joi.string().max(50).allow('', null).trim().optional(),   // ← ADDED: cash/bank/card/cheque
+  paymentMethod:        Joi.string().valid('cash','bank','credit_card','debit_card','cheque','mobile_wallet','online').allow('', null).trim().optional(),
   transactionCategory: Joi.string().valid(...Object.values(TRANSACTION_CATEGORIES)).allow(null).optional(),
   notes: Joi.string().max(1000).allow('', null).trim().optional(),
   tags: Joi.array().items(Joi.string().trim()).optional(),
@@ -98,12 +105,34 @@ const createTransactionSchema = Joi.object({
     if (Math.round(debits * 100) !== Math.round(credits * 100)) {
       return helpers.message('Total debits must equal total credits in journal lines');
     }
-    if (Math.round(debits * 100) !== Math.round(value.amount * 100)) {
-      return helpers.message('Journal line total must equal the primary transaction amount');
+    // Auto-compute amount from journal lines — the debit total IS the transaction amount.
+    // This removes the requirement for the caller to pre-calculate and pass amount separately,
+    // which was non-intuitive for compound entries (e.g. asset disposal where multiple
+    // debit accounts sum to more than the asset's original cost).
+    if (debits > 0) {
+      value.amount = Math.round(debits * 100) / 100;
     }
   }
 
   return value;
+});
+
+/**
+ * #9 — Schema for server-side batch posting.
+ * Each item carries the core transaction fields (the engine fills in the rest);
+ * unknown keys (party names, currency, tax flags…) are allowed through.
+ */
+const batchTransactionsSchema = Joi.object({
+  items: Joi.array().min(1).max(1000).required().items(
+    Joi.object({
+      transactionDate: Joi.date().iso().required(),
+      description:     Joi.string().min(1).max(500).required(),
+      amount:          Joi.number().positive().required(),
+      debitAccountId:  Joi.string().pattern(objectIdPattern).required(),
+      creditAccountId: Joi.string().pattern(objectIdPattern).required(),
+      idempotencyKey:  Joi.string().max(120).optional(),
+    }).unknown(true)
+  ),
 });
 
 /**
@@ -259,6 +288,7 @@ module.exports = {
   confirmNaturalLanguageSchema,
   excelUploadSchema,
   confirmExcelImportSchema,
+  batchTransactionsSchema,
   transactionFiltersSchema,
   transactionIdParamSchema,
   reverseTransactionSchema,

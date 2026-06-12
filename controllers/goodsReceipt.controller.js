@@ -7,10 +7,11 @@ const ApiResponse = require('../utils/ApiResponse');
 
 function actor(req) {
   return {
-    _id:      req.user.id,
-    fullName: req.user.fullName,
-    email:    req.user.email,
-    role:     req.user.role,
+    _id:        req.user.id,
+    fullName:   req.user.fullName,
+    email:      req.user.email,
+    role:       req.user.role,
+    businessId: req.user.businessId, // R-05: tenant scope for service loads
   };
 }
 

@@ -75,17 +75,28 @@ class FxService {
    * @returns {Promise<number>}
    */
   async getRate(businessId, fromCurrency, toCurrency, asOfDate = new Date()) {
+    return (await this.getRateInfo(businessId, fromCurrency, toCurrency, asOfDate)).rate;
+  }
+
+  /**
+   * Like getRate, but also reports whether a stored rate was actually found.
+   * `found: false` means the caller may fall back to a user-supplied rate
+   * instead of the safe default of 1.
+   *
+   * @returns {Promise<{ rate: number, found: boolean, rateDate: Date|null }>}
+   */
+  async getRateInfo(businessId, fromCurrency, toCurrency, asOfDate = new Date()) {
     const from = (fromCurrency || '').toUpperCase();
     const to   = (toCurrency   || '').toUpperCase();
-    if (!from || !to || from === to) return 1;
+    if (!from || !to || from === to) return { rate: 1, found: true, rateDate: null };
 
     const dateStr = new Date(asOfDate).toISOString().split('T')[0];
     const key     = this._key(String(businessId), from, to, dateStr);
 
     const cached = this._get(key);
-    if (cached !== null) return cached;
+    if (cached !== null) return { rate: cached, found: true, rateDate: null };
 
-    // Direct rate
+    // Direct rate — most recent on or before the transaction date (FX-at-date).
     const direct = await CurrencyRate.findOne({
       businessId,
       fromCurrency: from,
@@ -95,7 +106,7 @@ class FxService {
 
     if (direct) {
       this._set(key, direct.rate);
-      return direct.rate;
+      return { rate: direct.rate, found: true, rateDate: direct.rateDate };
     }
 
     // Inverse rate
@@ -109,11 +120,11 @@ class FxService {
     if (inverse) {
       const r = this.round(1 / inverse.rate, from);
       this._set(key, r);
-      return r;
+      return { rate: r, found: true, rateDate: inverse.rateDate };
     }
 
-    logger.warn(`[FX] No rate ${from}→${to} on ${dateStr} for business ${businessId} — defaulting to 1`);
-    return 1;
+    logger.warn(`[FX] No stored rate ${from}→${to} on ${dateStr} for business ${businessId}`);
+    return { rate: 1, found: false, rateDate: null };
   }
 
   /**
@@ -144,21 +155,48 @@ class FxService {
 
   /**
    * Given a transaction amount + currency, return the FX fields to persist.
+   * `amount` is always the FCY amount (e.g. 100 USD when currencyCode='USD').
    * If txnCurrency matches baseCurrency, rate=1 and baseCurrencyAmount=amount.
    *
-   * @returns {{ currencyCode, exchangeRate, baseCurrencyAmount }}
+   * Rate selection (locks the rate as of the transaction date — IAS 21):
+   *   1. A stored CurrencyRate on/before txnDate → authoritative, date-locked.
+   *   2. No stored rate, but the caller supplied a positive rate → honour it
+   *      (so a manual foreign-currency entry is never silently flattened to 1).
+   *   3. Otherwise → 1, with a warning.
+   *
+   * @param {number}      providedRate             optional caller-supplied rate (units of base per 1 FCY)
+   * @param {number|null} callerBaseCurrencyAmount  if the caller already knows the base-currency
+   *                                               equivalent (e.g. from a locked FX deal), pass it
+   *                                               here. When provided and positive it takes precedence
+   *                                               over the computed amount * rate, preventing
+   *                                               double-conversion if the caller already converted.
+   * @returns {{ currencyCode, exchangeRate, baseCurrencyAmount, rateSource }}
    */
-  async prepareFxFields(amount, txnCurrency, businessId, txnDate) {
+  async prepareFxFields(amount, txnCurrency, businessId, txnDate, providedRate = null, callerBaseCurrencyAmount = null) {
     const base = await this.getBaseCurrency(businessId);
     const code = (txnCurrency || base).toUpperCase();
     if (code === base) {
-      return { currencyCode: code, exchangeRate: 1, baseCurrencyAmount: this.round(amount, code) };
+      return { currencyCode: code, exchangeRate: 1, baseCurrencyAmount: this.round(amount, code), rateSource: 'base' };
     }
-    const rate = await this.getRate(businessId, code, base, txnDate || new Date());
+    const info = await this.getRateInfo(businessId, code, base, txnDate || new Date());
+    let rate = info.rate;
+    let rateSource = info.found ? 'stored' : 'default';
+    if (!info.found && Number(providedRate) > 0) {
+      rate = Number(providedRate);
+      rateSource = 'provided';
+    }
+    // If the caller explicitly provided a positive base-currency amount, use it directly.
+    // This avoids double-conversion when the caller pre-computed the equivalent
+    // (e.g. the test passes pkrAmt that was already amount * rate).
+    const callerBca = Number(callerBaseCurrencyAmount);
+    const baseCurrencyAmount = (callerBca > 0 && Number.isFinite(callerBca))
+      ? this.round(callerBca, base)
+      : this.round(amount * rate, base);
     return {
       currencyCode:       code,
       exchangeRate:       rate,
-      baseCurrencyAmount: this.round(amount * rate, base),
+      baseCurrencyAmount,
+      rateSource,
     };
   }
 }

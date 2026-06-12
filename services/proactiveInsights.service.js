@@ -90,13 +90,29 @@ async function getNeedsAttention(businessId) {
   if (!businessId) { const e = new Error('Business ID is required'); e.statusCode = 400; throw e; }
   const lstm = require('./forecasting/lstmForecastService'); // lazy — avoid cycle
 
-  const [insightsRes, outlook, anomaly] = await Promise.allSettled([
+  const trendMonitor = require('./trendMonitor.service'); // lazy — avoid cycle
+
+  const [insightsRes, outlook, anomaly, persistedAlerts] = await Promise.allSettled([
     financialIntelligence.getFinancialInsights(businessId),
     businessHealth.getForwardOutlook(businessId, { horizonMonths: 6 }),
     lstm.fetchAnomalyRisk(businessId),
+    trendMonitor.listOpen(businessId),
   ]).then((r) => r.map((x) => (x.status === 'fulfilled' ? x.value : null)));
 
   const items = [];
+
+  // FR-02.1/02.3 — persisted trend/invariant alerts (deduplicated, ack-able).
+  for (const a of (persistedAlerts || [])) {
+    items.push({
+      id: `alert_${a.ruleKey}_${a.periodKey}`,
+      source: 'trend-monitor',
+      level: normalizeLevel(a.level),
+      title: a.title,
+      message: [a.what, a.howMuch, a.sinceWhen, a.recommendation].filter(Boolean).join(' '),
+      action: 'Open', actionTo: a.actionTo || '/financial-reports',
+      alertId: String(a._id),
+    });
+  }
 
   for (const s of (insightsRes?.insights || [])) items.push(normalizeItem(s, 'finance'));
 

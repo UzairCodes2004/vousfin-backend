@@ -60,20 +60,35 @@ const buildAccountResolver = (accounts) => (name) => {
 
 /**
  * Create a transaction from structured form.
+ *
+ * #6 — routed through the approval gate. When the business has approvals enabled
+ * and the amount exceeds the threshold, the transaction is parked in the review
+ * queue (nothing posts) instead of hitting the ledger. Otherwise it posts
+ * immediately — identical to the legacy behaviour (approvals are off by default).
  */
 const createFormTransaction = async (req, res, next) => {
   try {
+    const approvalService = require('../services/approval.service');
     const transactionData = {
       ...req.body,
       businessId: req.user.businessId,
       inputMethod: 'form',
+      doubleSubmitGuard: true, // reject exact duplicates posted within 10s (double-click protection)
     };
-    const transaction = await transactionService.createTransaction(
+    const result = await approvalService.submitOrPost(
       transactionData,
-      req.user.id,
-      req.ip
+      req.user,
+      req.ip,
+      { source: 'form' }
     );
-    ApiResponse.created(res, transaction, 'Transaction recorded successfully');
+    if (result.pendingApproval) {
+      return ApiResponse.created(
+        res,
+        result.pendingTransaction,
+        `Submitted for approval — amount exceeds the ${result.threshold} approval limit`
+      );
+    }
+    ApiResponse.created(res, result.transaction, 'Transaction recorded successfully');
   } catch (error) {
     next(error);
   }
@@ -391,12 +406,23 @@ const confirmNaturalLanguage = async (req, res, next) => {
     }
 
     // ── Standard (non-installment) transaction ────────────────────────────────
-    const transaction = await transactionService.createTransaction(
+    // #6 — route through the approval gate, same as the structured form, so a
+    // typed/NL entry above the limit waits for review instead of posting.
+    const approvalService = require('../services/approval.service');
+    const result = await approvalService.submitOrPost(
       transactionData,
-      req.user.id,
-      req.ip
+      req.user,
+      req.ip,
+      { source: 'nl' }
     );
-    ApiResponse.created(res, transaction, 'Transaction recorded from natural language');
+    if (result.pendingApproval) {
+      return ApiResponse.created(
+        res,
+        result.pendingTransaction,
+        `Submitted for approval — amount exceeds the ${result.threshold} approval limit`
+      );
+    }
+    ApiResponse.created(res, result.transaction, 'Transaction recorded from natural language');
   } catch (error) {
     next(error);
   }
@@ -674,17 +700,63 @@ const confirmExcelImport = async (req, res, next) => {
       });
     }
 
-    const results = await transactionService.createBulkTransactions(
+    // #9 — route through the gated batch service so over-threshold rows are
+    // parked for approval (consistent with the form/NL/AI paths) and we get a
+    // structured summary in a single server-side pass.
+    const batchPostingService = require('../services/batchPosting.service');
+    const batch = await batchPostingService.postBatch(
+      businessId,
       transactionsToCreate,
-      req.user.id,
-      req.ip
+      req.user,
+      req.ip,
+      { source: 'excel' }
     );
 
-    // Merge account-resolution failures with service-level failures
-    results.failed = [...(results.failed || []), ...accountErrors];
+    // Map to the legacy Excel result shape (+ pending) and merge resolution errors.
+    const results = {
+      successful: batch.posted,
+      pending:    batch.pending,
+      failed:     [...batch.failed, ...accountErrors],
+      batchId:    batch.batchId,
+    };
 
-    logger.info(`Excel import complete: ${results.successful} saved, ${results.failed.length} failed`);
-    ApiResponse.success(res, results, `${results.successful} transactions imported successfully`);
+    logger.info(`Excel import complete: ${results.successful} posted, ${results.pending} pending approval, ${results.failed.length} failed`);
+    const msg = results.pending > 0
+      ? `${results.successful} imported, ${results.pending} sent for approval`
+      : `${results.successful} transactions imported successfully`;
+    ApiResponse.success(res, results, msg);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/v1/transactions/batch
+ * Post many transactions in one call. Each item goes through the approval gate;
+ * over-threshold items are parked. Optional per-item idempotencyKey makes a
+ * retry safe (already-posted keys are skipped).
+ *
+ * Body: { items: [ { transactionDate, description, amount, debitAccountId, creditAccountId, ...optional, idempotencyKey? } ] }
+ */
+const postBatchTransactions = async (req, res, next) => {
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new ApiError(400, 'Provide a non-empty "items" array');
+    }
+    const batchPostingService = require('../services/batchPosting.service');
+    const result = await batchPostingService.postBatch(
+      req.user.businessId,
+      items,
+      req.user,
+      req.ip,
+      { source: 'batch' }
+    );
+    const msg = `Batch complete: ${result.posted} posted`
+      + (result.pending ? `, ${result.pending} sent for approval` : '')
+      + (result.skipped ? `, ${result.skipped} already posted` : '')
+      + (result.failed.length ? `, ${result.failed.length} failed` : '');
+    ApiResponse.success(res, result, msg);
   } catch (error) {
     next(error);
   }
@@ -1078,6 +1150,7 @@ module.exports = {
   downloadExcelTemplate,
   uploadExcelPreview,
   confirmExcelImport,
+  postBatchTransactions,
   getTransactions,
   getTransactionById,
   updateTransaction,

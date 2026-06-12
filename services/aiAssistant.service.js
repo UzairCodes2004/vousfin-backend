@@ -277,6 +277,23 @@ async function callGroq(messages, opts = {}, retries = 2) {
  * @returns {Promise<{ answer: string }>}
  */
 async function chat(question, businessId, chatHistory = []) {
+  // FR-03.1 — grounded query engine FIRST: deterministic, exact GL figures
+  // with drill-down links, labelled factual/estimate. The LLM only handles
+  // what the engine doesn't match, so common queries are always accurate.
+  try {
+    const grounded = await require('./financialQuery.service').answer(question, businessId);
+    if (grounded) {
+      return {
+        answer:   grounded.answer + (grounded.followUp ? `\n\n${grounded.followUp}` : ''),
+        basis:    grounded.basis,        // 'factual' | 'estimate'
+        figures:  grounded.figures,      // [{label, value, link}] — drill-downs
+        grounded: true,
+      };
+    }
+  } catch (e) {
+    require('../config/logger').warn(`[financialQuery] grounded engine failed, falling back to LLM: ${e.message}`);
+  }
+
   // Build financial context fresh every call so numbers are always current
   const ctx = await buildFinancialContext(businessId);
   const contextBlock = formatContext(ctx);

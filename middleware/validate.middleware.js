@@ -14,7 +14,7 @@
  */
 const validate = (schema, property = 'body') => {
   return (req, res, next) => {
-    const { error } = schema.validate(req[property], {
+    const { error, value } = schema.validate(req[property], {
       abortEarly:   false,
       allowUnknown: true,   // never reject unknown keys — prevents "field is not allowed" 400s
     });
@@ -29,6 +29,20 @@ const validate = (schema, property = 'body') => {
           message: detail.message,
         })),
       });
+    }
+    // Write Joi-defaulted values back so controllers see defaults.
+    // req.query is a getter on Express's prototype — direct assignment is silently ignored,
+    // so we mutate it in-place with Object.assign instead.
+    // For req.body and req.params, direct replacement works fine.
+    if (value) {
+      if (property === 'query') {
+        // Merge defaults into the existing query object.
+        // Joi returns string values for Joi.date() defaults (it does NOT coerce the
+        // default value to a Date object), so no conversion is needed.
+        Object.assign(req.query, value);
+      } else {
+        req[property] = value;
+      }
     }
     next();
   };

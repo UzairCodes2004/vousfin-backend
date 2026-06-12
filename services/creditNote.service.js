@@ -15,22 +15,28 @@
 const mongoose = require('mongoose');
 const CreditNote = require('../models/CreditNote.model');
 const Invoice = require('../models/Invoice.model');
+const ChartOfAccount = require('../models/ChartOfAccount.model');
 const customerRepository = require('../repositories/customer.repository');
 const auditService = require('./audit.service');
+const partyBalanceService = require('./partyBalance.service');
+const { postBalancedJournal } = require('./ledgerPosting.service');
 const { ApiError } = require('../utils/ApiError');
 const logger = require('../config/logger');
-const { ENTITY_TYPES, AUDIT_ACTIONS } = require('../config/constants');
+const { ENTITY_TYPES, AUDIT_ACTIONS, TRANSACTION_TYPES } = require('../config/constants');
 
 class CreditNoteService {
   // ───────────────────────────────────────────────────────────────────────────
   // Helpers
   // ───────────────────────────────────────────────────────────────────────────
 
-  async _loadOrThrow(id) {
+  async _loadOrThrow(id, businessId = null) {
     if (!mongoose.Types.ObjectId.isValid(id)) {
       throw new ApiError(400, 'Invalid credit note id');
     }
-    const cn = await CreditNote.findById(id);
+    // R-05: tenant scope when provided
+    const cn = businessId
+      ? await CreditNote.findOne({ _id: id, businessId })
+      : await CreditNote.findById(id);
     if (!cn) throw new ApiError(404, 'Credit note not found');
     if (cn.isArchived) throw new ApiError(410, 'Credit note has been archived');
     return cn;
@@ -128,7 +134,7 @@ class CreditNoteService {
   // ───────────────────────────────────────────────────────────────────────────
 
   async approve(id, user, ipAddress) {
-    const cn = await this._loadOrThrow(id);
+    const cn = await this._loadOrThrow(id, user?.businessId);
     if (cn.state !== 'draft') {
       throw new ApiError(409, `Credit note cannot be approved from state "${cn.state}"`);
     }
@@ -145,7 +151,7 @@ class CreditNoteService {
   // ───────────────────────────────────────────────────────────────────────────
 
   async apply(id, user, ipAddress) {
-    const cn = await this._loadOrThrow(id);
+    const cn = await this._loadOrThrow(id, user?.businessId);
     if (cn.state !== 'approved') {
       throw new ApiError(409, `Credit note must be approved before applying (current: "${cn.state}")`);
     }
@@ -166,6 +172,64 @@ class CreditNoteService {
     invoice.lastModifiedBy = user._id;
     await invoice.save();
 
+    // Post GL journal entry for credit_note: DR Sales Returns & Allowances / CR Accounts Receivable
+    if (cn.noteType === 'credit_note') {
+      try {
+        const [salesReturnsAcct, arAcct] = await Promise.all([
+          ChartOfAccount.findOne({
+            businessId: cn.businessId,
+            $or: [{ accountCode: '4115' }, { accountName: /sales returns/i }],
+          }).lean(),
+          ChartOfAccount.findOne({
+            businessId: cn.businessId,
+            $or: [{ accountCode: '1110' }, { accountName: /accounts receivable/i }],
+          }).lean(),
+        ]);
+
+        if (salesReturnsAcct && arAcct) {
+          const je = await postBalancedJournal({
+            businessId:         cn.businessId,
+            transactionDate:    new Date(),
+            description:        `Credit Note ${cn.creditNoteNumber} applied to ${cn.invoiceNumber || invoice.invoiceNumber}`,
+            transactionType:    TRANSACTION_TYPES.REFUND,
+            amount:             cn.totalAmount,
+            debitAccountId:     salesReturnsAcct._id,
+            creditAccountId:    arAcct._id,
+            transactionSource:  'system_generated',
+            status:             'posted',
+            entryType:          'adjusting',
+            createdBy:          user._id,
+            lastModifiedBy:     user._id,
+            currencyCode:       cn.currencyCode || 'PKR',
+            baseCurrencyCode:   cn.baseCurrencyCode || 'PKR',
+            exchangeRate:       cn.exchangeRate || 1,
+            baseCurrencyAmount: cn.totalAmount,
+          });
+          cn.linkedJournalEntryId = je._id;
+
+          // Decrement the customer's receivable balance
+          if (invoice.customerId) {
+            await partyBalanceService.adjustReceivable(
+              cn.businessId,
+              invoice.customerId,
+              -cn.totalAmount,
+              {
+                userId:     user._id,
+                reason:     'credit_note_applied',
+                entityType: 'creditNote',
+                entityId:   cn._id,
+              }
+            );
+          }
+        } else {
+          logger.warn(`[creditNote.apply] Could not find Sales Returns or AR account for business ${cn.businessId} — GL not posted`);
+        }
+      } catch (glErr) {
+        logger.error(`[creditNote.apply] GL posting failed for ${cn.creditNoteNumber}: ${glErr.message}`);
+        // Do NOT re-throw — the credit note application still proceeds; GL drift is logged
+      }
+    }
+
     cn.state = 'applied';
     cn.lastModifiedBy = user._id;
     await cn.save();
@@ -177,7 +241,7 @@ class CreditNoteService {
   // ───────────────────────────────────────────────────────────────────────────
 
   async cancel(id, user, reason, ipAddress) {
-    const cn = await this._loadOrThrow(id);
+    const cn = await this._loadOrThrow(id, user?.businessId);
     if (cn.state === 'cancelled') return cn;
 
     // If it was applied, reverse the invoice adjustment
@@ -195,6 +259,41 @@ class CreditNoteService {
         }
         invoice.lastModifiedBy = user._id;
         await invoice.save();
+
+        // Reverse the GL journal entry if one was posted
+        if (cn.linkedJournalEntryId) {
+          try {
+            const transactionService = require('./transaction.service');
+            await transactionService.reverseTransaction(
+              cn.linkedJournalEntryId.toString(),
+              cn.businessId.toString(),
+              { reason: `Credit note ${cn.creditNoteNumber} cancelled` },
+              user._id,
+              ipAddress
+            );
+          } catch (revErr) {
+            logger.warn(`[creditNote.cancel] GL reversal failed for ${cn.creditNoteNumber}: ${revErr.message}`);
+          }
+
+          // Restore customer receivable balance
+          if (cn.noteType === 'credit_note' && invoice.customerId) {
+            try {
+              await partyBalanceService.adjustReceivable(
+                cn.businessId,
+                invoice.customerId,
+                cn.totalAmount,
+                {
+                  userId:     user._id,
+                  reason:     'credit_note_cancelled',
+                  entityType: 'creditNote',
+                  entityId:   cn._id,
+                }
+              );
+            } catch (balErr) {
+              logger.warn(`[creditNote.cancel] Balance restore failed: ${balErr.message}`);
+            }
+          }
+        }
       }
     }
 
@@ -242,7 +341,7 @@ class CreditNoteService {
   }
 
   async softDelete(id, user, ipAddress) {
-    const cn = await this._loadOrThrow(id);
+    const cn = await this._loadOrThrow(id, user?.businessId);
     if (cn.isArchived) return cn;
     // If applied, reverse first
     if (cn.state === 'applied') {

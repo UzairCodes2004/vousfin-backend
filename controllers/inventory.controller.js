@@ -89,3 +89,21 @@ exports.getStockLedger = async (req, res, next) => {
     ApiResponse.success(res, ledger, 'Stock ledger retrieved');
   } catch (e) { next(e); }
 };
+
+// R-04 — recompute an item's weighted-average cost by replaying its movements.
+// ?post=true (or body.post) also heals the item + posts a valuation adjustment.
+exports.recalculate = async (req, res, next) => {
+  try {
+    const recalcService = require('../services/inventoryRecalc.service');
+    const post = req.query.post === 'true' || req.body?.post === true;
+    const report = await recalcService.recalculateItem(req.user.businessId, req.params.id, {
+      post,
+      user: { _id: req.user.id },
+    });
+    ApiResponse.success(res, report, report.inSync
+      ? 'Inventory valuation is in sync'
+      : report.applied
+        ? 'Inventory valuation recalculated and corrected'
+        : 'Inventory valuation drift detected (preview)');
+  } catch (e) { next(e); }
+};

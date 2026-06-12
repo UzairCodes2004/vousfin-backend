@@ -1,3 +1,7 @@
+// Force Google DNS so Atlas SRV/TXT/A lookups work on any local network
+const dns = require('dns');
+dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
+
 const mongoose = require('mongoose');
 const app = require('./app');
 const connectDB = require('./config/database');
@@ -122,7 +126,56 @@ const startServer = async () => {
         }
       });
 
-      logger.info('⏰ AR/AP automation jobs scheduled (recurring bills + invoices + reminders + dunning)');
+      // Phase 4 — Accrual: post due deferred-revenue / prepaid-expense recognitions
+      const recognitionService = require('./services/recognitionSchedule.service');
+      // Daily at 05:30 — recognize any schedule slices whose date has arrived
+      cron.schedule('30 5 * * *', async () => {
+        try {
+          const r = await recognitionService.postDueRecognitions(null, new Date());
+          if (r.linesPosted) logger.info(`[cron] Recognition: posted ${r.linesPosted} due entries (${r.errors} errors)`);
+        } catch (err) {
+          logger.error(`[cron] postDueRecognitions error: ${err.message}`);
+        }
+      });
+
+      // ── #5 — recurring transactions (templates) ──────────────────────────
+      const transactionTemplateService = require('./services/transactionTemplate.service');
+      // Daily at 06:30 — post transactions for every due recurring template
+      cron.schedule('30 6 * * *', async () => {
+        try {
+          const r = await transactionTemplateService.generateDueRecurring(new Date());
+          if (r.generated || r.pending) {
+            logger.info(`[cron] Recurring transactions: ${r.generated} posted, ${r.pending} pending approval (${r.scanned} due)`);
+          }
+        } catch (err) {
+          logger.error(`[cron] generateDueRecurring error: ${err.message}`);
+        }
+      });
+
+      // ── FR-03.4 — autonomous monthly CFO report ───────────────────────────
+      const cfoReportService = require('./services/cfoReport.service');
+      // Daily at 08:30 — runs only on the first business day; delivered by 9 AM.
+      cron.schedule('30 8 * * *', async () => {
+        try {
+          await cfoReportService.runMonthly(new Date());
+        } catch (err) {
+          logger.error(`[cron] cfoReport error: ${err.message}`);
+        }
+      });
+
+      // ── FR-02.1 / FR-02.3 — trend monitor + balance-equation invariant ────
+      const trendMonitor = require('./services/trendMonitor.service');
+      // Every 30 minutes — rolling-window drift rules + runtime invariant.
+      // Alerts dedup at the DB layer, so frequent runs never spam.
+      cron.schedule('*/30 * * * *', async () => {
+        try {
+          await trendMonitor.runAllBusinesses();
+        } catch (err) {
+          logger.error(`[cron] trendMonitor error: ${err.message}`);
+        }
+      });
+
+      logger.info('⏰ AR/AP automation jobs scheduled (recurring bills + invoices + transactions + reminders + dunning + accrual recognition + trend monitor)');
     } catch (err) {
       logger.warn(`⚠️ AR/AP automation jobs failed to schedule (non-fatal): ${err.message}`);
     }

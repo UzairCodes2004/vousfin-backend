@@ -40,7 +40,14 @@ jest.mock('../../../models/Bill.model', () => {
     return Array.isArray(allowed) && allowed.includes(to);
   };
   Bill.findById = async (id) => stateStore.get(String(id)) || null;
-  Bill.findOne  = async () => null;
+  // Chainable mock: supports both `await findOne(...)` and `findOne().sort().select().lean()`
+  const _chain = (val) => ({
+    sort: () => _chain(val), select: () => _chain(val), populate: () => _chain(val),
+    lean: async () => val,
+    then: (res, rej) => Promise.resolve(val).then(res, rej),
+    catch: (rej) => Promise.resolve(val).catch(rej),
+  });
+  Bill.findOne  = () => _chain(null);
   Bill.find = async () => Array.from(stateStore.values());
   Bill.countDocuments = async () => stateStore.size;
   Bill.__reset = () => stateStore.clear();

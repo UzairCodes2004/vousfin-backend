@@ -31,6 +31,7 @@ const auditService = require('./audit.service');
 const fxService = require('./fx.service');
 const partyBalanceService = require('./partyBalance.service');     // ERP Step 4 — centralized AR balance
 const { postBalancedJournal } = require('./ledgerPosting.service'); // ERP Step 4 — JE + running-balance sync
+const { withTransaction } = require('../utils/withTransaction');   // R-01 — atomic recognition unit
 const { businessEvents, EVENTS } = require('./businessEventEngine.service'); // ERP Step 4 — event broadcasts
 const { ApiError } = require('../utils/ApiError');
 const { validateDocumentData, assertNoDuplicateNumber, assertPartyExists } = require('../utils/arApValidation'); // M4
@@ -121,8 +122,34 @@ class InvoiceService {
    * Phase 2: Accepts lineItems, discount, shipping, multi-currency, attachments, bank details.
    * If lineItems are provided, amount is auto-computed by the model's pre-save hook.
    */
+  /**
+   * Auto-generate a unique invoice number for a business.
+   * Format: INV-YYYYMM-NNNNN (sequential within the calendar month).
+   * @private
+   */
+  async _generateInvoiceNumber(businessId) {
+    const now = new Date();
+    const yyyymm = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const last = await Invoice.findOne({
+      businessId,
+      invoiceNumber: { $regex: `^INV-${yyyymm}-` },
+    }).sort({ createdAt: -1 }).select('invoiceNumber').lean();
+
+    let seq = 1;
+    if (last?.invoiceNumber) {
+      const n = parseInt(last.invoiceNumber.split('-').pop(), 10);
+      if (!isNaN(n)) seq = n + 1;
+    }
+    return `INV-${yyyymm}-${String(seq).padStart(5, '0')}`;
+  }
+
   async createDraft(data, user, ipAddress) {
     const hasLines = Array.isArray(data.lineItems) && data.lineItems.length > 0;
+
+    // Auto-generate invoice number if the caller omitted it
+    if (!data.invoiceNumber?.trim()) {
+      data.invoiceNumber = await this._generateInvoiceNumber(data.businessId);
+    }
 
     // ── M4 enterprise validation (service layer) ─────────────────────────────
     validateDocumentData(data, { kind: 'invoice', isUpdate: false });
@@ -238,7 +265,7 @@ class InvoiceService {
    * Records field-level changes in fieldHistory.
    */
   async updateDraft(id, data, user, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     if (invoice.state !== INVOICE_STATES.DRAFT) {
       throw new ApiError(409, 'Only draft invoices can be edited');
     }
@@ -313,7 +340,7 @@ class InvoiceService {
   // ───────────────────────────────────────────────────────────────────────────
 
   async submitForApproval(id, user, ipAddress, opts = {}) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     if (!invoice.approvalRequired) {
       // Auto-promote to approved when approval is not required
       return this._applyStateChange(invoice, INVOICE_STATES.APPROVED, user, {
@@ -341,7 +368,7 @@ class InvoiceService {
 
   /** M6 — advance/act on the multi-level approval chain (reject/reassign/escalate). */
   async actOnApproval(id, action, user, { note, level } = {}, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     const approvalEngine = require('./approvalEngine.service');
     if (!invoice.approvalChain || invoice.approvalChain.length === 0) {
       throw new ApiError(409, 'This invoice has no approval chain');
@@ -360,7 +387,23 @@ class InvoiceService {
   }
 
   async approve(id, user, note, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
+
+    // Phase 2: Check Customer Credit Limit
+    if (invoice.customerId) {
+      const Customer = require('../models/Customer.model');
+      const customer = await Customer.findById(invoice.customerId).lean();
+      if (customer && customer.creditLimit > 0) {
+        const newBalance = (customer.currentReceivableBalance || 0) + invoice.totalAmount;
+        if (newBalance > customer.creditLimit) {
+          if (customer.creditLimitAction === 'block') {
+            throw new ApiError(403, `Invoice approval blocked: exceeds customer credit limit of ${customer.creditLimit} (New Balance: ${newBalance})`);
+          } else {
+            logger.warn(`[invoice] Customer ${customer.fullName} exceeded credit limit (Limit: ${customer.creditLimit}, New Balance: ${newBalance}) upon invoice ${invoice.invoiceNumber} approval.`);
+          }
+        }
+      }
+    }
 
     // ── M6: multi-level approval — advance the chain one step ────────────────
     const approvalEngine = require('./approvalEngine.service');
@@ -413,7 +456,7 @@ class InvoiceService {
   }
 
   async reject(id, user, note, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     invoice.approvalLog.push({
       action:    'rejected',
       actorId:   user._id,
@@ -435,58 +478,120 @@ class InvoiceService {
   // ───────────────────────────────────────────────────────────────────────────
 
   async send(id, user, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     invoice.sentAt = new Date();
     return this._applyStateChange(invoice, INVOICE_STATES.SENT, user, { ipAddress });
   }
 
   async cancel(id, user, reason, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     return this._applyStateChange(invoice, INVOICE_STATES.CANCELLED, user, { reason, ipAddress });
   }
 
   /** M5 — GL-correct void (reverses recognition + refunds payments; never deletes). */
   async void(id, reason, user, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     const arApVoidCredit = require('./arApVoidCredit.service');
     return arApVoidCredit.voidDocument('invoice', invoice, reason, user, ipAddress);
   }
 
   /** M5 — apply a customer credit memo (DR Sales Returns / CR AR) to this invoice. */
   async applyCreditMemo(id, amount, reason, user, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     const arApVoidCredit = require('./arApVoidCredit.service');
     return arApVoidCredit.applyCreditMemo('invoice', invoice, amount, reason, user, ipAddress);
   }
 
   /** M8 — preview the early-payment discount currently available on this invoice. */
-  async previewEarlyPaymentDiscount(id) {
-    const invoice = await this._loadOrThrow(id);
+  async previewEarlyPaymentDiscount(id, businessId = null) {
+    const invoice = await this._loadOrThrow(id, businessId);
     return require('./earlyPaymentDiscount.service').preview('invoice', invoice);
   }
 
   /** M8 — realize the early-payment discount (DR Sales Returns / CR AR) if in window. */
   async applyEarlyPaymentDiscount(id, user, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     return require('./earlyPaymentDiscount.service').apply('invoice', invoice, user, ipAddress, {});
   }
 
   async dispute(id, user, reason, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     invoice.disputeReason = reason || null;
     invoice.disputedAt = new Date();
     return this._applyStateChange(invoice, INVOICE_STATES.DISPUTED, user, { reason, ipAddress });
   }
 
   async writeOff(id, user, reason, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     invoice.writeOffReason = reason || null;
-    invoice.writtenOffAt = new Date();
+    invoice.writtenOffAt   = new Date();
+
+    // Post Bad Debt Expense journal entry: DR Bad Debt Expense / CR Accounts Receivable
+    const outstanding = Math.round(
+      ((invoice.remainingBalance != null ? invoice.remainingBalance : invoice.totalAmount) || 0) * 100
+    ) / 100;
+
+    if (outstanding > 0) {
+      try {
+        const [badDebtAcct, arAcct] = await Promise.all([
+          ChartOfAccount.findOne({
+            businessId: invoice.businessId,
+            $or: [{ accountCode: '6370' }, { accountName: /bad debt/i }],
+          }).lean(),
+          ChartOfAccount.findOne({
+            businessId: invoice.businessId,
+            $or: [{ accountCode: '1110' }, { accountName: /accounts receivable/i }],
+          }).lean(),
+        ]);
+
+        if (badDebtAcct && arAcct) {
+          const je = await postBalancedJournal({
+            businessId:         invoice.businessId,
+            transactionDate:    new Date(),
+            description:        `Write-off: Invoice ${invoice.invoiceNumber} — ${reason || 'bad debt'}`,
+            transactionType:    TRANSACTION_TYPES.ADJUSTING_ENTRY,
+            amount:             outstanding,
+            debitAccountId:     badDebtAcct._id,
+            creditAccountId:    arAcct._id,
+            transactionSource:  TRANSACTION_SOURCES.SYSTEM_GENERATED,
+            status:             JOURNAL_STATUS.POSTED,
+            entryType:          'adjusting',
+            invoiceNumber:      invoice.invoiceNumber,
+            createdBy:          user._id,
+            lastModifiedBy:     user._id,
+            currencyCode:       invoice.currencyCode || 'PKR',
+            baseCurrencyCode:   invoice.baseCurrencyCode || 'PKR',
+            exchangeRate:       invoice.exchangeRate || 1,
+            baseCurrencyAmount: outstanding,
+          });
+          invoice.writeOffJournalId = je._id;
+
+          // Decrement the customer's receivable balance
+          if (invoice.customerId) {
+            await partyBalanceService.adjustReceivable(
+              invoice.businessId,
+              invoice.customerId,
+              -outstanding,
+              { userId: user._id, reason: 'write_off', entityType: ENTITY_TYPES.INVOICE, entityId: invoice._id }
+            );
+          }
+        } else {
+          logger.warn(
+            `[invoice.writeOff] Could not find Bad Debt or AR account for business ` +
+            `${invoice.businessId} — GL not posted for invoice ${invoice.invoiceNumber}`
+          );
+        }
+      } catch (glErr) {
+        logger.error(`[invoice.writeOff] GL posting failed for ${invoice.invoiceNumber}: ${glErr.message}`);
+        // Do NOT re-throw — state change still proceeds; GL drift is logged
+      }
+    }
+
     return this._applyStateChange(invoice, INVOICE_STATES.WRITTEN_OFF, user, { reason, ipAddress });
   }
 
   async markPaid(id, user, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     const outstanding = Math.round(
       ((invoice.remainingBalance != null ? invoice.remainingBalance : invoice.totalAmount) || 0) * 100
     ) / 100;
@@ -527,12 +632,12 @@ class InvoiceService {
 
   /** Generic state transition entry point (used by tests + admin tooling). */
   async transitionState(id, toState, user, { reason = null, ipAddress = null } = {}) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     return this._applyStateChange(invoice, toState, user, { reason, ipAddress });
   }
 
   async softDelete(id, user, ipAddress) {
-    const invoice = await this._loadOrThrow(id);
+    const invoice = await this._loadOrThrow(id, user?.businessId);
     if (invoice.isArchived) return invoice;
     invoice.isArchived = true;
     invoice.archivedAt = new Date();
@@ -622,56 +727,68 @@ class InvoiceService {
     const netAmount = r2(invoice.amount || (invoice.totalAmount - (invoice.taxAmount || 0)));
     const primaryAmount = netAmount > 0 ? netAmount : r2(invoice.totalAmount);
 
-    // Running tally of what we debit to the AR control account — the customer's
-    // receivable is incremented by exactly this at the end. (Rule 5)
-    let arDebited = 0;
-    let primaryJe = null;
-    try {
-      primaryJe = await postBalancedJournal({
-        businessId,
-        transactionDate:   invoice.issueDate,
-        description:       `AR Recognition — ${invoice.invoiceNumber}${invoice.customerSnapshot?.fullName ? ' (' + invoice.customerSnapshot.fullName + ')' : ''}`,
-        transactionType:   TRANSACTION_TYPES.CREDIT_SALE,
-        amount:            primaryAmount,
-        debitAccountId:    arAccount._id,
-        creditAccountId:   revenueAccountId,
-        status:            JOURNAL_STATUS.POSTED,
-        transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
-        invoiceNumber:     invoice.invoiceNumber,
-        customerId:        invoice.customerId || null,
-        currencyCode:      invoice.currencyCode || 'PKR',
-        exchangeRate:      invoice.exchangeRate || 1,
-        createdBy:         user._id,
-        lastModifiedBy:    user._id,
-        // M9 — this entry is the immutable projection of the authoritative invoice.
-        isProjection:      true,
-        projectionOf:      { documentType: 'invoice', documentId: invoice._id },
-      });
-      arDebited = r2(arDebited + primaryAmount);
-    } catch (e) {
-      logger.error(`[invoice] failed to create AR recognition JE for ${invoice.invoiceNumber}: ${e.message}`);
-      return null;
-    }
-
-    invoice.arJournalId = primaryJe._id;
-    if (!invoice.linkedJournalEntryId) invoice.linkedJournalEntryId = primaryJe._id;
-    await invoice.save();
-
-    // ── Output-tax JE: DR Accounts Receivable, CR GST/Output Tax Payable ─────
+    // ── Resolve the optional output-tax account up-front (read, no write) ────
     const taxAmount = r2(invoice.taxAmount || 0);
+    let outputTaxAcc = null;
     if (taxAmount > 0) {
-      const outputTaxAcc = await ChartOfAccount.findOne({
+      const acc = await ChartOfAccount.findOne({
         businessId,
         accountCode: { $in: ['2120', '2125'] }, // GST Payable → WHT Payable fallback
       }).lean();
-      if (outputTaxAcc && outputTaxAcc._id.toString() !== arAccount._id.toString()) {
-        try {
+      if (acc && acc._id.toString() !== arAccount._id.toString()) outputTaxAcc = acc;
+    }
+
+    // ── R-01: recognize AR atomically ────────────────────────────────────────
+    // The primary JE, the optional output-tax JE, the invoice document update and
+    // the customer balance move now commit together or roll back together. On a
+    // standalone dev server withTransaction runs them without a session (legacy
+    // behaviour). A failure rolls everything back, so we can never half-recognize
+    // an invoice (e.g. AR posted but the tax leg or customer balance missing).
+    let primaryJe = null;
+    const preLinked = invoice.linkedJournalEntryId; // remember to restore on rollback
+    try {
+      await withTransaction(async (session) => {
+        let arDebited = 0;
+        primaryJe = await postBalancedJournal({
+          businessId,
+          transactionDate:   invoice.issueDate,
+          description:       `AR Recognition — ${invoice.invoiceNumber}${invoice.customerSnapshot?.fullName ? ' (' + invoice.customerSnapshot.fullName + ')' : ''}`,
+          transactionType:   TRANSACTION_TYPES.CREDIT_SALE,
+          amount:            primaryAmount,
+          debitAccountId:    arAccount._id,
+          creditAccountId:   revenueAccountId,
+          status:            JOURNAL_STATUS.POSTED,
+          transactionSource: TRANSACTION_SOURCES.SYSTEM_GENERATED,
+          invoiceNumber:     invoice.invoiceNumber,
+          customerId:        invoice.customerId || null,
+          currencyCode:      invoice.currencyCode || 'PKR',
+          exchangeRate:      invoice.exchangeRate || 1,
+          createdBy:         user._id,
+          lastModifiedBy:    user._id,
+          // M9 — this entry is the immutable projection of the authoritative invoice.
+          isProjection:      true,
+          projectionOf:      { documentType: 'invoice', documentId: invoice._id },
+        }, { session });
+        arDebited = r2(arDebited + primaryAmount);
+
+        invoice.arJournalId = primaryJe._id;
+        if (!invoice.linkedJournalEntryId) invoice.linkedJournalEntryId = primaryJe._id;
+        await invoice.save({ session });
+
+        // Output-tax JE: DR Accounts Receivable, CR GST/Output Tax Payable.
+        // taxAmount/taxType are tagged so this entry is visible to the tax
+        // return (taxReport sums JE.taxAmount). 'GST Payable' → taxType 'GST'.
+        if (outputTaxAcc) {
+          const outputTaxType = (outputTaxAcc.accountName || 'Tax')
+            .replace(/\b(Payable|Receivable)\b/ig, '').replace(/\(.*?\)/g, '').trim() || 'Tax';
           await postBalancedJournal({
             businessId,
             transactionDate:   invoice.issueDate,
             description:       `AR Output Tax — ${invoice.invoiceNumber}`,
             transactionType:   TRANSACTION_TYPES.CREDIT_SALE,
             amount:            taxAmount,
+            taxAmount:         taxAmount,
+            taxType:           outputTaxType,
             debitAccountId:    arAccount._id,
             creditAccountId:   outputTaxAcc._id,
             status:            JOURNAL_STATUS.POSTED,
@@ -682,19 +799,24 @@ class InvoiceService {
             exchangeRate:      invoice.exchangeRate || 1,
             createdBy:         user._id,
             lastModifiedBy:    user._id,
-          });
+          }, { session });
           arDebited = r2(arDebited + taxAmount);
-        } catch (e) {
-          logger.warn(`[invoice] output-tax JE failed for ${invoice.invoiceNumber}: ${e.message}`);
         }
-      }
-    }
 
-    // ── Mirror the AR debit onto the customer's receivable balance ───────────
-    if (invoice.customerId && arDebited > 0) {
-      await partyBalanceService.adjustReceivable(businessId, invoice.customerId, arDebited, {
-        userId: user._id, reason: 'invoice_approved', entityType: ENTITY_TYPES.INVOICE, entityId: invoice._id,
+        // Mirror the AR debit onto the customer's receivable balance.
+        if (invoice.customerId && arDebited > 0) {
+          await partyBalanceService.adjustReceivable(businessId, invoice.customerId, arDebited, {
+            userId: user._id, reason: 'invoice_approved', entityType: ENTITY_TYPES.INVOICE, entityId: invoice._id, session,
+          });
+        }
       });
+    } catch (e) {
+      // Everything rolled back — undo the in-memory mutations so the returned doc
+      // doesn't reference a JE that no longer exists.
+      invoice.arJournalId = undefined;
+      invoice.linkedJournalEntryId = preLinked;
+      logger.error(`[invoice] AR recognition rolled back for ${invoice.invoiceNumber}: ${e.message}`);
+      return null;
     }
 
     // ── ERP Step 5: recognize COGS + reduce inventory for product line items ──
@@ -900,11 +1022,15 @@ class InvoiceService {
   // Read APIs
   // ───────────────────────────────────────────────────────────────────────────
 
-  async _loadOrThrow(id) {
+  async _loadOrThrow(id, businessId = null) {
     if (!mongoose.Types.ObjectId.isValid(id)) {
       throw new ApiError(400, 'Invalid invoice id');
     }
-    const invoice = await Invoice.findById(id);
+    // R-05: scope by tenant when businessId is supplied so one business can
+    // never load/mutate another business's invoice via a foreign id.
+    const invoice = businessId
+      ? await Invoice.findOne({ _id: id, businessId })
+      : await Invoice.findById(id);
     if (!invoice) throw new ApiError(404, 'Invoice not found');
     if (invoice.isArchived) throw new ApiError(410, 'Invoice has been archived');
     return invoice;

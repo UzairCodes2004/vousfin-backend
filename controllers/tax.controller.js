@@ -30,7 +30,7 @@ class TaxController {
    */
   async getConfig(req, res, next) {
     try {
-      const business = await Business.findById(req.businessId, 'taxConfig currency').lean();
+      const business = await Business.findById(req.user.businessId, 'taxConfig currency').lean();
       if (!business) throw new ApiError(404, 'Business not found');
 
       const taxCfg  = business.taxConfig || {};
@@ -93,14 +93,14 @@ class TaxController {
       if (customRates           !== undefined)  update['taxConfig.customRates']           = new Map(Object.entries(customRates || {}));
 
       const business = await Business.findByIdAndUpdate(
-        req.businessId,
+        req.user.businessId,
         { $set: update },
         { new: true, runValidators: true }
       ).lean();
 
       if (!business) throw new ApiError(404, 'Business not found');
 
-      logger.info(`[Tax] Config updated for business ${req.businessId}`);
+      logger.info(`[Tax] Config updated for business ${req.user.businessId}`);
       res.json({ success: true, data: business.taxConfig, message: 'Tax configuration updated' });
     } catch (err) {
       next(err);
@@ -143,12 +143,12 @@ class TaxController {
         taxFlagUpdate['taxConfig.vatEnabled'] = false;
       }
 
-      await Business.findByIdAndUpdate(req.businessId, { $set: taxFlagUpdate }, { new: true });
+      await Business.findByIdAndUpdate(req.user.businessId, { $set: taxFlagUpdate }, { new: true });
 
       // Seed tax accounts
-      const { created, skipped } = await taxEngine.ensureTaxAccounts(req.businessId, country);
+      const { created, skipped } = await taxEngine.ensureTaxAccounts(req.user.businessId, country);
 
-      logger.info(`[Tax] Enabled ${country} tax for business ${req.businessId}: ${created} accounts created, ${skipped} skipped`);
+      logger.info(`[Tax] Enabled ${country} tax for business ${req.user.businessId}: ${created} accounts created, ${skipped} skipped`);
 
       res.json({
         success: true,
@@ -173,7 +173,7 @@ class TaxController {
       ];
 
       const accounts = await ChartOfAccount.find({
-        businessId: req.businessId,
+        businessId: req.user.businessId,
         $or: [
           { accountCode: { $in: TAX_ACCOUNT_CODES } },
           { accountName: { $regex: /gst|vat|wht|cgst|sgst|igst|tds|srb|pra|sales tax/i } },
@@ -210,7 +210,7 @@ class TaxController {
       if (!transactionType)       throw new ApiError(400, 'transactionType is required');
 
       const taxResult = await taxEngine.resolveApplicableTaxes({
-        businessId:        req.businessId,
+        businessId:        req.user.businessId,
         transactionType,
         amount:            Number(amount),
         mode:              mode || 'inclusive',
@@ -309,7 +309,7 @@ class TaxController {
       const { enabled, category, isNonFiler, customRate, strn } = req.body;
 
       const vendor = await Vendor.findOneAndUpdate(
-        { _id: id, businessId: req.businessId },
+        { _id: id, businessId: req.user.businessId },
         {
           $set: {
             'whtProfile.enabled':    !!enabled,
@@ -338,7 +338,7 @@ class TaxController {
    */
   async getWhtSchedules(req, res, next) {
     try {
-      const { config } = await taxEngine.getBusinessTaxConfig(req.businessId);
+      const { config } = await taxEngine.getBusinessTaxConfig(req.user.businessId);
       const country = config.country || 'PK';
       const profile = getProfile(country);
       res.json({ success: true, data: profile.whtSchedules, country });
@@ -355,7 +355,7 @@ class TaxController {
   async taxLedger(req, res, next) {
     try {
       const { startDate, endDate } = req.query;
-      const data = await taxReport.getTaxLedger(req.businessId, {
+      const data = await taxReport.getTaxLedger(req.user.businessId, {
         startDate: startDate ? new Date(startDate) : null,
         endDate:   endDate   ? new Date(endDate)   : null,
       });
@@ -372,9 +372,9 @@ class TaxController {
   async taxSummary(req, res, next) {
     try {
       const { startDate, endDate } = req.query;
-      const { config } = await taxEngine.getBusinessTaxConfig(req.businessId);
+      const { config } = await taxEngine.getBusinessTaxConfig(req.user.businessId);
       const data = await taxReport.getTaxSummary(
-        req.businessId,
+        req.user.businessId,
         {
           startDate: startDate ? new Date(startDate) : null,
           endDate:   endDate   ? new Date(endDate)   : null,
@@ -394,7 +394,7 @@ class TaxController {
   async whtSummary(req, res, next) {
     try {
       const { startDate, endDate } = req.query;
-      const data = await taxReport.getWhtSummary(req.businessId, {
+      const data = await taxReport.getWhtSummary(req.user.businessId, {
         startDate: startDate ? new Date(startDate) : null,
         endDate:   endDate   ? new Date(endDate)   : null,
       });
@@ -412,9 +412,9 @@ class TaxController {
   async filingSummary(req, res, next) {
     try {
       const { startDate, endDate } = req.query;
-      const { config } = await taxEngine.getBusinessTaxConfig(req.businessId);
+      const { config } = await taxEngine.getBusinessTaxConfig(req.user.businessId);
       const data = await taxReport.getFilingSummary(
-        req.businessId,
+        req.user.businessId,
         {
           startDate: startDate ? new Date(startDate) : null,
           endDate:   endDate   ? new Date(endDate)   : null,

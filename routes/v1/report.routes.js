@@ -22,6 +22,9 @@ router.use(authMiddleware, requireBusiness);
 
 // ── Core financial statements ────────────────────────────────────────────────
 router.get('/income-statement',    validate(incomeStatementSchema,    'query'), ctrl.getIncomeStatement);
+// Common aliases — both resolve to the same income-statement handler
+router.get('/profit-loss',         validate(incomeStatementSchema,    'query'), ctrl.getIncomeStatement);
+router.get('/profit-and-loss',     validate(incomeStatementSchema,    'query'), ctrl.getIncomeStatement);
 router.get('/balance-sheet',       validate(balanceSheetSchema,       'query'), ctrl.getBalanceSheet);
 router.get('/cash-flow',           validate(cashFlowSchema,           'query'), ctrl.getCashFlowStatement);
 router.get('/trial-balance',       validate(trialBalanceSchema,       'query'), ctrl.getTrialBalance);
@@ -45,5 +48,8 @@ router.get('/comparative/balance',  validate(comparativeBalanceSchema, 'query'),
 // ── KPI & export ─────────────────────────────────────────────────────────────
 router.get('/kpi',                 validate(kpiSchema,                'query'), ctrl.getKPISummary);
 router.get('/export',              validate(exportReportSchema,       'query'), ctrl.exportReport);
+
+// ── FR-02.2: AI-narrated statements (English + Urdu, grounded in the GL) ─────
+router.get('/narrative',           ctrl.getNarrative);
 
 module.exports = router;

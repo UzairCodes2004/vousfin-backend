@@ -5,6 +5,48 @@ const { BUSINESS_TYPES, DEFAULT_CURRENCY, ACCOUNT_TYPES, ACCOUNT_SUBTYPES, NORMA
 const objectIdPattern = /^[0-9a-fA-F]{24}$/;
 
 /**
+ * Logo may be either an http(s) URL or an uploaded image stored inline as a
+ * base64 data URI (data:image/png;base64,...). We cap the length so a single
+ * oversized upload can't bloat the business document. ~3MB of base64 ≈ a ~2MB
+ * image, which is plenty for a logo.
+ */
+const logoSchema = Joi.string()
+  .allow('', null)
+  .max(3_000_000)
+  .custom((value, helpers) => {
+    if (!value) return value;
+    const isUrl = /^https?:\/\//i.test(value);
+    const isDataImage = /^data:image\/(png|jpe?g|gif|webp|svg\+xml);base64,/i.test(value);
+    if (!isUrl && !isDataImage) return helpers.error('any.invalid');
+    return value;
+  })
+  .messages({
+    'any.invalid': 'Logo must be an http(s) URL or an uploaded image file',
+    'string.max': 'Logo image is too large (max ~2MB). Please use a smaller image.',
+  });
+
+const contactFields = {
+  phone: Joi.string().max(40).allow('', null).trim().optional(),
+  email: Joi.string().email({ tlds: false }).max(120).allow('', null).trim().optional()
+    .messages({ 'string.email': 'Please enter a valid email address' }),
+  address: Joi.string().max(300).allow('', null).trim().optional(),
+  website: Joi.string().uri().max(200).allow('', null).trim().optional()
+    .messages({ 'string.uri': 'Website must be a valid URL (e.g., https://example.com)' }),
+  reportingCurrency: Joi.string().length(3).uppercase().allow('', null).optional(),
+};
+
+/**
+ * Schema for destructive actions (reset data / delete business). The caller must
+ * echo back the exact business name as a typed confirmation.
+ */
+const confirmActionSchema = Joi.object({
+  confirmName: Joi.string().required().trim().messages({
+    'any.required': 'Please type your business name to confirm',
+    'string.empty': 'Please type your business name to confirm',
+  }),
+});
+
+/**
  * Schema for creating a new business profile.
  * Used in POST /business
  */
@@ -25,9 +67,8 @@ const createBusinessSchema = Joi.object({
     'string.length': 'Currency must be a 3-letter ISO code (e.g., PKR, USD)',
   }),
   fiscalYearStartMonth: Joi.number().integer().min(1).max(12).default(1).optional(),
-  logoUrl: Joi.string().uri().optional().allow('', null).messages({
-    'string.uri': 'Logo URL must be a valid URL',
-  }),
+  logoUrl: logoSchema.optional(),
+  ...contactFields,
 });
 
 /**
@@ -41,7 +82,8 @@ const updateBusinessSchema = Joi.object({
   businessType: Joi.string().valid(...BUSINESS_TYPES).optional(),
   currency: Joi.string().length(3).uppercase().optional(),
   fiscalYearStartMonth: Joi.number().integer().min(1).max(12).optional(),
-  logoUrl: Joi.string().uri().allow('', null).optional(),
+  logoUrl: logoSchema.optional(),
+  ...contactFields,
 }).min(1); // at least one field must be present
 
 /**
@@ -93,6 +135,7 @@ const listAccountsQuerySchema = Joi.object({
 module.exports = {
   createBusinessSchema,
   updateBusinessSchema,
+  confirmActionSchema,
   addCustomAccountSchema,
   updateAccountSchema,
   listAccountsQuerySchema,

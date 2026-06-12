@@ -3,14 +3,17 @@
 // Phase 1 — HTTP layer over services/bill.service.js.
 //
 const billService = require('../services/bill.service');
+const invoicePdfService = require('../services/invoicePdf.service');
+const { buildBusinessHeader } = require('../utils/pdfBusinessHeader');
 const ApiResponse = require('../utils/ApiResponse');
 
 function actor(req) {
   return {
-    _id:      req.user.id,
-    fullName: req.user.fullName,
-    email:    req.user.email,
-    role:     req.user.role,
+    _id:        req.user.id,
+    fullName:   req.user.fullName,
+    email:      req.user.email,
+    role:       req.user.role,
+    businessId: req.user.businessId, // R-05: lets services scope loads to the tenant
   };
 }
 
@@ -61,6 +64,21 @@ exports.getById = async (req, res, next) => {
   try {
     const bill = await billService.getById(req.params.id, req.user.businessId);
     ApiResponse.success(res, bill, 'Bill retrieved');
+  } catch (err) { next(err); }
+};
+
+// Download a professional PDF of the bill (mirrors invoice PDF).
+exports.downloadPdf = async (req, res, next) => {
+  try {
+    const bill = await billService.getById(req.params.id, req.user.businessId);
+    const Business = require('../models/Business.model');
+    const biz = await Business.findById(req.user.businessId).lean();
+    await invoicePdfService.streamPdf(
+      bill.toObject ? bill.toObject() : bill,
+      buildBusinessHeader(biz),
+      res,
+      { type: 'bill' }
+    );
   } catch (err) { next(err); }
 };
 
@@ -122,7 +140,7 @@ exports.applyCreditMemo = async (req, res, next) => {
 // M8 — early-payment discount
 exports.previewEarlyPaymentDiscount = async (req, res, next) => {
   try {
-    const preview = await billService.previewEarlyPaymentDiscount(req.params.id);
+    const preview = await billService.previewEarlyPaymentDiscount(req.params.id, req.user.businessId);
     ApiResponse.success(res, preview, 'Early-payment discount preview');
   } catch (err) { next(err); }
 };

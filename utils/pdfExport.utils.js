@@ -175,31 +175,30 @@ function finalise(doc, buffers) {
 
 async function generateIncomeStatementPDF({ businessName, data, dateRange, currency = 'PKR' }) {
   const { doc, buffers } = buildDoc();
+  // Suppress zero-balance individual account rows; section totals always print.
+  const nz = (accts) => (accts || []).filter(a => (a.balance || 0) !== 0);
   try {
     docHeader(doc, businessName, 'Income Statement (Profit & Loss)', `For the period: ${dateRange}`);
 
     sectionHeader(doc, 'REVENUE');
-    const revAccounts = data.revenue?.accounts || data.revenue || [];
-    revAccounts.forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
+    nz(data.revenue?.accounts || data.revenue).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
     subtotalLine(doc, 'Total Revenue', data.totalRevenue || data.revenue?.total || 0, currency);
 
     if ((data.cogs?.total || 0) > 0) {
       sectionHeader(doc, 'COST OF GOODS SOLD');
-      const cogsAccounts = data.cogs?.accounts || [];
-      cogsAccounts.forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
+      nz(data.cogs?.accounts).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
       subtotalLine(doc, 'Total COGS', data.cogs.total, currency);
     }
 
     totalLine(doc, 'GROSS PROFIT', data.grossProfit || 0, currency, false);
 
     sectionHeader(doc, 'OPERATING EXPENSES');
-    const opexAccounts = data.operatingExpenses?.accounts || [];
-    opexAccounts.forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
+    nz(data.operatingExpenses?.accounts).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
     subtotalLine(doc, 'Total Operating Expenses', data.operatingExpenses?.total || 0, currency);
 
     if ((data.depreciationAmortization?.total || 0) !== 0) {
       sectionHeader(doc, 'DEPRECIATION & AMORTIZATION');
-      (data.depreciationAmortization?.accounts || []).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
+      nz(data.depreciationAmortization?.accounts).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
       subtotalLine(doc, 'Total D&A', data.depreciationAmortization.total, currency);
     }
 
@@ -211,7 +210,7 @@ async function generateIncomeStatementPDF({ businessName, data, dateRange, curre
 
     if ((data.interestExpense?.total || 0) !== 0) {
       sectionHeader(doc, 'INTEREST EXPENSE');
-      (data.interestExpense?.accounts || []).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
+      nz(data.interestExpense?.accounts).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
       subtotalLine(doc, 'Total Interest', data.interestExpense.total, currency);
     }
 
@@ -228,49 +227,48 @@ async function generateIncomeStatementPDF({ businessName, data, dateRange, curre
 
 async function generateBalanceSheetPDF({ businessName, data, asOfDate, currency = 'PKR' }) {
   const { doc, buffers } = buildDoc();
+  // Suppress zero-balance individual account rows; group subtotals always print.
+  const nz = (accts) => (accts || []).filter(a => (a.balance || 0) !== 0);
   try {
     docHeader(doc, businessName, 'Balance Sheet', `As of ${fmtDate(asOfDate)}`);
 
     // Assets
     sectionHeader(doc, 'ASSETS');
-    const assetAccounts = data.assets?.accounts || [];
-    const assetGroups   = data.assets?.groups || null;
+    const assetGroups = data.assets?.groups || null;
 
     if (assetGroups && assetGroups.length) {
       assetGroups.forEach(g => {
         doc.fillColor(COLORS.accent).font('Helvetica-Bold').fontSize(8)
            .text(g.label.toUpperCase(), COL_L + 8, doc.y + 4);
         doc.moveDown(0.3);
-        g.accounts.forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 16, i));
+        nz(g.accounts).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 16, i));
         subtotalLine(doc, `Total ${g.label}`, g.total, currency);
       });
     } else {
-      assetAccounts.forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
+      nz(data.assets?.accounts).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
     }
     totalLine(doc, 'TOTAL ASSETS', data.totalAssets || 0, currency, false);
 
     // Liabilities
     sectionHeader(doc, 'LIABILITIES');
     const liabGroups = data.liabilities?.groups || null;
-    const liabAccounts = data.liabilities?.accounts || [];
 
     if (liabGroups && liabGroups.length) {
       liabGroups.forEach(g => {
         doc.fillColor(COLORS.accent).font('Helvetica-Bold').fontSize(8)
            .text(g.label.toUpperCase(), COL_L + 8, doc.y + 4);
         doc.moveDown(0.3);
-        g.accounts.forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 16, i));
+        nz(g.accounts).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 16, i));
         subtotalLine(doc, `Total ${g.label}`, g.total, currency);
       });
     } else {
-      liabAccounts.forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
+      nz(data.liabilities?.accounts).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
     }
     subtotalLine(doc, 'Total Liabilities', data.totalLiabilities || 0, currency);
 
     // Equity
     sectionHeader(doc, 'EQUITY');
-    const eqAccounts = data.equity?.accounts || [];
-    eqAccounts.forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
+    nz(data.equity?.accounts).forEach((a, i) => lineItem(doc, a.accountName, a.balance, currency, 0, i));
     subtotalLine(doc, 'Total Equity', data.totalEquity || 0, currency);
 
     totalLine(doc, 'TOTAL LIABILITIES & EQUITY', data.totalLiabilitiesAndEquity || (data.totalLiabilities + data.totalEquity), currency);

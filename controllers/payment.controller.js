@@ -19,6 +19,16 @@ class PaymentController {
     }
   }
 
+  async autoAllocate(req, res, next) {
+    try {
+      const { partyType, partyId } = req.body;
+      const payment = await paymentService.autoAllocatePayment(req.user.businessId, partyType, partyId, req.body, req.user.id, req.ip);
+      ApiResponse.created(res, payment, 'Payment auto-allocated successfully');
+    } catch (err) {
+      next(err);
+    }
+  }
+
   async list(req, res, next) {
     try {
       const { direction, partyId, status, startDate, endDate, page, limit } = req.query;

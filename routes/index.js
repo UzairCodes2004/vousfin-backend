@@ -37,12 +37,22 @@ const arApIntegrityRoutes = require('./v1/arApIntegrity.routes'); // AR/AP M9 �
 const forecastPlatformRoutes = require('./v1/forecastPlatform.routes'); // Forecast Platform F1 — foundation data layer
 const forecastRegistryRoutes = require('./v1/forecastRegistry.routes'); // Forecast Platform F3 — registry/persistence/baseline gate
 const forecastDomainRoutes = require('./v1/forecastDomain.routes'); // Forecast Platform F6 — domain forecasts
+const recognitionScheduleRoutes = require('./v1/recognitionSchedule.routes'); // Phase 4 — accrual: deferred revenue / prepaid expense
+const transactionTemplateRoutes = require('./v1/transactionTemplate.routes'); // #5 — recurring / template transactions
+const approvalRoutes = require('./v1/approval.routes'); // #6 — approval workflow
+const bankReconciliationRoutes = require('./v1/bankReconciliation.routes'); // #7 — bank-statement reconciliation
+const alertRoutes = require('./v1/alert.routes'); // FR-02.1/02.3 — financial alerts + trend monitor
+const healthIndicatorRoutes = require('./v1/healthIndicators.routes'); // FR-03.2 — 40+ health indicators
 
 // Mount v1 routes under /api/v1
 router.use('/auth', authRoutes);
 router.use('/business', businessRoutes);
 router.use('/transactions', transactionRoutes);
 router.use('/reports', reportRoutes);
+router.use('/alerts', alertRoutes); // FR-02.1/02.3 — financial alerts
+router.use('/health-indicators', healthIndicatorRoutes); // FR-03.2
+router.use('/scenarios', require('./v1/scenario.routes')); // FR-03.3 — decision impact modeler
+router.use('/cfo-reports', require('./v1/cfoReport.routes')); // FR-03.4 — autonomous monthly CFO report
 router.use('/dashboard', dashboardRoutes);
 router.use('/ai', aiRoutes);
 router.use('/admin', adminRoutes);
@@ -73,6 +83,10 @@ router.use('/ar-ap-integrity',       arApIntegrityRoutes);        // AR/AP M9 �
 router.use('/forecast-platform',     forecastPlatformRoutes);     // Forecast Platform F1 — foundation data layer
 router.use('/forecast-registry',     forecastRegistryRoutes);     // Forecast Platform F3 — registry/persistence/baseline gate
 router.use('/forecast-domains',      forecastDomainRoutes);       // Forecast Platform F6 — domain forecasts
+router.use('/recognition-schedules', recognitionScheduleRoutes);  // Phase 4 — accrual: deferred revenue / prepaid expense
+router.use('/transaction-templates', transactionTemplateRoutes);  // #5 — recurring / template transactions
+router.use('/approvals',             approvalRoutes);             // #6 — approval workflow
+router.use('/bank-reconciliation',   bankReconciliationRoutes);   // #7 — bank-statement reconciliation
 
 // Health check endpoint (versioned)
 router.get('/health', (req, res) => {

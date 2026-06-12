@@ -5,6 +5,7 @@
 // and the fx-rates controller (month-end revaluation endpoint).
 const JournalEntry   = require('../models/JournalEntry.model');
 const ChartOfAccount = require('../models/ChartOfAccount.model');
+const { applyRunningBalance } = require('./ledgerPosting.service');
 const fxService      = require('./fx.service');
 const reportCache    = require('../utils/reportCache');
 const logger         = require('../config/logger');
@@ -29,21 +30,6 @@ class JournalGeneratorService {
       loss:        accounts.find(a => a.accountCode === '6200'),
       unrealised:  accounts.find(a => a.accountCode === '6210'),
     };
-  }
-
-  /** Atomically increment the running balance on a ChartOfAccount. */
-  async _bump(accountId, delta) {
-    if (!delta || !accountId) return;
-    await ChartOfAccount.findByIdAndUpdate(accountId, { $inc: { runningBalance: delta } });
-  }
-
-  /** Determine the balance delta for a debit/credit side based on normalBalance. */
-  async _delta(accountId, amount, side) {
-    const acct = await ChartOfAccount.findById(accountId).select('normalBalance').lean();
-    if (!acct) return 0;
-    if (side === 'debit')  return acct.normalBalance === 'Debit'  ?  amount : -amount;
-    if (side === 'credit') return acct.normalBalance === 'Credit' ?  amount : -amount;
-    return 0;
   }
 
   // ── Realised FX Gain / Loss ───────────────────────────────────────────────
@@ -130,8 +116,8 @@ class JournalGeneratorService {
     });
 
     // Update running balances
-    await this._bump(debitId,  await this._delta(debitId,  fxAmount, 'debit'));
-    await this._bump(creditId, await this._delta(creditId, fxAmount, 'credit'));
+    await applyRunningBalance(debitId,  fxAmount, 'debit');
+    await applyRunningBalance(creditId, fxAmount, 'credit');
 
     reportCache.invalidate(String(businessId));
     logger.info(`[FX] Realised ${isGain ? 'gain' : 'loss'} of ${fxAmount} recorded — journal ${entry._id}`);
@@ -244,8 +230,8 @@ class JournalGeneratorService {
           },
         });
 
-        await this._bump(debitId,  await this._delta(debitId,  absAmt, 'debit'));
-        await this._bump(creditId, await this._delta(creditId, absAmt, 'credit'));
+        await applyRunningBalance(debitId,  absAmt, 'debit');
+        await applyRunningBalance(creditId, absAmt, 'credit');
 
         stats.created++;
         logger.info(`[FX] Unrealised revaluation for tx ${tx._id}: ${isGain ? '+' : '-'}${absAmt} ${baseCurrency}`);
@@ -297,8 +283,8 @@ class JournalGeneratorService {
       metadata: { unrealisedFxReversal: true, fxSourceTransactionId: sourceTxId.toString() },
     });
 
-    await this._bump(rev.debitAccountId,  await this._delta(rev.debitAccountId,  prior.amount, 'debit'));
-    await this._bump(rev.creditAccountId, await this._delta(rev.creditAccountId, prior.amount, 'credit'));
+    await applyRunningBalance(rev.debitAccountId,  prior.amount, 'debit');
+    await applyRunningBalance(rev.creditAccountId, prior.amount, 'credit');
 
     // Mark original as reversed
     await JournalEntry.findByIdAndUpdate(prior._id, { status: JOURNAL_STATUS.REVERSED });

@@ -25,14 +25,13 @@ class ApiResponse {
    * @param {Object} res - Express response object
    * @param {string} message - Error message (optional, default: 'Internal server error')
    * @param {number} statusCode - HTTP status code (default: 500)
+   * @param {Object} [extra] - Optional extra data (e.g. { details: [...] })
    * @returns {Object} Express response
    */
-  static error(res, message = 'Internal server error', statusCode = 500) {
-    return res.status(statusCode).json({
-      success: false,
-      message,
-      data: null,
-    });
+  static error(res, message = 'Internal server error', statusCode = 500, extra = null) {
+    const body = { success: false, message, data: null };
+    if (extra) Object.assign(body, extra);
+    return res.status(statusCode).json(body);
   }
 
   /**

@@ -34,7 +34,7 @@ const shared = {
 
 const createInvoiceSchema = Joi.object({
   ...shared,
-  invoiceNumber: shared.invoiceNumber.required(),
+  invoiceNumber: shared.invoiceNumber.allow('', null),  // optional — service auto-generates when blank
   issueDate:     shared.issueDate.required(),
 })
   .or('amount', 'lineItems')   // at least one source of value
