@@ -35,7 +35,8 @@ router.get('/wht-schedules',        taxCtrl.getWhtSchedules);
 router.put('/vendor/:id/wht',       taxCtrl.updateVendorWht);
 
 // ── Live position (FR-04.1) ───────────────────────────────────────────────────
-router.get('/position',             taxCtrl.getPosition);    // always-on liability per tax type
+router.get('/position',             taxCtrl.getPosition);       // always-on liability per tax type
+router.get('/position/trend',       taxCtrl.getPositionTrend);  // ?months=6 — daily snapshot series
 
 // ── Reporting (Phase 5.4.6) ───────────────────────────────────────────────────
 router.get('/reports/ledger',       taxCtrl.taxLedger);      // ?startDate&endDate

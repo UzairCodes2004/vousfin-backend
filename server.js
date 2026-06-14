@@ -10,6 +10,7 @@ const logger = require('./config/logger');
 const { scheduleAnomalyScan } = require('./jobs/anomalyScan.job');
 const { scheduleFxRateSync }  = require('./jobs/fxRateSync.job');
 const { schedulePaymentReminders } = require('./jobs/paymentReminder.job');
+const { scheduleTaxSnapshots } = require('./jobs/taxSnapshot.job');
 const { initialize: initForecastingData } = require('./services/forecasting/dataLoader');
 const { ensureLSTMRunning, stopLSTM } = require('./utils/lstmService');
 
@@ -54,6 +55,13 @@ const startServer = async () => {
       schedulePaymentReminders();
     } catch (err) {
       logger.warn(`⚠️ Payment reminder job failed to schedule (non-fatal): ${err.message}`);
+    }
+
+    // Step 3b2: Schedule daily tax-position snapshots (00:30) for the 6-month trend (FR-04.1)
+    try {
+      scheduleTaxSnapshots();
+    } catch (err) {
+      logger.warn(`⚠️ Tax-snapshot job failed to schedule (non-fatal): ${err.message}`);
     }
 
     // Forecast Platform F3: capture realized forecast accuracy daily (09:00)
