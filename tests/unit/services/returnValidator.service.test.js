@@ -47,7 +47,7 @@ describe('returnValidator.validateReturn', () => {
     expect(out['validation.passed']).toBe(false);
     expect(out.status).toBeUndefined();   // stays draft (no transition)
     const err = out['validation.errors'].find(e => e.code === 'OUTPUT_LT_ANNEX');
-    expect(err.fix).toMatch(/Annex-C/);
+    expect(err.fix).toMatch(/sales/i);   // plain-language fix (no form jargon)
   });
 
   it('fails on a missing NTN', async () => {
