@@ -25,7 +25,7 @@ const TAX_OPTIMIZATION_RULES = [
   {
     id: 'DEPRECIATION_UNCLAIMED',
     taxType: 'INCOME_TAX',
-    title: 'Claim depreciation on your fixed assets',
+    title: 'Claim wear-and-tear on your equipment',
     legalRef: 'Income Tax Ordinance 2001, s.22 & Third Schedule',
     riskLevel: 'safe',
     detect(ctx) {
@@ -36,7 +36,7 @@ const TAX_OPTIMIZATION_RULES = [
       if (saving <= 0) return null;
       return {
         estimatedSavingPKR: saving,
-        explanation: `You hold ${money(ctx.fixedAssetsGross)} of fixed assets but have booked no depreciation this year. Claiming the tax depreciation allowance (~${pct(DEPRECIATION_RATE)} of cost) lowers taxable income by about ${money(annualDepreciation)}, cutting income tax by roughly ${money(saving)}.`,
+        explanation: `You own ${money(ctx.fixedAssetsGross)} of equipment and assets but haven't claimed any wear-and-tear (depreciation) this year. Claiming it (about ${pct(DEPRECIATION_RATE)} of cost) lowers the profit you're taxed on by roughly ${money(annualDepreciation)}, saving about ${money(saving)} in income tax.`,
       };
     },
   },
@@ -44,7 +44,7 @@ const TAX_OPTIMIZATION_RULES = [
   {
     id: 'INPUT_TAX_UNCLAIMED',
     taxType: 'GST',
-    title: 'Recover your excess input sales tax',
+    title: 'Claim back the extra sales tax you paid',
     legalRef: 'Sales Tax Act 1990, s.7 & s.10',
     riskLevel: 'safe',
     detect(ctx) {
@@ -53,7 +53,7 @@ const TAX_OPTIMIZATION_RULES = [
       if (claimable <= 0) return null;
       return {
         estimatedSavingPKR: claimable,
-        explanation: `Your input sales tax exceeds output tax by ${money(claimable)} this period. Rather than leaving it on the table, carry the excess forward or claim a refund under s.10.`,
+        explanation: `You paid ${money(claimable)} more sales tax on your purchases than you collected on your sales this period. Don't leave it with FBR — carry it to next month or claim it back as a refund.`,
       };
     },
   },
@@ -61,7 +61,7 @@ const TAX_OPTIMIZATION_RULES = [
   {
     id: 'ADVANCE_TAX_OVERPAID',
     taxType: 'INCOME_TAX',
-    title: 'You may have overpaid advance tax',
+    title: 'You may have paid too much tax in advance',
     legalRef: 'Income Tax Ordinance 2001, s.147 & s.170 (refund)',
     riskLevel: 'review',
     detect(ctx) {
@@ -71,7 +71,7 @@ const TAX_OPTIMIZATION_RULES = [
       if (excess <= 0) return null;
       return {
         estimatedSavingPKR: excess,
-        explanation: `Advance tax already paid/withheld (${money(ctx.advanceTaxPaid)}) is higher than your projected annual income-tax liability (${money(expectedLiability)}). The ${money(excess)} excess can be adjusted against your next instalment or claimed as a refund under s.170.`,
+        explanation: `You've already paid ${money(ctx.advanceTaxPaid)} in tax this year (in advance and withheld) — more than your likely full-year income tax of ${money(expectedLiability)}. You can put the extra ${money(excess)} towards your next payment or claim it back as a refund.`,
       };
     },
   },
@@ -79,7 +79,7 @@ const TAX_OPTIMIZATION_RULES = [
   {
     id: 'WHT_SECTION_OPTIMISATION',
     taxType: 'WHT',
-    title: 'Verify filer status before withholding',
+    title: 'Check your suppliers are registered tax filers',
     legalRef: 'Income Tax Ordinance 2001, s.153 & Tenth Schedule (non-filer rates)',
     riskLevel: 'review',
     detect(ctx) {
@@ -87,7 +87,7 @@ const TAX_OPTIMIZATION_RULES = [
       const potential = r0(ctx.whtWithheldYTD * 0.5);      // non-filer rates ~2× filer rates
       return {
         estimatedSavingPKR: potential,
-        explanation: `You withheld ${money(ctx.whtWithheldYTD)} of tax this year. Where counterparties are active filers (on the FBR ATL), withholding is roughly half the non-filer rate — verifying filer status before payment could reduce withholding by up to ${money(potential)}.`,
+        explanation: `You held back ${money(ctx.whtWithheldYTD)} in tax from supplier payments this year. Non-filers are charged roughly double — so if your suppliers are registered active tax filers, checking before you pay could cut the tax you hold back by up to ${money(potential)}.`,
       };
     },
   },

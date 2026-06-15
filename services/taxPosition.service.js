@@ -83,7 +83,7 @@ async function getLivePosition(businessId, asOf = new Date()) {
   const taxes = [
     { taxType: 'GST',        label: 'GST / Sales Tax',       liability: Math.max(0, gstNet), refundable: gstNet < 0, raw: gstNet, nextDeadline: deadlineFor('GST'),        status: 'tracked'     },
     { taxType: 'WHT',        label: 'Withholding Tax',       liability: r2(wht.totalWht),    refundable: false,                  nextDeadline: deadlineFor('WHT'),        status: 'tracked'     },
-    { taxType: 'INCOME_TAX', label: 'Income Tax (provision)', liability: incomeTax,           refundable: false,                  nextDeadline: deadlineFor('INCOME_TAX'), status: incomeTaxStatus },
+    { taxType: 'INCOME_TAX', label: 'Income Tax (estimated)',  liability: incomeTax,           refundable: false,                  nextDeadline: deadlineFor('INCOME_TAX'), status: incomeTaxStatus },
     { taxType: 'EOBI',       label: 'EOBI',                  liability: eobi,                refundable: false,                  nextDeadline: deadlineFor('EOBI'),       status: payrollStatus },
     { taxType: 'SESSI',      label: 'SESSI',                 liability: sessi,               refundable: false,                  nextDeadline: deadlineFor('SESSI'),      status: payrollStatus },
   ];
