@@ -43,6 +43,11 @@ router.post('/payroll-accrual',     validate(payrollAccrualSchema), taxCtrl.addP
 // ── Optimization advisor (FR-04.2) ─────────────────────────────────────────────
 router.get('/advisories',           taxCtrl.getAdvisories);     // legal tax-saving advisories
 
+// ── Return preparation & filing (FR-04.3) ──────────────────────────────────────
+router.get('/returns',              taxCtrl.listReturns);
+router.post('/returns/prepare',     taxCtrl.prepareReturn);     // { returnType, period:{year,month?} }
+router.get('/returns/:id',          taxCtrl.getReturn);
+
 // ── Reporting (Phase 5.4.6) ───────────────────────────────────────────────────
 router.get('/reports/ledger',       taxCtrl.taxLedger);      // ?startDate&endDate
 router.get('/reports/summary',      taxCtrl.taxSummary);     // input/output split

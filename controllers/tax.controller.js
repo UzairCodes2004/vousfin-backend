@@ -21,6 +21,8 @@ const taxPosition        = require('../services/taxPosition.service');  // FR-04
 const taxSnapshot        = require('../services/taxSnapshot.service');  // FR-04.1 (Phase 2)
 const payrollRepo        = require('../repositories/payrollAccrual.repository');  // FR-04.1 (Phase 3)
 const taxAdvisor         = require('../services/taxAdvisor.service');  // FR-04.2
+const returnPrepare      = require('../services/returnPrepare.service');  // FR-04.3
+const taxReturnRepo      = require('../repositories/taxReturn.repository');  // FR-04.3
 const { getProfile, getSupportedCountries } = require('../config/countryTaxProfiles');
 const { SUPPORTED_COUNTRIES } = require('../config/constants');
 const { ApiError }       = require('../utils/ApiError');
@@ -493,6 +495,46 @@ class TaxController {
     try {
       const data = await taxAdvisor.getAdvisories(req.user.businessId);
       res.json({ success: true, data });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  // ── GET /tax/returns ───────────────────────────────────────────────────────
+  /** All prepared returns for this business, newest period first (FR-04.3). */
+  async listReturns(req, res, next) {
+    try {
+      const data = await taxReturnRepo.listForBusiness(req.user.businessId);
+      res.json({ success: true, data });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  // ── POST /tax/returns/prepare ──────────────────────────────────────────────
+  /**
+   * Compile a return from the GL and persist it as a draft (FR-04.3).
+   * Body: { returnType: 'GST-01'|'WHT-165'|'IT-RETURN', period: { year, month? } }
+   */
+  async prepareReturn(req, res, next) {
+    try {
+      const { returnType, period } = req.body;
+      const data = await returnPrepare.prepare(req.user.businessId, returnType, period, req.user._id || req.user.id || null);
+      res.json({ success: true, data, message: `${returnType} prepared` });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  // ── GET /tax/returns/:id ───────────────────────────────────────────────────
+  /** A single prepared return (business-scoped) (FR-04.3). */
+  async getReturn(req, res, next) {
+    try {
+      const ret = await taxReturnRepo.findById(req.params.id);
+      if (!ret || String(ret.businessId) !== String(req.user.businessId)) {
+        throw new ApiError(404, 'Return not found');
+      }
+      res.json({ success: true, data: ret });
     } catch (err) {
       next(err);
     }

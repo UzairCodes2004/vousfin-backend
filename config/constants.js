@@ -816,6 +816,34 @@ module.exports = {
   },
 
   // ===============================
+  // FR-04.3 — Tax Return State Machine
+  // Lifecycle: draft → validated → submitted → filed ; any → rejected
+  // ===============================
+  TAX_RETURN_STATUS: {
+    DRAFT:     'draft',
+    VALIDATED: 'validated',
+    SUBMITTED: 'submitted',
+    FILED:     'filed',
+    REJECTED:  'rejected',
+  },
+
+  TAX_RETURN_TYPES: {
+    GST01:     'GST-01',
+    WHT165:    'WHT-165',
+    IT_RETURN: 'IT-RETURN',
+    EOBI:      'EOBI',
+    SESSI:     'SESSI',
+  },
+
+  RETURN_TRANSITIONS: {
+    draft:     ['validated', 'rejected'],
+    validated: ['submitted', 'draft', 'rejected'],  // back to draft to re-edit
+    submitted: ['filed', 'rejected'],
+    filed:     [],            // terminal
+    rejected:  ['draft'],     // fix and retry
+  },
+
+  // ===============================
   // Phase 3.1 — Vendor Credit State Machine
   // ===============================
   VENDOR_CREDIT_STATES: {
