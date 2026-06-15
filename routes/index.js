@@ -87,6 +87,7 @@ router.use('/recognition-schedules', recognitionScheduleRoutes);  // Phase 4 —
 router.use('/transaction-templates', transactionTemplateRoutes);  // #5 — recurring / template transactions
 router.use('/approvals',             approvalRoutes);             // #6 — approval workflow
 router.use('/bank-reconciliation',   bankReconciliationRoutes);   // #7 — bank-statement reconciliation
+router.use('/autonomy',              require('./v1/autonomy.routes')); // Autonomy roadmap Phase 0 — control plane + inbox
 
 // Health check endpoint (versioned)
 router.get('/health', (req, res) => {

@@ -554,6 +554,8 @@ module.exports = {
     BANK_STATEMENT:       'bankStatement',
     // ── FR-04.3: Tax return ───────────────────────────────────────────────────
     TAX_RETURN:           'taxReturn',
+    // ── Autonomy Phase 0: proposed action ─────────────────────────────────────
+    PROPOSED_ACTION:      'proposedAction',
   },
 
   // ===============================
@@ -845,6 +847,33 @@ module.exports = {
     submitted: ['filed', 'rejected'],
     filed:     [],            // terminal
     rejected:  ['draft'],     // fix and retry
+  },
+
+  // ===============================
+  // Autonomy roadmap Phase 0 — Autonomy Engine + Action Framework
+  // ===============================
+  // How much the system is trusted to act, per capability. Earned gradually.
+  AUTONOMY_LEVELS: {
+    OBSERVE:   'observe',    // watch + log proposals only; nothing surfaced to act on
+    SUGGEST:   'suggest',    // proposals go to the inbox for human approval (default)
+    COPILOT:   'copilot',    // auto-execute high-confidence within limits; queue the rest
+    AUTOPILOT: 'autopilot',  // auto-execute within limits; only escalate exceptions
+  },
+
+  // The agent capabilities the autonomy dial governs.
+  AUTONOMY_CAPABILITIES: [
+    'bookkeeping', 'reconciliation', 'collections', 'payments', 'tax', 'close', 'advisory',
+  ],
+
+  // Lifecycle of a proposed action flowing through the router.
+  PROPOSED_ACTION_STATUS: {
+    OBSERVED:  'observed',   // logged only (observe level)
+    QUEUED:    'queued',     // waiting for human approval in the inbox
+    APPROVED:  'approved',   // human approved; awaiting/!executed
+    EXECUTED:  'executed',   // carried out (auto or after approval)
+    REJECTED:  'rejected',   // human declined
+    FAILED:    'failed',     // execution errored
+    REVERSED:  'reversed',   // undone after execution
   },
 
   // ===============================
