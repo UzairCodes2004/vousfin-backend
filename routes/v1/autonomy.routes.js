@@ -15,6 +15,7 @@ router.get('/report',                 ctrl.getReport);       // accuracy + dial 
 
 // The one inbox + activity
 router.get('/inbox',                  ctrl.getInbox);        // ?capability=
+router.post('/scan',                  ctrl.scan);            // agents look for work → inbox
 router.get('/actions',                ctrl.getActions);
 router.post('/actions/:id/approve',   ctrl.approve);
 router.post('/actions/:id/reject',    ctrl.reject);

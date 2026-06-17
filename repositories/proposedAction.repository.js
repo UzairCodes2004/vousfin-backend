@@ -26,6 +26,15 @@ class ProposedActionRepository extends BaseRepository {
     const a = await this.model.findById(id).lean();
     return a && String(a.businessId) === String(businessId) ? a : null;
   }
+
+  /**
+   * The most recent action for a (sourceType, sourceId) pair — lets an agent
+   * avoid re-proposing something already pending, decided, or done. Returns null
+   * if none exists.
+   */
+  async latestBySource(businessId, sourceType, sourceId) {
+    return this.model.findOne({ businessId, sourceType, sourceId }).sort({ createdAt: -1 }).lean();
+  }
 }
 
 module.exports = new ProposedActionRepository();

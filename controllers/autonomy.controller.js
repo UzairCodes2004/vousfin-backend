@@ -6,10 +6,11 @@ require('../models/AutonomyPolicy.model');
 require('../models/FeedbackEvent.model');
 require('../models/EntityMemory.model');
 require('../models/SourceDocument.model');
-// Requiring the bookkeeper registers its post_journal execute/reverse handlers
-// with the action router, so approving/reversing a bookkeeping action works
-// regardless of route mount order.
+// Requiring the agents registers their execute/reverse handlers with the action
+// router, so approving/reversing their actions works regardless of route order.
 require('../services/bookkeeper.service');
+const reconciler = require('../services/reconciler.service');
+const collector = require('../services/collector.service');
 const policy = require('../services/autonomyPolicy.service');
 const actionRouter = require('../services/actionRouter.service');
 const commandCenter = require('../services/commandCenter.service');
@@ -37,6 +38,20 @@ class AutonomyController {
   async getInbox(req, res, next) {
     try { res.json({ success: true, data: await commandCenter.getInbox(req.user.businessId) }); }
     catch (err) { next(err); }
+  }
+
+  // POST /autonomy/scan — let the agents look for work (reconciliation + collections)
+  // and surface it as proposed actions in the inbox.
+  async scan(req, res, next) {
+    try {
+      const businessId = req.user.businessId;
+      const who = { id: req.user._id || req.user.id || null };
+      const [reconciliation, collections] = await Promise.all([
+        reconciler.scanBusiness(businessId, who).catch(() => 0),
+        collector.scanBusiness(businessId, who).catch(() => 0),
+      ]);
+      res.json({ success: true, data: { reconciliation, collections, total: reconciliation + collections }, message: 'Scan complete' });
+    } catch (err) { next(err); }
   }
 
   // GET /autonomy/report — the Autonomy Report: accuracy + dial recommendations

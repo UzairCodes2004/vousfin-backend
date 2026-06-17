@@ -880,7 +880,9 @@ module.exports = {
 
   // The action types agents emit through the router (the `type` on a ProposedAction).
   PROPOSED_ACTION_TYPES: {
-    POST_JOURNAL: 'post_journal',   // Bookkeeper — record a document as a journal entry
+    POST_JOURNAL:     'post_journal',     // Bookkeeper — record a document as a journal entry
+    CLEAR_BANK_MATCH: 'clear_bank_match', // Reconciler — link a statement line to a ledger entry
+    ESCALATE_DUNNING: 'escalate_dunning', // Collector — chase an overdue customer (next dunning step)
   },
 
   // Autonomy Phase 2 — Bookkeeper agent. Where an ingested document came from.
